@@ -10,14 +10,15 @@ Design and analysis package for the **authorized, non-destructive web-applicatio
 | 01 | [Requirements](01-requirements.md) | 67 functional + 37 non-functional requirements (traceable IDs, per-phase ownership) |
 | 02 | [Threat model](02-threat-model.md) | Assets, actors, trust boundaries, data flows, 36 STRIDE threats (all 10 named threats), abuse cases, failure modes |
 | 03 | [Architecture & tech stack](03-architecture.md) | Two-plane design, single egress choke point, two-stage authorization, sandboxing, ADR-candidates |
-| 04 | [Authorization & scope schema](04-authorization-and-scope-schema.md) | The safety backbone: engagement, authorization, scope, canonicalization, the two-stage decision procedure, two-tier network guard, split audit, dual-control approval, breadth limits |
-| 05 | [Safety invariants](05-safety-invariants.md) | 59 absolute, test-enforced safety properties (release fails if any is violated) |
+| 04 | [Authorization & scope schema](04-authorization-and-scope-schema.md) | The safety backbone: engagement, authorization, scope, canonicalization, immutable `request_spec` + JIT two-stage procedure, two-tier network guard, split audit, dual-control approval, computable breadth limits |
+| 05 | [Safety invariants](05-safety-invariants.md) | 63 absolute, test-enforced safety properties (release fails if any is violated) |
 | 06 | [Acceptance criteria](06-acceptance-criteria.md) | Phase-gate criteria, exit tests, and safety gates for Phases 1–12 |
 | 07 | [Non-goals & refusals](07-non-goals-and-refusals.md) | What the platform will never do, and the safe defensive alternative for each refused capability |
 | 08 | [Design review & critique resolution](08-design-review-and-critique-resolution.md) | Adversarial review (2 rounds); every finding/blocker → resolution with traceability |
 | 09 | [RBAC matrix](09-rbac-matrix.md) | The single authoritative role/action matrix and approval-authority policy |
 | 10 | [Request authorization flow](10-request-authorization-flow.md) | Two-stage egress-grant tokens and authenticated per-job broker ingress |
 | 11 | [Data retention & deletion](11-data-retention-and-deletion.md) | Raw-output handling, retention classes, per-engagement cryptographic erasure |
+| — | [Consistency checker](consistency/check_phase0_docs.py) | Dependency-free machine-checkable gate over docs 00–11 (`python3 docs/phase-0/consistency/check_phase0_docs.py`) |
 
 ## The one idea everything follows from
 

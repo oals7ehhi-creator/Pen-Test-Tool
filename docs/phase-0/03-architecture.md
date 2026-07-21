@@ -179,28 +179,27 @@ Redaction is a **mandatory pipeline stage owned by the worker before any evidenc
 Operator selects check  ──►  API validates RBAC + engagement state
         │
         ▼
-STAGE 1 — Scope Authority: (engagement, method, target, port, path, class, now)
-        │                        │
-        │      DENY ◄────────────┘  (reason recorded; operator sees why)
-        ▼ ALLOW  → mints SIGNED, short-TTL, single-use egress GRANT binding the exact request
-        │          line (method+canonical URL/path); approval ref if intrusive; NO resolved IP
-        ▼
-API enqueues job + grant in ONE Postgres transaction
-   (budget checked & decremented transactionally; out-of-scope job literally cannot commit)
+Check engine builds an IMMUTABLE, fully-hashed request_spec (spec_sha256 over the exact request)
+   and ENQUEUES only (spec_id, tenant_id)  — the queue holds the spec, never a grant
         │
+        ▼  dispatcher pulls a queued spec (SKIP LOCKED) when ready to execute
+STAGE 1 — Scope Authority (JUST-IN-TIME): load spec; recompute+verify spec_sha256
+        │                        │
+        │      DENY ◄────────────┘  (reason recorded; spec stays queued or is dropped)
+        ▼ ALLOW  → re-check scope/auth/window/e-stop over CURRENT state; RESERVE 1 budget unit;
+        │          mint SIGNED, ≤30s, single-use GRANT bound to spec_sha256 (approval ref if intrusive; NO IP)
         ▼
-Worker pulls job (SKIP LOCKED) → builds a STRUCTURED request (typed struct, never a command
-   string) and presents (per-job identity + grant) to the broker's authenticated ingress
-   • native check: prepared HTTP request object
-   • tool check: typed tool-spec referencing a pinned template/tool ID (no free-form flags)
+Worker presents (per-job identity + grant + spec) to the broker's authenticated ingress
+   (the worker does NOT serialize the HTTP request itself)
         │
         ▼  (only path out of the netns; NOT a generic CONNECT proxy)
 STAGE 2 — Guarded Egress Broker:
-   auth per-job ingress ─► verify grant (sig/aud/exp/jti single-use) ─► re-check live state
-   (auth/window/e-stop/budget, fail-closed) ─► resolve DNS ─► check ALL resolved IPs (Tier A/B)
-   ─► PIN validated IP ─► commit request.intent audit BEFORE connect ─► connect to PINNED IP
-   (SNI=orig host) ─► send ─► redirect? request a FRESH grant per hop, stop if out-of-scope
-   ─► emit request.completed/failed (resolved+pinned IP, redacted)  [breaker may trip → halt]
+   auth per-job ingress ─► verify grant (sig/aud/exp/jti single-use) AND grant.spec_sha256==sha256(spec)
+   ─► RECONSTRUCT+normalize the request FROM THE SPEC (assert == spec) ─► re-check live state
+   (auth/window/e-stop/rate, fail-closed) ─► resolve DNS ─► check ALL resolved IPs (Tier A/B)
+   ─► PIN validated IP ─► commit request.intent (spec_sha256, jti, reserved unit) BEFORE connect
+   ─► connect to PINNED IP (SNI=orig host) ─► send ─► redirect? new spec + FRESH grant, stop if off-scope
+   ─► request.completed/failed (resolved+pinned IP, redacted); COMMIT budget on send / RELEASE on denial
         │
         ▼
 Target responds (in-scope only) ──► response returns to worker/sandbox
@@ -284,6 +283,9 @@ Result: there is **no path from UI/API input to a shell**, and **no user-control
 - **ADR-13: Authenticated per-job broker ingress, never a generic CONNECT proxy.** Each broker request carries a per-job identity/capability matching a single-use, audience-bound grant; the broker serves only the exact grant-authorized request line. Rationale: a generic `CONNECT` proxy would void the network-topology guarantee. Trade-off: per-job identity issuance and a `jti` consumption store.
 - **ADR-14: Dual-control approval (N-of-M) for the legal gate.** Authorization attestation and scope expansion require ≥2 distinct, role-verified approvers (never the requester/tester), each pinning the plan/document hash. Rationale: the primary abuse actor is a privileged insider; a single-approver model let one person broaden-and-re-attest. Trade-off: two humans in the loop for legal/scope changes — intentional friction on the highest-consequence action.
 - **ADR-15: Per-engagement cryptographic erasure reconciles secure deletion with WORM/backups.** Engagement data is envelope-encrypted under a per-engagement DEK; deletion destroys the DEK, making ciphertext in primary/WORM/backup stores undecryptable without mutating any immutable store. Rationale: WORM protects integrity during retention but blocks physical deletion. Trade-off: DEK custody and a deletion-verification step. Design: `11-data-retention-and-deletion.md`.
+- **ADR-16: The queued object is an immutable, fully-hashed `request_spec`; grants are minted just-in-time.** Short-lived single-use grants cannot be enqueued (they would expire in the queue or force wide TTLs), so the queue holds an immutable `spec_sha256`-hashed spec and the Scope Authority mints a ≤30s grant only at dispatch, after re-verifying the hash and re-checking scope/auth/window/e-stop/budget against current state. Rationale: keeps the grant out of the queue and makes the authorized request tamper-evident. Trade-off: a JIT mint call on the dispatch hot path — acceptable at this platform's low volumes. Design: `04` §7, `10`.
+- **ADR-17: The broker reconstructs and normalizes the request from the signed spec.** The Guarded Egress Broker never sends a worker-serialized request; it rebuilds the wire request deterministically from the immutable spec (method, canonical URL, fixed header-set, inert payload, session-by-reference) and asserts equality. Rationale: a worker cannot inject a deviation between authorization and the wire. Trade-off: the broker owns request construction and the safe header/payload catalogs.
+- **ADR-18: Explicit WebSocket and budget semantics.** ws/wss handshakes are scoped/pinned like HTTP; established connections are bounded by duration/message/size/count caps and terminated on e-stop/window/expiry. Request budget uses reserve-at-mint / commit-on-send / release-on-denial so the sent count never exceeds the total and no unit leaks. Rationale: long-lived sockets and queue-dwell would otherwise escape the per-request scope/time/budget model. Trade-off: per-connection accounting and interlock-driven connection teardown.
 
 ---
 

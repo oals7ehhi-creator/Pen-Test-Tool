@@ -2,29 +2,33 @@
 
 # Request Authorization Flow, Egress-Grant Tokens & Broker Ingress
 
-This document specifies **how a single outbound request is authorized end-to-end** and **how the data-plane network is arranged** so that authorization cannot be bypassed. It resolves two Phase 0-review blockers:
+This document specifies **how a single outbound request is authorized end-to-end** and **how the data-plane network is arranged** so that authorization cannot be bypassed. It resolves several review blockers:
 
-- **Blocker 2** — the scheduling token cannot bind a resolved IP before the Guarded Egress Broker resolves DNS. We define a **two-stage flow** with **broker-time IP binding** and a fully-specified grant token.
-- **Blocker 6** — the sandbox/worker network arrangement and an **authenticated, per-job broker ingress that is never a generic CONNECT proxy**.
+- **The scheduling token cannot bind a resolved IP** before the Guarded Egress Broker resolves DNS → a **two-stage flow** with **broker-time IP binding**.
+- **Grants are short-lived but jobs sit in a queue** → the **queued object is an immutable, fully-hashed `request_spec`**, and grants are **minted just-in-time (JIT) at dispatch**, bound to the spec's hash, so no grant ever waits in the queue.
+- **The broker must not trust a worker-built request** → the broker **reconstructs and normalizes** the wire request deterministically from the signed immutable spec.
+- **Autonomous request engines** (headless browser, self-driving tools) and **WebSockets** need explicit semantics (§4.4, §5).
+- The sandbox/worker network arrangement and an **authenticated, per-job broker ingress that is never a generic CONNECT proxy** (§4).
 
-Canonical components (see `04` and `00`): **Scope Authority** (sole decision authority, mints grants, no target I/O) and **Guarded Egress Broker** (sole socket-creator to targets, resolves/pins/connects).
+Canonical components (see `04` and `00`): **Scope Authority** (sole decision authority, mints grants, no target I/O, no target DNS) and **Guarded Egress Broker** (sole target-socket creator, resolves/pins/connects, reconstructs the request).
 
 ---
 
 ## 1. Why two stages
 
-The resolved IP of a target is unknown until DNS is resolved, and **only the Guarded Egress Broker resolves target DNS** (co-located with socket creation, so the validated IP is the dialed IP — the anti-rebinding guarantee). A grant minted at scheduling time therefore **cannot** contain a resolved IP. Binding a resolved IP at mint time was the internal contradiction the review flagged. The fix:
+The resolved IP of a target is unknown until DNS is resolved, and **only the Guarded Egress Broker resolves target DNS** (co-located with socket creation, so the validated IP is the dialed IP — the anti-rebinding guarantee). A grant minted at scheduling time therefore **cannot** contain a resolved IP. Furthermore, grants are short-lived and single-use, so a grant cannot be enqueued and wait — the **immutable `request_spec`** is what waits in the queue, and the grant is minted **just-in-time** when a dispatcher is ready to execute. The fix:
 
-- **Stage 1 — Scheduling / grant issuance (Scope Authority).** Authorizes the exact *request line* (method + canonical URL/host/port/scheme/path), binds it to the frozen scope and authorization, and mints a short-TTL, single-use signed **egress grant**. No IP is bound.
-- **Stage 2 — Broker-time authorization (Guarded Egress Broker).** Authenticates the job, verifies the grant, re-checks live state (fail-closed), resolves DNS, validates **every** resolved IP against the network guard and the frozen scope, **pins** the validated IP, connects, and records the resolved+pinned IP in the completion audit event.
+- **Queued object — immutable `request_spec` (`04` §7.0).** A fully-hashed (`spec_sha256`) specification of the exact request: method, canonical URL/host/port/scheme/path, a fixed header-set id, an inert payload id, an operator-session reference (value resolved later at the broker), mode, and (if intrusive) an approval reference. Created once, never mutated; the queue stores only `(spec_id, tenant_id)`.
+- **Stage 1 — JIT grant issuance (Scope Authority).** At dispatch, the Authority loads the spec, **recomputes and verifies `spec_sha256`**, re-runs the scope/authorization/window/e-stop/budget checks against *current* state, reserves one budget unit, and mints a short-TTL (≤30s), single-use signed **egress grant bound to `spec_sha256`** — not to a re-listed request line, and never to a resolved IP.
+- **Stage 2 — Broker-time authorization (Guarded Egress Broker).** Authenticates the job, verifies the grant and that `grant.spec_sha256 == sha256(spec)`, **reconstructs and normalizes** the wire request from the spec (never a worker-serialized request), re-checks live state (fail-closed), resolves DNS, validates **every** resolved IP against the network guard and the frozen scope, **pins** the validated IP, connects, and records the resolved+pinned IP in the completion event.
 
-This preserves "one decision authority, one enforcer" while making IP validation happen where — and only where — the IP is known.
+This preserves "one decision authority, one enforcer," makes IP validation happen where — and only where — the IP is known, and keeps the short-lived grant out of the queue entirely.
 
 ---
 
 ## 2. The egress grant token (Stage-1 output)
 
-A compact, signed token (e.g. a PASETO/JWS-style structure with an Ed25519 signature from the Scope Authority; algorithm pinned, `none` forbidden). It is a **capability**: possession + validity authorizes exactly one request line, once.
+A compact, signed token (e.g. a PASETO/JWS-style structure with an Ed25519 signature from the Scope Authority; algorithm pinned, `none` forbidden). It is a **capability**: possession + validity authorizes exactly one immutable spec, once. Because it binds `spec_sha256`, it transitively binds the exact method and canonical path (they are fields of the spec) without re-listing them.
 
 | Claim | Purpose |
 |---|---|
@@ -33,20 +37,17 @@ A compact, signed token (e.g. a PASETO/JWS-style structure with an Ed25519 signa
 | `sub` | Subject = `run_id` (the scan run). |
 | `job_id` | The specific job/check invocation this grant serves. |
 | `jti` | Unique nonce. **Single-use**: the broker consumes it exactly once (replay protection). |
-| `iat`, `nbf`, `exp` | Issued-at, not-before, expiry. **Short TTL** (seconds to low minutes) bounds the replay window. |
+| `iat`, `nbf`, `exp` | Issued-at, not-before, expiry. **Short TTL (≤30s)** — the grant is minted JIT and only has to cover dispatch→send. |
 | `tenant_id`, `engagement_id` | Tenancy binding; must match the job's identity and the broker's per-job context. |
 | `authorization_id`, `authorization_exp` | The legal authority in force; broker re-checks freshness at Stage 2. |
 | `scope_hash` | The exact frozen `scope_version` the decision was made against (`04` §4.1). Broker loads that immutable version to re-validate resolved IPs. |
-| `method` | Exact HTTP method authorized. A grant for `GET` cannot drive a `POST`. |
-| `canonical_url` | Full canonical URL (scheme, host, port, path) — the exact request line. |
-| `canonical_host`, `port`, `scheme`, `canonical_path` | Decomposed, redundant with `canonical_url`, for cheap broker checks and path-prefix enforcement. |
+| **`spec_sha256`** | **Hash of the immutable `request_spec` this grant authorizes.** The broker requires `grant.spec_sha256 == sha256(presented spec)`; the method, canonical URL/host/port/scheme/path, header-set, and payload all live in the spec, so a grant cannot be replayed against any other request line or verb. |
 | `mode` | `passive` / `safe_active` / `approval_gated`. |
 | `request_class` | `native` / `tool_driven` / `browser`. Controls which egress-inspection mode applies (`08` §2). |
-| `approval_ref` | Required for intrusive/elevated class; the approval must be `approved`, unexpired, and plan-hash-matched. Null otherwise. |
-| `budget_ref` | Reference used to atomically decrement the engagement request budget on send. |
+| `approval_ref` | Required for intrusive/elevated class; the approval must be `approved`, unexpired, and its `plan_sha256` must cover this `spec_sha256`. Null otherwise. |
 | `sig` | Signature over all claims (Ed25519). Broker verifies before anything else. |
 
-**Explicitly NOT in the grant:** any resolved IP (unknown at Stage 1). Path and method **are** bound (closing the earlier "IP-level token authorizes any path/verb" gap — the former SI-043, now folded into SI-001/SI-053).
+**Explicitly NOT in the grant:** any resolved IP (unknown at Stage 1); and no re-listed request line — the line is the hashed spec. Budget is not referenced by a claim: it is **reserved at grant-mint** and committed/released by the broker (`04` §8). Method and path are bound via `spec_sha256` (closing the earlier "IP-level token authorizes any path/verb" gap).
 
 **Replay & forgery protection:** signature + pinned algorithm; `aud` binding to one broker; `nbf`/`exp` short window; `jti` single-use consumed in a strongly-consistent store; per-job ingress identity (§4) so a leaked grant is useless without the job's mTLS identity.
 
@@ -55,32 +56,41 @@ A compact, signed token (e.g. a PASETO/JWS-style structure with an Ed25519 signa
 ## 3. End-to-end sequence
 
 ```
-Scheduler ── job ──▶ Scope Authority  (STAGE 1)
-                     run §7 steps 0–5 over the frozen scope_version
-                     PASS ─▶ mint egress grant (claims in §2), emit scope.decision.allow
-                     FAIL ─▶ DENY (audited); job not dispatched
+Check engine ── builds ──▶ immutable request_spec (hashed: spec_sha256); ENQUEUE (spec_id, tenant_id)
+        │                    (the queue holds the spec reference, NOT a grant)
+        ▼ dispatcher pulls a queued spec when ready to execute
+Dispatcher ── spec_id ──▶ Scope Authority  (STAGE 1, JUST-IN-TIME)
+                     load spec; recompute + verify spec_sha256 (else DENY spec_tampered)
+                     re-run §7 checks 0–5 over the frozen scope_version, against CURRENT state
+                     PASS ─▶ RESERVE 1 budget unit; mint short-TTL grant bound to spec_sha256 (§2);
+                              emit scope.decision.allow
+                     FAIL ─▶ DENY (audited); spec stays queued for later, or dropped on hard failure
         │
-        ▼ grant + job dispatched to a Worker (control plane → data plane; jobs pulled, no inbound to workers)
-Worker (data plane) constructs a STRUCTURED request (typed struct; never a command string)
-        │  presents (job identity + grant) to the broker's authenticated per-job ingress (§4)
+        ▼ grant + spec dispatched to a Worker (control plane → data plane; jobs pulled, no inbound to workers)
+Worker (data plane) presents (per-job identity + grant + spec) to the broker's authenticated ingress (§4)
+        │  the worker does NOT serialize the HTTP request itself
         ▼
 Guarded Egress Broker  (STAGE 2)
    1. INGRESS AUTH   — verify per-job mTLS/capability; bind connection to (tenant, engagement, run, job)
-   2. VERIFY GRANT   — signature, iss, aud==self, nbf/exp, jti unused → consume; tenant/engagement match
-   3. RE-CHECK STATE — authorization fresh, window open, e-stop clear, budget>0, rate/concurrency slot
-                       (fail-closed per SI-046: any unknown ⇒ DENY)
-   4. RESOLVE DNS    — canonical_host → all A/AAAA
-   5. GUARD + SCOPE  — every resolved IP: network guard (§6) + must satisfy scope_hash's ip/cidr/domain rules
-   6. PIN + CONNECT  — dial ONLY a pinned validated IP; TLS cert host must match canonical_host
-   7. INTENT AUDIT   — durably commit request.intent BEFORE the socket write (SI-055)
-   8. SEND           — issue exactly the grant's method + path; body from inert payload catalog only
-   9. REDIRECT?      — do NOT auto-follow; request a FRESH grant for the Location; else STOP
-  10. COMPLETE AUDIT — request.completed/failed with resolved+pinned IP, status, byte counts (redacted)
+   2. VERIFY GRANT   — signature, iss, aud==self, nbf/exp, jti unused → consume; AND grant.spec_sha256 == sha256(spec)
+   3. RECONSTRUCT    — deterministically rebuild the wire request FROM THE SPEC (method, url, header-set,
+                       inert payload, operator session from the secret lease); re-normalize; assert == spec  else DENY
+   4. RE-CHECK STATE — authorization fresh, window open, e-stop clear, rate/concurrency slot
+                       (fail-closed per SI-046: any unknown ⇒ DENY and RELEASE the reservation)
+   5. RESOLVE DNS    — canonical_host → all A/AAAA
+   6. GUARD + SCOPE  — every resolved IP: network guard (§6) + must satisfy scope_hash's ip/cidr/domain rules
+   7. PIN + CONNECT  — dial ONLY a pinned validated IP; TLS cert host must match canonical_host
+   8. INTENT AUDIT   — durably commit request.intent (spec_sha256, jti, reserved unit) BEFORE the socket write,
+                       in ONE transaction with the reservation (SI-055)
+   9. SEND           — issue exactly the reconstructed request
+  10. REDIRECT?      — do NOT auto-follow; form a NEW spec for the Location and request a FRESH JIT grant; else STOP
+  11. COMPLETE AUDIT — request.completed/failed with resolved+pinned IP, status, byte counts (redacted);
+                       COMMIT the reserved budget unit on send / RELEASE it on any pre-send denial
         │
         ▼ response (in-scope only) ─▶ redaction ─▶ minimized evidence ─▶ finding
 ```
 
-If any Stage-2 step fails, **no socket is opened** (or an open socket is closed) and a deny/failure event is recorded.
+If any Stage-2 step fails, **no socket is opened** (or an open socket is closed), the reserved budget unit is released, and a deny/failure event is recorded.
 
 ---
 
@@ -105,20 +115,40 @@ The network is arranged so that authorization is a **topology invariant**, not j
   - never proxies a destination that did not come from a Scope-Authority grant.
 - HTTPS inspection mode is chosen per `request_class` (`08` §2, SI-042): request-by-request adapter driving with redirects disabled (preferred), or broker TLS-termination with a **sandbox-only** internal CA. The broker is not a passthrough tunnel in either mode — every request line is grant-authorized and visible to the broker for scope/path/redirect/body enforcement.
 
-**Result:** three independent layers must all agree before a target is contacted — (1) the network namespace lets the sandbox reach only the broker, (2) the broker authenticates the per-job identity, and (3) a valid, single-use, request-line-bound grant exists. A defect in any one degrades toward *refusing to connect*.
+**Result:** three independent layers must all agree before a target is contacted — (1) the network namespace lets the sandbox reach only the broker, (2) the broker authenticates the per-job identity, and (3) a valid, single-use, `spec_sha256`-bound grant exists. A defect in any one degrades toward *refusing to connect*.
+
+### 4.4 Broker-mediated JIT for autonomous request engines
+A headless browser or a self-driving tool emits many requests the check engine did not pre-enumerate, so they cannot be pre-enqueued as specs. Instead the broker mediates: for **each** intercepted request line it **forms a `request_spec` on the fly**, computes `spec_sha256`, and asks the Scope Authority for a **JIT grant** (Stage 1 over the frozen scope). Only if a grant is minted does the request proceed (Stage 2 reconstruction/resolve/pin/connect). An out-of-scope subresource or an off-scope redirect gets **no grant → blocked**. The Scope Authority stays the sole minter and the broker the sole socket creator; budget/rate/window/e-stop apply per intercepted request exactly as for native checks.
 
 ---
 
-## 5. Invariant mapping
+## 5. WebSocket semantics
+
+WebSockets do not fit the one-request/one-response model, so their handling is stated explicitly:
+
+- **Handshake is authorized like HTTP.** A `kind='websocket'` spec (method `GET`, scheme `ws`/`wss`) authorizes the **Upgrade handshake** to a canonical path. Stage 1 scopes it; Stage 2 reconstructs, resolves DNS, validates every IP, **pins**, and connects — identical to an HTTP request. There is no separate un-scoped path.
+- **Scope is fixed at the pinned handshake.** An established socket cannot change target host/IP; there is no per-message re-targeting, so post-upgrade frames need no per-message scope check — the connection is already pinned in-scope.
+- **Bounded connection.** Each connection counts against `engagement.max_ws_connections` (`ws_in_flight`) and is capped by `ws_max_duration_s`, `ws_max_messages`, and `ws_max_message_bytes` (`04` §8). Exceeding a cap closes the connection.
+- **Interlocks terminate connections.** Emergency stop, testing-window close, and authorization expiry **abort active WebSocket connections**, not just block new ones (SI-013 extended to long-lived sockets).
+- **Non-destructive frames only.** The platform sends only inert/observation frames per the check contract — never destructive or high-volume fuzzing.
+- **Handshake redirects** are re-authorized like any HTTP redirect (new spec + JIT grant); an established WS is never auto-followed anywhere.
+
+---
+
+## 6. Invariant mapping
 
 | Concern | Invariant |
 |---|---|
-| Single choke point; grant binds request line (method/path), broker-time IP validation & pinning | **SI-001** (rewritten), **SI-003**, **SI-004** |
-| Two-stage flow, grant claim set, single-use/replay protection, broker-time binding | **SI-053** |
-| Authenticated per-job ingress; no generic CONNECT proxy | **SI-053** |
-| Tool/browser broker-only; client DNS off | **SI-041** |
+| Single choke point; grant binds `spec_sha256`; broker-time IP validation & pinning | **SI-001** (rewritten), **SI-003**, **SI-004** |
+| Immutable hashed `request_spec` as queued object; JIT grant minting | **SI-060** |
+| Broker reconstructs/normalizes the request from the spec; no worker-serialized request | **SI-061** |
+| Two-stage flow, grant claim set, single-use/replay protection, broker-time binding, per-job ingress, no generic CONNECT | **SI-053** |
+| Budget reserve-at-mint / commit-on-send / release-on-denial | **SI-062** (with **SI-017**) |
+| Tool/browser broker-only; client DNS off; broker-mediated JIT per request | **SI-041**, **SI-054** |
 | HTTPS inspection point (driven vs sandbox-CA termination) | **SI-042** |
 | Worker narrow internal allowlist + broker only; no direct target/internet | **SI-054** (refines **SI-033**) |
-| Redirect re-authorization per hop | **SI-005** |
+| Redirect re-authorization per hop (new spec + grant) | **SI-005** |
+| WebSocket handshake scoped/pinned; connection bounded and terminated on interlocks | **SI-063** |
+| Window/expiry/e-stop re-checked at JIT mint and Stage 2 | **SI-011**, **SI-012**, **SI-049** |
 | Fail-closed on any unresolved dependency at Stage 2 | **SI-046** |
-| Request intent durably committed before egress | **SI-055** |
+| Request intent (spec_sha256 + jti + reservation) durably committed before egress | **SI-055** |

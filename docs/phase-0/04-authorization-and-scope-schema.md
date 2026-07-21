@@ -24,6 +24,7 @@
 6. **Canonicalize before you compare.** All matching is performed on a single canonical form for host, IP, port, scheme, and path. Raw operator input is preserved separately for audit but is never the thing matched against.
 7. **Dual control on the legal gate.** Authorization attestation and any scope expansion require two distinct approvers (§10); no single actor can broaden what may be tested.
 8. **Composite-tenant integrity.** Every child row references its parent by a composite `(id, tenant_id)` foreign key, so a row can never point at a parent in another tenant (§1).
+9. **The queued object is immutable and hashed.** Work is queued as an immutable, fully-hashed `request_spec`; short-lived egress grants are minted **just-in-time** at dispatch and bound to the spec's hash, so no grant ever waits in the queue (§7).
 
 ---
 
@@ -85,10 +86,17 @@ TABLE engagement (
   max_response_body_bytes INT NOT NULL DEFAULT 2097152 CHECK (max_response_body_bytes > 0), -- 2 MiB
 
   -- Scope-breadth ceilings (see §4.6) — bound how broad a scope may get before elevated approval
-  max_scope_hosts         INT NOT NULL DEFAULT 1024 CHECK (max_scope_hosts BETWEEN 1 AND 65536),
-  max_scope_addresses     BIGINT NOT NULL DEFAULT 65536 CHECK (max_scope_addresses >= 1),
-  min_ipv4_prefix         INT NOT NULL DEFAULT 24 CHECK (min_ipv4_prefix BETWEEN 8 AND 32),
-  min_ipv6_prefix         INT NOT NULL DEFAULT 48 CHECK (min_ipv6_prefix BETWEEN 32 AND 128),
+  max_scope_hosts          INT NOT NULL DEFAULT 1024 CHECK (max_scope_hosts BETWEEN 1 AND 65536),
+  max_ipv4_equiv_addresses BIGINT NOT NULL DEFAULT 65536 CHECK (max_ipv4_equiv_addresses >= 1),
+  max_cidr_entries         INT NOT NULL DEFAULT 64 CHECK (max_cidr_entries BETWEEN 1 AND 4096),
+  min_ipv4_prefix          INT NOT NULL DEFAULT 24 CHECK (min_ipv4_prefix BETWEEN 8 AND 32),
+  min_ipv6_prefix          INT NOT NULL DEFAULT 48 CHECK (min_ipv6_prefix BETWEEN 32 AND 128),
+
+  -- WebSocket caps (see §7.2): established ws/wss connections are bounded, not per-message scoped
+  max_ws_connections       INT NOT NULL DEFAULT 4 CHECK (max_ws_connections BETWEEN 0 AND 64),
+  ws_max_duration_s        INT NOT NULL DEFAULT 300 CHECK (ws_max_duration_s BETWEEN 1 AND 3600),
+  ws_max_messages          INT NOT NULL DEFAULT 500 CHECK (ws_max_messages BETWEEN 1 AND 100000),
+  ws_max_message_bytes     INT NOT NULL DEFAULT 65536 CHECK (ws_max_message_bytes BETWEEN 1 AND 1048576),
 
   -- Data-handling posture (see 11-data-retention-and-deletion.md)
   raw_quarantine_enabled  BOOLEAN NOT NULL DEFAULT FALSE,   -- off by default (SI-057)
@@ -102,6 +110,12 @@ TABLE engagement (
   emergency_stopped_by    UUID,
 
   UNIQUE (id, tenant_id),                                    -- target of composite child FKs
+  -- Deferred composite FKs break the engagement<->authorization<->scope_version cycle while still
+  -- guaranteeing same-tenant references (verified at COMMIT, not per-statement).
+  FOREIGN KEY (active_authorization_id, tenant_id)
+        REFERENCES authorization(id, tenant_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (active_scope_version_id, tenant_id)
+        REFERENCES scope_version(id, tenant_id) DEFERRABLE INITIALLY DEFERRED,
   CONSTRAINT rps_host_le_global   CHECK (per_host_max_rps <= global_max_rps),
   CONSTRAINT conc_host_le_global  CHECK (per_host_concurrency <= max_concurrency),
   CONSTRAINT budget_used_le_total CHECK (request_budget_used <= request_budget_total)
@@ -215,6 +229,8 @@ TABLE authorization (
   FOREIGN KEY (engagement_id, tenant_id)  REFERENCES engagement(id, tenant_id),
   FOREIGN KEY (scope_version_id, tenant_id) REFERENCES scope_version(id, tenant_id),
   FOREIGN KEY (superseded_by, tenant_id)  REFERENCES authorization(id, tenant_id),
+  FOREIGN KEY (attestation_approval_id, tenant_id)
+        REFERENCES approval_request(id, tenant_id) DEFERRABLE INITIALLY DEFERRED,
   CONSTRAINT auth_dates_valid CHECK (expires_at > effective_from),
   CONSTRAINT attest_true      CHECK (written_auth_attested = TRUE),
   CONSTRAINT active_needs_dual_approval CHECK (          -- cannot go active without a resolved attestation approval
@@ -244,9 +260,11 @@ TABLE scope_version (
   engagement_id  UUID NOT NULL,
   version_number INT  NOT NULL,
   scope_hash     CHAR(64) NOT NULL,       -- canonical hash defined below
-  entry_count    INT NOT NULL,
-  host_count     INT NOT NULL,            -- distinct hosts (breadth accounting, §4.6)
-  address_count  BIGINT NOT NULL,         -- sum of allow ip/cidr sizes minus exclusions (breadth accounting)
+  entry_count          INT NOT NULL,
+  host_count           INT NOT NULL,      -- distinct allow domain host-families (a wildcard = its own family), §4.6
+  ipv4_equiv_addresses BIGINT NOT NULL,   -- Σ over allow IPv4 ip/cidr of 2^(32 - prefix); a single ip = 1
+  cidr_entry_count     INT NOT NULL,      -- count of allow ip/cidr entries (both families)
+  ipv6_min_prefix      INT,               -- broadest (numerically smallest) allow IPv6 prefix present, or NULL
   created_by     UUID NOT NULL,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   note           TEXT CHECK (char_length(note) <= 1000),
@@ -270,7 +288,7 @@ TABLE scope_version (
     api_doc_sha256, sort(api_operations) )
   ```
 
-  Null out fields not applicable to the class, serialize each tuple as canonical JSON, sort the tuples lexicographically, concatenate, and `SHA-256`. The hash is therefore independent of insertion order and cosmetic input but sensitive to any host/range/port/scheme/path/operation/exclusion/elevation change. `entry_count`, `host_count`, and `address_count` are derived at freeze time and are part of the breadth checks (§4.6) — they are also included as a trailer in the hashed document so breadth cannot drift under a fixed hash.
+  Null out fields not applicable to the class, serialize each tuple as canonical JSON, sort the tuples lexicographically, concatenate, and `SHA-256`. The hash is therefore independent of insertion order and cosmetic input but sensitive to any host/range/port/scheme/path/operation/exclusion/elevation change. `entry_count`, `host_count`, `ipv4_equiv_addresses`, `cidr_entry_count`, and `ipv6_min_prefix` are computed deterministically at freeze time and included as a trailer in the hashed document, so breadth cannot drift under a fixed hash. Breadth reflects **allow-entry worst case**; **exclusions are not subtracted** — an exclusion must never be a way to smuggle a broader allow past a ceiling.
 
 ### 4.2 Scope entry (supertype + typed value, strict per-class shape)
 
@@ -390,10 +408,12 @@ Broad scope is the quiet path from an authorized assessment to an unauthorized o
 | IPv6 CIDR prefix | `prefix_len` ≥ `engagement.min_ipv6_prefix` (default `/48`) | Same pattern; absolute floor `/32` ⇒ hard reject. |
 | Wildcard domain | Any `*.host` entry | Must be `elevated` + dual-approved; PSL/apex wildcards hard-rejected. |
 | Distinct hosts | `scope_version.host_count` ≤ `engagement.max_scope_hosts` (default 1024) | Above ceiling ⇒ elevated dual approval required to raise the ceiling. |
-| Total addresses | `scope_version.address_count` ≤ `engagement.max_scope_addresses` (default 65536) | Above ceiling ⇒ elevated dual approval. |
+| IPv4-equivalent addresses | `scope_version.ipv4_equiv_addresses` ≤ `engagement.max_ipv4_equiv_addresses` (default 65536) | Above ceiling ⇒ elevated dual approval. Computed as Σ `2^(32-prefix)` over allow IPv4 ip/cidr entries (a single ip = 1). |
+| CIDR entry count | `scope_version.cidr_entry_count` ≤ `engagement.max_cidr_entries` (default 64) | Above ceiling ⇒ elevated dual approval. |
+| IPv6 breadth | `ipv6_min_prefix` ≥ `engagement.min_ipv6_prefix` | Governed **solely** by the per-entry prefix floor + elevated approval — **never** an address sum (an IPv6 /64 already holds 2^64 addresses, so summing addresses is meaningless). |
 | **Scope expansion** | Any new host/domain/IP/range vs the currently-authorized `scope_version` | Requires an `approval_request` of type `scope_expansion` at threshold **and** re-attestation (new authorization). |
 
-`entry_count`, `host_count`, and `address_count` are computed at freeze and bound into the hashed document (§4.1). The Scope Authority refuses to mint grants for a `scope_version` whose breadth exceeds ceilings without the corresponding approved elevation.
+`host_count`, `ipv4_equiv_addresses`, `cidr_entry_count`, and `ipv6_min_prefix` are computed at freeze and bound into the hashed document (§4.1); IPv4 breadth is an exact worst-case address budget while IPv6 breadth is bounded by prefix floors (address counting is deliberately avoided for IPv6). The Scope Authority refuses to mint grants for a `scope_version` whose breadth exceeds ceilings without the corresponding approved elevation.
 
 ---
 
@@ -462,70 +482,120 @@ Applied to **every resolved IP** and every IP literal by the Guarded Egress Brok
 
 ---
 
-## 7. Request authorization — the two-stage decision procedure
+## 7. Request authorization — immutable request spec + just-in-time two-stage flow
 
-Every outbound request passes a **two-stage** flow (blocker 2). The full token/ingress design is in `10-request-authorization-flow.md`; this section defines the ordered checks and which component owns each.
+Every outbound request passes a **two-stage** flow. **The object placed on the queue is an immutable, fully-hashed `request_spec` — never a grant.** Egress grants are short-lived (TTL in seconds) and single-use, so they are **minted just-in-time at dispatch**, not at enqueue; a grant's lifetime only has to cover *dispatch → send*, never the (possibly long) queue dwell time. Full token/ingress design: `10-request-authorization-flow.md`.
 
-**Why two stages:** the resolved IP is unknown until DNS is resolved, and DNS resolution of targets is done only by the Guarded Egress Broker at connect time. Therefore the Stage-1 grant (minted by the Scope Authority at scheduling) **cannot and does not bind a resolved IP** — it binds the exact request *line*. The resolved IP is validated and pinned at Stage 2, at the broker, and recorded in the completion audit event.
+### 7.0 The queued object — immutable `request_spec`
+
+```sql
+TABLE request_spec (               -- the IMMUTABLE, fully-hashed queued object
+  id                 UUID PRIMARY KEY,
+  tenant_id          UUID NOT NULL,
+  engagement_id      UUID NOT NULL,
+  run_id             UUID NOT NULL,
+  job_id             UUID NOT NULL,
+  scope_hash         CHAR(64) NOT NULL,       -- the frozen scope_version this spec was specced against
+  authorization_id   UUID NOT NULL,
+  request_class      TEXT NOT NULL CHECK (request_class IN ('native','tool_driven','browser')),
+  kind               TEXT NOT NULL CHECK (kind IN ('http','websocket')),  -- WS handshake vs HTTP request
+  check_id           TEXT,                    -- registered check id (native)
+  tool_template_id   TEXT,                    -- pinned tool/template id (tool_driven), else NULL
+  method             TEXT NOT NULL CHECK (method IN ('GET','HEAD','OPTIONS','POST','PUT','PATCH','DELETE')),
+  canonical_url      TEXT NOT NULL,
+  canonical_host     TEXT NOT NULL,
+  port               INT  NOT NULL CHECK (port BETWEEN 1 AND 65535),
+  scheme             TEXT NOT NULL CHECK (scheme IN ('https','http','wss','ws')),
+  canonical_path     TEXT NOT NULL,
+  query_canonical    TEXT,                    -- canonical, redaction-safe query (never secrets)
+  header_set_id      TEXT NOT NULL,           -- id of a FIXED safe header template (no free-form headers)
+  session_ref        TEXT,                    -- ref to an operator session lease; VALUE injected by broker,
+                                              --   never stored here and EXCLUDED from spec_sha256
+  payload_id         TEXT,                    -- id of an INERT payload from the curated catalog (no free-form body)
+  mode               TEXT NOT NULL CHECK (mode IN ('passive','safe_active','approval_gated')),
+  approval_ref       UUID,                    -- required for approval_gated / intrusive class
+  spec_sha256        CHAR(64) NOT NULL,       -- canonical hash over ALL request-determining fields (below)
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  frozen             BOOLEAN NOT NULL DEFAULT TRUE,   -- specs are immutable from creation
+
+  UNIQUE (id, tenant_id),
+  UNIQUE (tenant_id, spec_sha256),
+  FOREIGN KEY (engagement_id, tenant_id)    REFERENCES engagement(id, tenant_id),
+  FOREIGN KEY (authorization_id, tenant_id) REFERENCES authorization(id, tenant_id),
+  FOREIGN KEY (approval_ref, tenant_id)     REFERENCES approval_request(id, tenant_id),
+  CONSTRAINT ws_is_get      CHECK (kind <> 'websocket' OR (method = 'GET' AND scheme IN ('ws','wss'))),
+  CONSTRAINT gated_needs_ref CHECK (mode <> 'approval_gated' OR approval_ref IS NOT NULL)
+);
+-- Immutability: UPDATE/DELETE are revoked at the grant level; a spec is created once, never mutated.
+-- spec_sha256 = SHA-256 over canonical JSON of
+--   (engagement_id, scope_hash, authorization_id, request_class, kind, check_id, tool_template_id,
+--    method, canonical_url, canonical_host, port, scheme, canonical_path, query_canonical,
+--    header_set_id, payload_id, mode, approval_ref).   session_ref is EXCLUDED (resolved at the broker).
+```
+
+- **Immutable & hashed.** A `request_spec` is created once — by the check engine for native checks, or by the broker for tool/browser requests (§7.2) — and never mutated; `spec_sha256` is the canonical hash over every request-determining field. **The queue stores only `(spec_id, tenant_id)`**, not a grant.
+- **No free-form request.** `method`, the `canonical_*` fields, a fixed `header_set_id`, an inert `payload_id`, and a `session_ref` (resolved to a secret lease at the broker, never stored) fully determine the wire request. A worker cannot hand the broker an arbitrary serialized request.
+
+### 7.1 The two-stage procedure
 
 ```
-STAGE 1 — SCOPE AUTHORITY (control plane; no target I/O). Mints a signed egress grant or DENIES.
-INPUT: engagement_id, method, candidate_url, mode, request_class, actor, approval_ref?
+STAGE 1 — SCOPE AUTHORITY (control plane; no target I/O). Called JUST-IN-TIME at dispatch. Mints a grant or DENIES.
+INPUT: spec_id (the immutable request_spec)
 
- 0. PRECONDITIONS (engagement-level gate)
-    a. engagement.status ∈ {authorized, active}          else DENY(engagement_not_active)
-    b. engagement.emergency_stop = FALSE                  else DENY(emergency_stop)
-    c. authorization active, effective_from ≤ now < expires_at   else DENY(authorization_invalid/expired)
-    d. engagement.active_scope_hash == authorization.scope_hash  else DENY(scope_binding_broken)
-    e. now inside a testing window AND not blackout       else DENY(outside_testing_window)
-    f. mode ∈ authorization.allowed_modes ∩ engagement.allowed_modes  else DENY(mode_not_authorized)
-    g. request_budget_used < request_budget_total         else DENY(budget_exhausted)
-    h. for intrusive/elevated class: approval_ref resolves to an APPROVED, unexpired approval
-       whose plan hash matches this request                else DENY(approval_missing)
- 1. PARSE + CANONICALIZE (§5). Malformed/bad-encoding/disallowed-scheme/zone-id ⇒ DENY.
- 2. SCHEME CHECK against allowed protocol entries.        else DENY(scheme_not_in_scope)
- 3. IF host is an IP literal → NETWORK GUARD (§6): Tier A ⇒ DENY(hard_denied);
-    Tier B without full elevation ⇒ DENY(restricted_range).
- 4. EXCLUSION CHECK (host/port/path/bound-host) — ANY match ⇒ DENY(excluded).
- 5. ALLOWLIST CHECK: host ∈ domain/ip/cidr allow AND port allowed AND
-    (path within an allowed path_prefix bound to this host OR no path_prefix constrains this host)
-    AND (if api_resource entries bind this host, operation allowed).  No match ⇒ DENY(not_in_scope).
- → ON PASS: MINT a Stage-1 egress grant (see doc 10): signed, short-TTL, single-use (jti), bound to
-   {iss, aud=broker, run_id, job_id, jti, iat/nbf/exp, tenant_id, engagement_id, scope_hash,
-    authorization_id, method, canonical_url, canonical_host, port, scheme, canonical_path,
-    mode, request_class, approval_ref?}.  NO resolved IP is bound here.
-   Emit audit `scope.decision.allow` (engagement stream).
+ A. LOAD spec; recompute spec_sha256; MUST equal the stored value            else DENY(spec_tampered)
+ 0. PRECONDITIONS (re-evaluated against CURRENT state, on the trusted clock):
+    a. engagement.status ∈ {authorized, active}                              else DENY(engagement_not_active)
+    b. engagement.emergency_stop = FALSE                                     else DENY(emergency_stop)
+    c. authorization active, effective_from ≤ now < expires_at               else DENY(authorization_invalid/expired)
+    d. engagement.active_scope_hash == spec.scope_hash == authorization.scope_hash  else DENY(scope_binding_broken)
+    e. now inside a testing window AND not blackout                          else DENY(outside_testing_window)
+    f. spec.mode ∈ authorization.allowed_modes ∩ engagement.allowed_modes    else DENY(mode_not_authorized)
+    g. budget: (request_budget_used + reserved) < request_budget_total       else DENY(budget_exhausted)
+    h. approval_gated/intrusive class: spec.approval_ref resolves to an APPROVED, unexpired approval whose
+       plan_sha256 COVERS spec.spec_sha256                                   else DENY(approval_missing)
+ 1-5. PARSE/CANONICALIZE, SCHEME, IP-LITERAL NETWORK GUARD (§6), EXCLUSIONS, ALLOWLIST — over the spec's
+      canonical fields, against the frozen scope_version identified by spec.scope_hash. Any fail ⇒ DENY.
+ → ON PASS: RESERVE 1 budget unit atomically (engagement_runtime_counter.reserved += 1) and MINT a
+   short-TTL (≤30s), single-use grant bound to {iss, aud=broker, run_id, job_id, jti, iat/nbf/exp,
+   tenant_id, engagement_id, authorization_id, scope_hash, SPEC_SHA256, mode, request_class, approval_ref?}.
+   NO resolved IP and NO request line are in the grant — the request line lives in the immutable spec.
+   Emit audit scope.decision.allow. If window/expiry/budget/e-stop fails, NO grant is minted and the spec
+   remains queued for a later dispatch (or is dropped on hard failure) — a stale grant can never sit in the queue.
 
 STAGE 2 — GUARDED EGRESS BROKER (data-plane enforcer; the ONLY socket creator).
- 6. INGRESS AUTH: authenticate the calling job's per-job identity/capability (doc 10, §ingress);
-    reject unauthenticated callers. This is NOT a generic CONNECT proxy.
- 7. VERIFY GRANT: signature, iss, aud==this broker, nbf/exp valid, jti unused (consume single-use);
-    replayed/forged/expired ⇒ DENY(grant_invalid).
- 8. RE-CHECK LIVE STATE (fail-closed per SI-046): authorization not expired/revoked, window open,
-    emergency_stop clear, budget remaining, rate/concurrency token available.  Any unknown ⇒ DENY.
- 9. DNS RESOLUTION + RESOLVED-IP RE-CHECK (rebinding protection):
-    a. Resolve canonical_host → all A/AAAA records.
-    b. For EACH resolved IP: NETWORK GUARD (§6) [Tier A ⇒ DENY; Tier B w/o full elevation ⇒ DENY],
-       AND the resolved IP must satisfy the frozen scope_version (in an allowed ip/cidr, or the host
-       is an allowlisted domain permitted to resolve to public space).  ANY failure ⇒ DENY.
-    c. PIN the validated IP set; connect ONLY to a pinned, validated IP (no re-resolution).
-10. CONNECT to pinned IP; on TLS verify the certificate hostname matches canonical_host.
-11. REDIRECT HANDLING: do NOT auto-follow. On 3xx, canonicalize Location and request a FRESH
-    Stage-1 grant from the Scope Authority for the new request line; only proceed if minted.
-    Out-of-scope ⇒ STOP, record. Bounded max-redirect depth; each hop independently authorized.
-12. AUDIT: a durable `request.intent` event is committed BEFORE the socket opens (SI-055);
-    a `request.completed`/`request.failed` event afterward records the resolved+pinned IP, status,
-    and byte counts (redacted). Budget decremented atomically on send.
+ 6. INGRESS AUTH: authenticate the calling job's per-job identity/capability; NOT a generic CONNECT proxy.
+ 7. VERIFY GRANT: signature, iss, aud==self, nbf/exp, jti unused (consume single-use). AND
+    grant.spec_sha256 == sha256(presented spec) — the spec is exactly the one authorized.  Mismatch ⇒ DENY.
+ 8. RECONSTRUCT + NORMALIZE the outbound request DETERMINISTICALLY from the immutable spec: method,
+    URL (canonical_url + query_canonical), headers (from header_set_id template only), body (from the inert
+    payload_id catalog only), operator session (injected from the secret lease named by session_ref). The
+    broker NEVER sends a worker-serialized request; it re-canonicalizes and asserts the reconstructed
+    request equals the spec's fields                                          else DENY(reconstruction_mismatch)
+ 9. RE-CHECK LIVE STATE (fail-closed, SI-046): auth not expired/revoked, window open, e-stop clear,
+    rate/concurrency slot. Any unknown ⇒ DENY (and RELEASE the reservation).
+10. DNS RESOLUTION + RESOLVED-IP RE-CHECK (rebinding): resolve canonical_host; EVERY resolved IP must pass
+    the network guard (§6) AND the frozen scope_version; PIN a validated IP; connect ONLY to the pin.
+11. AUDIT INTENT (SI-055): durably commit request.intent (records spec_sha256, grant jti, reserved unit)
+    BEFORE the socket opens — this commit and the budget reservation are ONE transaction.
+12. CONNECT to the pinned IP (TLS cert host == canonical_host); SEND the reconstructed request.
+13. REDIRECT: never auto-follow. On 3xx, canonicalize Location → form a NEW request_spec → request a FRESH
+    JIT grant. Out-of-scope ⇒ STOP, record. Bounded hop depth; each hop independently specced + granted.
+14. COMPLETE: request.completed/failed records the resolved+pinned IP, status, byte counts (redacted).
+    On send COMMIT the reserved unit (reserved -= 1; used += 1). On any pre-send DENY/failure RELEASE it
+    (reserved -= 1; used unchanged). Sent count never exceeds request_budget_total.
 ```
 
-**Key protections baked in**
-- **DNS rebinding:** resolve → validate every IP → pin → connect to the pin, all at the broker; no client-side resolution anywhere.
-- **Redirect scope escape:** every hop needs a fresh Stage-1 grant; no "trusted because we started in scope."
-- **Deny-by-default & fail-closed:** any non-affirmative state at either stage denies (SI-002, SI-046).
-- **Double-checkpoint in time:** Stage 1 at schedule, Stage 2 at execute; expiry/e-stop/window firing between them is caught at Stage 2.
-- **Replay-safe grants:** short TTL + single-use `jti` + `aud` binding + per-job ingress identity (doc 10).
+### 7.2 Tool / browser (broker-mediated) and WebSocket semantics
 
----
+- **Tool-driven / browser requests are not pre-enqueued per subrequest.** A headless browser or a self-driving tool is an autonomous request engine; the broker is its mediating proxy (`10` §4). For **each** intercepted request line the broker **forms a `request_spec` on the fly**, computes `spec_sha256`, and requests a **JIT grant** from the Scope Authority (Stage 1 over the frozen scope). Only if a grant is minted does it proceed to Stage 2. A browser that fetches an out-of-scope subresource, or follows a redirect off-scope, simply gets **no grant → the request is blocked**. The Scope Authority remains the sole minter and the broker the sole socket creator even for autonomous engines.
+- **WebSocket (`ws`/`wss`).** A `kind='websocket'` spec authorizes the **HTTP Upgrade handshake** (a `GET` to the canonical WS path); the handshake is scoped, resolved, IP-pinned, and connected **exactly like an HTTP request**. Scope is fixed at the pinned handshake — an established socket can never change target. The established connection is bounded by per-connection caps (§8: `ws_max_duration_s`, `ws_max_messages`, `ws_max_message_bytes`) and counts against `max_ws_connections` (`ws_in_flight`); **e-stop, window close, or authorization expiry terminate active connections**. Redirects do not apply to an established WS; a handshake redirect is re-authorized like any HTTP redirect (new spec + JIT grant). Only inert/observation frames per the check contract are sent — never destructive fuzzing.
+
+### 7.3 Key protections baked in
+- **Immutable spec + JIT grant:** the queued object is hash-frozen; grants are minted just-in-time bound to `spec_sha256`, so no grant sits in the queue and a tampered spec is rejected at mint (SI-001, SI-060).
+- **Broker reconstruction:** the wire request is rebuilt deterministically from the signed spec and must equal it; a worker cannot inject a deviation (SI-061).
+- **DNS rebinding / redirects:** resolve → validate → pin at the broker; every redirect is a new spec + grant (SI-003, SI-004, SI-005).
+- **Budget correctness:** reserve at mint, commit on send, release on denial — never double-spent, never spent on a request that is not sent (SI-017, SI-062).
+- **Fail-closed & double-checkpoint:** any non-affirmative state at either stage denies; window/expiry/e-stop re-checked at JIT mint and Stage 2 (SI-002, SI-046, SI-049).
 
 ## 8. Rate-limit, testing-window & expiry enforcement (runtime fields)
 
@@ -535,7 +605,9 @@ TABLE engagement_runtime_counter (
   tenant_id            UUID NOT NULL,
   window_started_at    TIMESTAMPTZ NOT NULL,
   requests_in_window   INT NOT NULL DEFAULT 0,
-  in_flight            INT NOT NULL DEFAULT 0,
+  in_flight            INT NOT NULL DEFAULT 0,     -- HTTP requests currently on the wire
+  reserved             INT NOT NULL DEFAULT 0,     -- budget units reserved at JIT grant-mint, not yet sent
+  ws_in_flight         INT NOT NULL DEFAULT 0,     -- established ws/wss connections (<= engagement.max_ws_connections)
   last_request_at      TIMESTAMPTZ,
   circuit_state        TEXT NOT NULL DEFAULT 'closed' CHECK (circuit_state IN ('closed','open','half_open')),
   circuit_opened_at    TIMESTAMPTZ,
@@ -549,9 +621,10 @@ TABLE engagement_runtime_counter (
 | Global / per-host RPS | `global_max_rps`, `per_host_max_rps` | Token buckets per engagement/host (broker send path); excess queued, not dropped. |
 | Concurrency | `max_concurrency`, `per_host_concurrency`, `in_flight` | Distributed semaphore consulted before every request. |
 | Min spacing | `min_request_interval_ms` | Enforced against `last_request_at`. |
-| Request budget | `request_budget_total/used` | Hard cap; exhaustion auto-pauses and notifies. |
+| Request budget | `request_budget_total`, `request_budget_used`, `reserved` | **Reserve-at-mint / commit-on-send / release-on-denial:** a JIT grant-mint atomically reserves a unit (`reserved += 1`) only if `used + reserved < request_budget_total`; a sent request commits (`reserved -= 1; used += 1`); a pre-send denial/failure releases (`reserved -= 1`). Sent count never exceeds `request_budget_total`, and no unit is spent on a request that is never sent. Exhaustion auto-pauses. |
 | Body cap | `max_response_body_bytes` | Response reading truncates; oversize bodies never fully buffered. |
-| Testing window / expiry | `testing_window`, `authorization.expires_at` | Evaluated at Stage-1 step 0 **and** Stage-2 step 8, on the trusted clock (SI-049). |
+| WebSocket | `max_ws_connections`, `ws_in_flight`, `ws_max_duration_s`, `ws_max_messages`, `ws_max_message_bytes` | Handshake scoped/pinned like HTTP (§7.2); established connection bounded by duration / message-count / message-size; `ws_in_flight <= max_ws_connections`; e-stop / window-close / expiry terminate active connections. |
+| Testing window / expiry | `testing_window`, `authorization.expires_at` | Re-evaluated at Stage-1 (**JIT grant-mint**) **and** Stage-2, on the trusted clock (SI-049); a spec that waits in the queue past the window simply gets no grant. |
 | Circuit breaker / emergency stop | `circuit_state`, `engagement.emergency_stop` | Breaker auto-pauses on error/latency thresholds; e-stop halts immediately, audited. |
 
 **Auto-expiration invariant:** expiry/window are *pure functions of the trusted clock*, re-derived at Stage 2 on every request, never a cached status flag alone.
@@ -597,19 +670,20 @@ TABLE audit_event (
      (stream='engagement' AND engagement_id IS NOT NULL AND tenant_id IS NOT NULL)
      OR (stream='tenant'  AND engagement_id IS NULL     AND tenant_id IS NOT NULL)
      OR (stream='global'  AND engagement_id IS NULL     AND tenant_id IS NULL)),
+  UNIQUE (id, tenant_id),                                    -- target of composite child FKs (e.g. approval linkage)
   UNIQUE (stream, tenant_id, engagement_id, seq),
   UNIQUE (stream, tenant_id, engagement_id, event_hash)
 );
 ```
 
 **Event-type catalog (illustrative).**
-- *engagement stream:* `scope.decision.allow`, `scope.decision.deny`, `request.intent`, `request.completed`, `request.failed`, `redirect.blocked`, `auth.attested`, `approval.requested`, `approval.decided`, `approval.threshold_met`, `scope.version.created`, `engagement.mode_changed`, `engagement.emergency_stop`, `engagement.expired`, `evidence.stored`, `dek.destroyed`.
+- *engagement stream:* `scope.decision.allow`, `scope.decision.deny`, `request.spec_created`, `request.intent`, `request.completed`, `request.failed`, `redirect.blocked`, `ws.opened`, `ws.closed`, `auth.attested`, `approval.requested`, `approval.decided`, `approval.threshold_met`, `scope.version.created`, `engagement.mode_changed`, `engagement.emergency_stop`, `engagement.expired`, `evidence.stored`, `dek.destroyed`.
 - *tenant stream:* `auth.login`, `auth.login_failed`, `auth.logout`, `user.role_changed`, `tenant.retention_changed`.
 - *global stream:* `platform.emergency_stop.global`, `tool.inventory.updated`, `tool.pinned`, `feed.ingested`, `key.rotated`.
 
 **Integrity rules**
 - **Genesis** per chain uses `prev_hash = 0*64`; each subsequent `prev_hash` = prior `event_hash` **within the same stream key**. Any altered/removed/reordered event breaks that chain from that point.
-- **Request intent precedes egress (SI-055):** the `request.intent` event is durably committed **before** the Broker opens the socket; the `request.completed`/`request.failed` event references it via `related_event_id`. A crash after intent but before completion leaves a durable, provable "attempted" record.
+- **Request intent precedes egress (SI-055):** the `request.intent` event — recording the `spec_sha256`, the grant `jti`, and the reserved budget unit — is durably committed **before** the Broker opens the socket, in the **same transaction** as the budget reservation, so a crash can neither send without a record nor leak a reserved unit. The `request.completed`/`request.failed` event references it via `related_event_id` and commits or releases the reservation. A crash after intent but before completion leaves a durable, provable "attempted" record.
 - **Redaction before hashing (SI-045):** secrets, cookies, `Authorization` headers, tokens, credentials-in-URL, PII, and raw bodies are stripped/omitted first; `payload_sha256` covers the redacted form. Raw target auth material and bodies are **never** written to any stream.
 - **Append-only:** `UPDATE`/`DELETE` revoked at the grant level and rejected by triggers.
 - **Anchoring & key custody (SI-051):** each chain head is periodically signed by a **write-only** signing service (whose key Administrators cannot read) and anchored to WORM/external notary; the residual rewrite window between anchors is documented in `11-data-retention-and-deletion.md`.
@@ -659,7 +733,13 @@ TABLE approval_request (
 
   UNIQUE (id, tenant_id),
   FOREIGN KEY (engagement_id, tenant_id) REFERENCES engagement(id, tenant_id),
-  CONSTRAINT scope_must_pass CHECK ((scope_check_result->>'decision') = 'pass'),
+  FOREIGN KEY (linked_scope_version_id, tenant_id) REFERENCES scope_version(id, tenant_id),
+  FOREIGN KEY (linked_audit_event_id, tenant_id)   REFERENCES audit_event(id, tenant_id),
+  -- Within-scope actions must already pass §7 Stage-1. Scope-CHANGING requests target something
+  -- NOT yet in scope, so the pass requirement applies ONLY to within-scope request types.
+  CONSTRAINT scope_must_pass CHECK (
+     request_type IN ('scope_expansion','restricted_range_allow','authorization_attestation')
+     OR (scope_check_result->>'decision') = 'pass'),
   CONSTRAINT threshold_by_type CHECK (        -- floors; may be raised per engagement, never lowered below floor
      (request_type IN ('authorization_attestation','scope_expansion','restricted_range_allow',
                        'mode_elevation','business_logic_test') AND required_approvals >= 2)
@@ -688,8 +768,9 @@ TABLE approval_decision (
 1. **Threshold.** `approval_request` becomes `approved` **iff** the count of *distinct* `approval_decision` rows with `decision='approve'`, `approver_role ∈ approver_roles`, and `approved_plan_sha256 = plan_sha256` (and `approved_document_sha256 = document_sha256` when present) is **≥ `required_approvals`**, **and** no `reject` decision exists. Any `reject` ⇒ `rejected`.
 2. **Separation of duties.** No approver may equal `requested_by`; no approver may be the tester executing the action; approvers must be distinct users; each approver must hold a role in `approver_roles`; a user may not hold two SoD-conflicting roles on the same engagement (doc 09).
 3. **Plan/document-hash binding.** Each approver pins the exact `plan_sha256` (and `document_sha256` for attestation). If the plan changes, prior decisions are void and the threshold must be re-met — an approval can never be moved onto a different plan.
-4. **Scope precondition.** An approval cannot be *created* unless its target already passes §7 Stage-1 (`scope_must_pass`). Approval is never a path to out-of-scope targets — only to higher-impact actions *within* scope. (Exception: `scope_expansion`/`restricted_range_allow` approvals gate a *new* `scope_version` that itself becomes the in-scope set once re-attested.)
-5. **Time-boxed & audited.** Requests and each decision emit audit events (`approval.requested`, `approval.decided`, `approval.threshold_met`). Expired approvals authorize nothing.
+4. **Scope precondition (conditional).** For *within-scope* request types (`intrusive_validation`, `business_logic_test`, `mode_elevation`) an approval cannot be created unless its target already passes §7 Stage-1 — the DDL `scope_must_pass` CHECK requires `scope_check_result.decision = 'pass'`. For *scope-changing* types (`scope_expansion`, `restricted_range_allow`, `authorization_attestation`) the target is by definition **not yet in scope**, so the CHECK deliberately does **not** require a pass; these approvals gate a *new* `scope_version` that becomes the in-scope set only once re-attested. (This resolves the earlier contradiction where the unconditional CHECK would have rejected every scope-expansion approval.)
+5. **Plan binds the exact request(s).** For `intrusive_validation`/`business_logic_test`, `plan_sha256` MUST cover the `spec_sha256` of every `request_spec` the approval authorizes; §7 Stage-1 step (h) mints a grant only if the spec's `approval_ref` resolves to an approved request whose `plan_sha256` covers that exact spec. An approval can never authorize a request whose spec it did not pin.
+6. **Time-boxed & audited.** Requests and each decision emit audit events (`approval.requested`, `approval.decided`, `approval.threshold_met`). Expired approvals authorize nothing.
 
 **Default approval policy** (roles from `09-rbac-matrix.md`; per-engagement config may raise thresholds, never lower below the floor):
 
@@ -770,14 +851,19 @@ These are the testable guarantees this schema exists to make provable (Phase 2 "
 3. **Exclusions always win.** Any candidate matching both allow and exclude ⇒ DENY (property test over overlaps, including host-bound paths).
 4. **Tier A is absolute.** No scope entry, elevated flag, or approval can reach loopback/metadata/unspecified/multicast/broadcast/reserved; obfuscated and transition IPv6 forms decode and deny (SI-006, SI-044).
 5. **Tier B needs full elevation.** RFC1918/ULA/link-local/CGNAT reachable only with an `elevated` entry **and** a dual-approved `restricted_range_allow` **and** `internal_testing_granted` (SI-047, SI-059).
-6. **Two-stage token is sound.** Stage-1 grants bind the request line but never a resolved IP; Stage-2 resolves, validates every IP, and pins; a grant is single-use (`jti`) and `aud`-bound (SI-001, SI-053).
+6. **Immutable spec + JIT two-stage.** The queued object is an immutable, fully-hashed `request_spec`; JIT grants bind `spec_sha256` (never a resolved IP), are single-use (`jti`) and `aud`-bound, and are minted only at dispatch so none can sit in the queue; the broker reconstructs the wire request from the spec and rejects any mismatch (SI-001, SI-060, SI-061).
 7. **Rebinding & redirects defeated.** Resolved IPs individually validated and pinned; every redirect hop needs a fresh grant (SI-003, SI-004, SI-005).
 8. **Dual control on the legal gate.** Attestation and scope expansion require two distinct valid-role approvers, neither the tester, each pinning the plan/document hash; the threshold is enforced, not advisory (SI-047).
 9. **Audit is complete, split, and tamper-evident.** Every action emits an event; request intent precedes egress; three streams chain independently; recomputation detects any edit/reorder; `seq` has no gaps (SI-026, SI-055, SI-056).
 10. **Breadth is bounded.** Broad CIDRs, wildcards, and excessive host/address counts are hard-capped or gated by elevated dual approval; scope expansion re-attests (SI-059).
 11. **Import is hash-verified & fail-closed.** A bundle whose recomputed `scope_hash` differs is rejected; Tier B/wildcard entries never self-activate.
-12. **Composite-tenant integrity.** No child row can reference a parent in another tenant (composite FK) and RLS scopes every query (SI-024).
+12. **Composite-tenant integrity.** No child row can reference a parent in another tenant — every FK is composite `(id, tenant_id)` (the engagement↔authorization↔scope_version and authorization↔attestation-approval cycles use DEFERRABLE composite FKs) — and RLS scopes every query (SI-024).
+13. **Budget is reserve/commit/release.** A unit is reserved at JIT grant-mint (only if `used + reserved < total`), committed on send, released on any pre-send denial; sent requests never exceed `request_budget_total` and no unit leaks (SI-017, SI-062).
+14. **Window/expiry/e-stop are JIT + Stage-2.** Re-evaluated at grant-mint and again at the broker; a spec that waited past the window gets no grant, and a fired e-stop/expiry aborts in-flight work including WebSockets (SI-011, SI-012, SI-013, SI-049).
+15. **Approval binds the exact spec.** Intrusive approvals pin `plan_sha256` covering each authorized `spec_sha256`; scope-changing approvals correctly do NOT require the not-yet-in-scope target to pass §7 (SI-018, SI-047).
+16. **Breadth accounting is computable.** An IPv4-equivalent address budget + a CIDR-entry cap are enforced; IPv6 breadth is governed by prefix floors + elevated approval (never an address sum); exclusions are not subtracted (SI-059).
+17. **WebSocket is bounded.** ws/wss handshakes are scoped/pinned like HTTP and established connections are bounded by duration/message/size/count caps and terminated on e-stop/window/expiry (SI-063).
 
 ---
 
-**File paths:** none produced — Phase 0 design deliverable. The schema seeds the Phase 2 migration set (`engagement`, `testing_window`, `authorization`, `scope_version`, `scope_entry`, `engagement_runtime_counter`, `audit_event`, `approval_request`, `approval_decision`) and the Scope Authority / Guarded Egress Broker two-stage decision procedure (§7), network guard (§6), canonicalization (§5), breadth limits (§4.6), and dual-control approval (§10). Related: `09-rbac-matrix.md`, `10-request-authorization-flow.md`, `11-data-retention-and-deletion.md`.
+**File paths:** none produced — Phase 0 design deliverable. The schema seeds the Phase 2 migration set (`engagement`, `testing_window`, `authorization`, `scope_version`, `scope_entry`, `request_spec`, `engagement_runtime_counter`, `audit_event`, `approval_request`, `approval_decision`) and the Scope Authority / Guarded Egress Broker two-stage decision procedure (§7), network guard (§6), canonicalization (§5), breadth limits (§4.6), and dual-control approval (§10). Related: `09-rbac-matrix.md`, `10-request-authorization-flow.md`, `11-data-retention-and-deletion.md`.

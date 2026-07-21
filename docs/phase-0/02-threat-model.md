@@ -78,7 +78,7 @@ The specification mandates coverage of ten named threats. Mapping to threat entr
 
 | Named threat | Threat entries |
 |---|---|
-| scope escape | T-001, T-002, T-003, T-004, T-027, T-029, T-030, T-035 |
+| scope escape | T-001, T-002, T-003, T-004, T-027, T-029, T-030, T-035, T-037 |
 | SSRF | T-005, T-006, T-031 |
 | command injection | T-007, T-008 |
 | malicious scanner output | T-009, T-010 |
@@ -86,7 +86,7 @@ The specification mandates coverage of ten named threats. Mapping to threat entr
 | secret leakage | T-013, T-014, T-034, T-036 |
 | cross-tenant access | T-015 |
 | report-data exposure | T-016, T-017, T-032 |
-| queue abuse | T-018, T-019 |
+| queue abuse | T-018, T-019, T-038 |
 | supply-chain compromise | T-020 |
 
 ## 6. Threats (STRIDE)
@@ -743,6 +743,42 @@ HAR files and Postman collections routinely embed Authorization headers, cookies
 - Test: a token in an imported HAR is never replayed
 
 **Residual risk.** Operator may still manually paste a credential; bounded by scope enforcement on the destination host.
+
+### T-037 — Stale/mismatched grant or tampered queued request spec
+
+- **STRIDE:** Tampering, Elevation of Privilege
+- **Named threat:** scope escape
+- **Likelihood / Impact:** low / high
+- **Assets at risk:** Scope configuration / allowlist, In-scope target systems
+
+If the queued object were a short-lived grant, it could expire in the queue (forcing long TTLs that widen the replay window) or be replayed; and if a queued request could be mutated after authorization, a benign-authorized request could be silently changed before it is sent.
+
+**Vector.** Mutating a queued request's fields after authorization; enqueuing or replaying a grant.
+
+**Mitigations.**
+- SI-060: the queued object is an **immutable, fully-hashed `request_spec`**; grants are minted **just-in-time** at dispatch, bound to `spec_sha256`, with a TTL that only covers dispatch→send — no grant sits in the queue.
+- SI-061: the broker **reconstructs** the request from the signed spec and rejects any spec/grant-hash mismatch; a worker cannot inject a deviation.
+- `spec_sha256` is recomputed and verified both at JIT mint and at the broker; grants are single-use (`jti`).
+
+**Residual risk.** Compromise of the Scope Authority signing key; bounded by key custody, single-use grants, and the immutable audit trail.
+
+### T-038 — WebSocket connection escaping scope, budget, or time interlocks
+
+- **STRIDE:** Tampering, Elevation of Privilege, Denial of Service (of the target)
+- **Named threat:** queue abuse
+- **Likelihood / Impact:** low / medium
+- **Assets at risk:** In-scope target systems, Scope configuration / allowlist
+
+A long-lived `ws`/`wss` connection could, if unhandled, run past the testing window / authorization expiry / emergency stop, attempt to change target mid-connection, or amplify load beyond the request budget.
+
+**Vector.** Opening a WebSocket and holding it across interlock events, or trying to re-target an established socket.
+
+**Mitigations.**
+- SI-063: the handshake is scoped, resolved, and IP-**pinned** exactly like HTTP; scope is fixed at the pinned handshake (no per-message re-target); per-connection duration/message-count/message-size caps + a per-engagement connection cap bound each socket.
+- SI-062: emergency stop, window close, and expiry **terminate active WebSocket connections**, not merely block new ones.
+- Only inert/observation frames per the check contract are sent — never destructive or high-volume fuzzing.
+
+**Residual risk.** Protocol-level abuse within the configured caps; bounded by the caps and the non-destructive frame contract.
 
 ## 7. Abuse cases
 
