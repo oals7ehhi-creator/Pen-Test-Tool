@@ -87,11 +87,11 @@ Two planes, separated by trust and by network policy:
 |---|---|---|
 | Web UI (SPA) | Guided workflow, triage, approvals, dashboards | Never constructs raw requests or commands |
 | Backend API / BFF | AuthN, RBAC, engagement/scope/authz CRUD, job intake, approval-gate state machine, report orchestration | Never contacts targets; never spawns processes |
-| Scope-Validation Service | *Sole authority* on "is (method,url,ip,port,path,time,approval) permitted for engagement E." Issues short-lived, signed scope decisions | Does not perform I/O to targets |
+| Scope Authority | *Sole decision authority* on "is (method,url,ip,port,path,time,approval) permitted for engagement E." Mints short-lived, signed **Stage-1 egress grants** binding the exact request line — no resolved IP (see `10-request-authorization-flow.md`) | Does not perform target I/O; does not resolve target DNS |
 | Job Queue | Durable, transactional, per-engagement fair scheduling, budgets | Cannot enqueue a job lacking a valid scope token |
 | Worker Pool | Pull jobs, orchestrate checks/adapters, capture evidence | No direct socket to targets; no shell |
 | Scanner Sandbox / Adapters | Run pinned third-party tools in isolation, parse structured output | No arbitrary flags; no network except via broker |
-| Guarded Egress Broker | The only egress path; enforces scope, DNS pinning, redirects, rate limits, breakers, audit | Cannot be bypassed by network policy |
+| Guarded Egress Broker | The only egress path and only target-socket creator; authenticates per-job ingress, verifies the grant, resolves DNS, validates+pins every resolved IP at broker time, enforces redirects/rate/breakers, emits split audit | Cannot be bypassed by network policy; is **not** a generic CONNECT proxy |
 | PostgreSQL | System of record; tenant isolation via RLS | — |
 | Object Storage (evidence) | Redacted evidence blobs, WORM/object-lock | — |
 | Secrets Manager | Target auth sessions, tool creds, signing keys | Secrets never land in DB rows or logs |
@@ -143,10 +143,10 @@ The safety model maps to specific, single-owner components. No control is duplic
 ### 3.1 The single egress choke point — Guarded Egress Broker
 **All outbound requests from the data plane traverse the broker. There is no second path.** Enforced at two layers:
 1. **Network layer (primary, non-bypassable):** worker and sandbox network namespaces are default-deny egress with no route to `0.0.0.0/0`; the sole allowed destination is the broker service. A compromised worker/tool physically cannot reach a target except through the broker.
-2. **Application layer (defense in depth):** the broker independently re-validates every request against the Scope-Validation Service before opening any socket.
+2. **Application layer (defense in depth):** the broker authenticates the calling job's per-job identity and independently verifies the Scope Authority's signed grant before opening any socket. The broker exposes an **authenticated, per-job ingress** — never a generic `CONNECT host:port` proxy — and serves only the exact request line a grant authorizes (`10-request-authorization-flow.md` §4).
 
 The broker owns, per request:
-- **Scope re-validation** (calls/verifies a signed scope decision — never trusts the caller's assertion).
+- **Grant verification** (signature, `aud`=self, `nbf`/`exp`, single-use `jti`) — never trusts the caller's assertion; the resolved IP is validated here at broker time, not pre-bound in the grant.
 - **DNS resolution with IP pinning:** the broker resolves the hostname itself, checks *every* resulting A/AAAA record against scope, then **connects to the exact pinned IP it validated** and sets the TLS SNI/Host to the original name. This closes DNS rebinding: the resolved-and-validated IP is the one dialed; a later re-resolution to a private IP cannot occur.
 - **RFC1918 / loopback / link-local / cloud-metadata (169.254.169.254, fd00:ec2::254, etc.) / ULA / documentation-range rejection**, for both IPv4 and IPv6, applied to the *resolved IP*, not just the hostname.
 - **Redirect handling:** the broker does not blindly follow redirects; each hop's target is re-validated for scope, and out-of-scope redirects stop the chain and are recorded.
@@ -155,11 +155,15 @@ The broker owns, per request:
 - **Testing-window & authorization-expiry enforcement:** the broker refuses egress outside the window or after expiry, even if a job slipped through scheduling.
 - **Audit emission:** every attempted request (allowed or denied, with reason) becomes an audit event.
 
-### 3.2 The scope guard — Scope-Validation Service
-Authority for *"is this permitted?"* lives in exactly one service. It evaluates: allowlisted domains/IPs/CIDRs/ports/URL-prefixes/APIs, explicit exclusions (exclusions win), canonicalized URL, IP family, active testing window, non-expired authorization, and — for intrusive actions — an existing approval record. It returns a **short-lived, signed scope decision** consumed at enqueue and re-verified at the broker. Because the broker re-checks and the network layer is default-deny, a stale or forged decision cannot produce out-of-scope traffic.
+### 3.2 The scope authority — Scope Authority
+Authority for *"is this permitted?"* lives in exactly one service. It evaluates (Stage 1): allowlisted domains/IPs/CIDRs/ports/URL-prefixes/APIs, explicit exclusions (exclusions win), canonicalized URL, IP-literal network guard, active testing window, non-expired authorization, mode, budget, and — for intrusive/elevated actions — an existing dual-approved approval. It mints a **short-lived, single-use, signed Stage-1 egress grant** binding the exact request line (method + canonical URL/path), consumed at the broker. It performs **no target DNS resolution and no target I/O** — resolved-IP validation and pinning happen at the broker (Stage 2). Because the broker re-checks live state and validates every resolved IP, and the network layer is default-deny, a stale or forged grant cannot produce out-of-scope traffic. Full two-stage design: `10-request-authorization-flow.md`.
 
 ### 3.3 Per-worker / per-sandbox network policy
-Each worker and each scanner sandbox runs in its own namespace with: default-deny egress, no internet route, allow-list only to the broker; read-only rootfs; dropped capabilities; seccomp/AppArmor; non-root; CPU/mem/PID/time quotas; no host mounts. This localizes blast radius per job.
+Two distinct data-plane postures, both default-deny with no internet route (`10-request-authorization-flow.md` §4):
+- **Tool / headless-browser sandbox — broker only.** The *only* reachable next hop is the Guarded Egress Broker: no route to targets, the internet, or internal services. Client-side DNS disabled (proxy-side resolve+pin), WebRTC/QUIC/direct sockets disabled (SI-041, SI-054).
+- **Worker — narrow internal allowlist + broker.** Reaches only the internal services it needs (queue, DB, object storage, Scope Authority, secret manager) **plus** the broker; **no direct route to any target or the internet**. A worker reaches a target only by presenting a grant to the broker (SI-033, SI-054).
+
+Both add: read-only rootfs; dropped capabilities; seccomp/AppArmor; non-root; CPU/mem/PID/time quotas; no host mounts. This localizes blast radius per job.
 
 ### 3.4 Approval gates
 The **approval-gate state machine lives in the Backend API** and is persisted in Postgres. Intrusive/validation checks cannot transition to `schedulable` without a recorded operator approval (who, when, plan hash). The signed scope decision for an intrusive check embeds the approval reference; the broker refuses intrusive-class egress whose decision lacks a valid approval. Human approval is thus enforced at both the scheduling boundary and the egress boundary.
@@ -175,29 +179,28 @@ Redaction is a **mandatory pipeline stage owned by the worker before any evidenc
 Operator selects check  ──►  API validates RBAC + engagement state
         │
         ▼
-API asks Scope-Validation Svc: (engagement, method, target, port, path, class, now)
+STAGE 1 — Scope Authority: (engagement, method, target, port, path, class, now)
         │                        │
         │      DENY ◄────────────┘  (reason recorded; operator sees why)
-        ▼ ALLOW  → issues SIGNED, short-TTL scope decision (embeds approval ref if intrusive)
-        │
+        ▼ ALLOW  → mints SIGNED, short-TTL, single-use egress GRANT binding the exact request
+        │          line (method+canonical URL/path); approval ref if intrusive; NO resolved IP
         ▼
-API enqueues job + scope decision in ONE Postgres transaction
+API enqueues job + grant in ONE Postgres transaction
    (budget checked & decremented transactionally; out-of-scope job literally cannot commit)
         │
         ▼
-Worker pulls job (SKIP LOCKED) → validates scope-decision signature + TTL + budget
-        │
-        ▼
-Worker builds a STRUCTURED check request (typed struct, never a command string)
+Worker pulls job (SKIP LOCKED) → builds a STRUCTURED request (typed struct, never a command
+   string) and presents (per-job identity + grant) to the broker's authenticated ingress
    • native check: prepared HTTP request object
    • tool check: typed tool-spec referencing a pinned template/tool ID (no free-form flags)
         │
-        ▼  (only path out of the netns)
-Guarded Egress Broker:
-   re-validate scope ─► resolve DNS ─► check ALL resolved IPs ─► reject private/meta/link-local
-   ─► rate/concurrency/window/expiry gates ─► connect to PINNED IP (SNI=orig host)
-   ─► send request ─► redirect? re-validate each hop, stop if out-of-scope
-   ─► emit audit event (request, decision, outcome)  [circuit breaker may trip → halt]
+        ▼  (only path out of the netns; NOT a generic CONNECT proxy)
+STAGE 2 — Guarded Egress Broker:
+   auth per-job ingress ─► verify grant (sig/aud/exp/jti single-use) ─► re-check live state
+   (auth/window/e-stop/budget, fail-closed) ─► resolve DNS ─► check ALL resolved IPs (Tier A/B)
+   ─► PIN validated IP ─► commit request.intent audit BEFORE connect ─► connect to PINNED IP
+   (SNI=orig host) ─► send ─► redirect? request a FRESH grant per hop, stop if out-of-scope
+   ─► emit request.completed/failed (resolved+pinned IP, redacted)  [breaker may trip → halt]
         │
         ▼
 Target responds (in-scope only) ──► response returns to worker/sandbox
@@ -228,7 +231,7 @@ Key invariant: **at every stage the request is data, validated independently, an
 **Model: shared control-plane infrastructure, per-tenant logical isolation, per-engagement execution isolation.** Tenancy hierarchy: **Tenant (org) → Engagement → Authorization/Scope → Jobs/Findings/Evidence.**
 
 - **Database isolation — PostgreSQL Row-Level Security.** Every tenant-owned table carries `tenant_id`; RLS policies bind reads/writes to the authenticated tenant context set per request (`SET LOCAL app.tenant_id`). This is defense that survives ORM/application bugs. Cross-tenant access requires no application check to be *added*; it requires an RLS policy to be *removed*, which is CI-guarded.
-- **Object storage isolation.** Evidence objects keyed by `tenant_id/engagement_id/...`; bucket policies + per-tenant prefixes; encryption keys optionally per-tenant via Vault transit for stronger separation.
+- **Object storage isolation.** Evidence objects keyed by `tenant_id/engagement_id/...`; bucket policies + per-tenant prefixes; **encrypted under a per-engagement Data Encryption Key** (envelope encryption via the secret manager) so a mis-scoped fetch returns undecryptable ciphertext (SI-050). The same per-engagement DEK is the unit of **cryptographic erasure** for secure deletion (`11-data-retention-and-deletion.md`, SI-058).
 - **Secrets isolation.** Vault namespaces/policies per tenant; target auth sessions are never shared across engagements.
 - **Queue & worker isolation.** Jobs carry tenant + engagement identity; per-engagement rate/concurrency budgets prevent one tenant's engagement from starving another (queue-abuse threat). Workers are stateless and scrubbed between jobs; a worker never holds two tenants' target sessions simultaneously.
 - **Egress isolation.** Broker token buckets and scope decisions are per-engagement; audit events are tenant-tagged. Circuit breakers and emergency-stop are scoped to an engagement so one halt does not disrupt others.
@@ -277,6 +280,10 @@ Result: there is **no path from UI/API input to a shell**, and **no user-control
 - **ADR-9: Hash-chained append-only audit log with WORM anchoring; mandatory redaction before evidence egress.** Rationale: tamper-evident audit trail and no secret/PII leakage into logs, findings, or reports (secret-leakage and report-data-exposure threats). Trade-off: redaction must be conservative and may occasionally over-redact — the correct failure direction.
 - **ADR-10: Rust for the safety kernel, TypeScript for the control plane, Go for workers.** Rationale: strongest memory-safety guarantees where a bug is most dangerous; developer velocity and shared types where iteration matters. Trade-off: three runtimes to operate; collapse to Go-everywhere-plus-SPA if the team needs fewer languages, accepting marginally weaker broker guarantees.
 - **ADR-11: Pinned tool/template versions verified by digest; egress-restricted, resource-capped sandboxes.** Rationale: supply-chain-compromise threat — a swapped tool image or malicious template cannot run un-pinned or reach the network freely. Trade-off: version bumps become deliberate, reviewed events.
+- **ADR-12: Two-stage request authorization with broker-time IP binding.** The Scope Authority mints a Stage-1 grant binding the request *line* (method + canonical URL/path) but no resolved IP; the Guarded Egress Broker resolves DNS, validates every resolved IP, and pins it at Stage 2. Rationale: the resolved IP is unknown until DNS is resolved, and only the broker resolves target DNS — pre-binding an IP at scheduling was impossible and internally contradictory. Trade-off: a second in-band grant per redirect hop; acceptable at this platform's low volumes. Design: `10-request-authorization-flow.md`.
+- **ADR-13: Authenticated per-job broker ingress, never a generic CONNECT proxy.** Each broker request carries a per-job identity/capability matching a single-use, audience-bound grant; the broker serves only the exact grant-authorized request line. Rationale: a generic `CONNECT` proxy would void the network-topology guarantee. Trade-off: per-job identity issuance and a `jti` consumption store.
+- **ADR-14: Dual-control approval (N-of-M) for the legal gate.** Authorization attestation and scope expansion require ≥2 distinct, role-verified approvers (never the requester/tester), each pinning the plan/document hash. Rationale: the primary abuse actor is a privileged insider; a single-approver model let one person broaden-and-re-attest. Trade-off: two humans in the loop for legal/scope changes — intentional friction on the highest-consequence action.
+- **ADR-15: Per-engagement cryptographic erasure reconciles secure deletion with WORM/backups.** Engagement data is envelope-encrypted under a per-engagement DEK; deletion destroys the DEK, making ciphertext in primary/WORM/backup stores undecryptable without mutating any immutable store. Rationale: WORM protects integrity during retention but blocks physical deletion. Trade-off: DEK custody and a deletion-verification step. Design: `11-data-retention-and-deletion.md`.
 
 ---
 

@@ -7,14 +7,17 @@ Design and analysis package for the **authorized, non-destructive web-applicatio
 | # | Document | Contents |
 |---|---|---|
 | 00 | [Overview & phase-gate report](00-overview.md) | Executive summary, decision log, glossary, risk register, run commands, **approval checkpoint** |
-| 01 | [Requirements](01-requirements.md) | 60 functional + 37 non-functional requirements (traceable IDs, per-phase ownership) |
+| 01 | [Requirements](01-requirements.md) | 67 functional + 37 non-functional requirements (traceable IDs, per-phase ownership) |
 | 02 | [Threat model](02-threat-model.md) | Assets, actors, trust boundaries, data flows, 36 STRIDE threats (all 10 named threats), abuse cases, failure modes |
-| 03 | [Architecture & tech stack](03-architecture.md) | Two-plane design, single egress choke point, sandboxing, ADR-candidates |
-| 04 | [Authorization & scope schema](04-authorization-and-scope-schema.md) | The safety backbone: engagement, authorization, scope, canonicalization, the scope decision procedure, audit & approval schemas |
-| 05 | [Safety invariants](05-safety-invariants.md) | 52 absolute, test-enforced safety properties (release fails if any is violated) |
+| 03 | [Architecture & tech stack](03-architecture.md) | Two-plane design, single egress choke point, two-stage authorization, sandboxing, ADR-candidates |
+| 04 | [Authorization & scope schema](04-authorization-and-scope-schema.md) | The safety backbone: engagement, authorization, scope, canonicalization, the two-stage decision procedure, two-tier network guard, split audit, dual-control approval, breadth limits |
+| 05 | [Safety invariants](05-safety-invariants.md) | 59 absolute, test-enforced safety properties (release fails if any is violated) |
 | 06 | [Acceptance criteria](06-acceptance-criteria.md) | Phase-gate criteria, exit tests, and safety gates for Phases 1–12 |
 | 07 | [Non-goals & refusals](07-non-goals-and-refusals.md) | What the platform will never do, and the safe defensive alternative for each refused capability |
-| 08 | [Design review & critique resolution](08-design-review-and-critique-resolution.md) | Adversarial review of the design; every finding → resolution with traceability |
+| 08 | [Design review & critique resolution](08-design-review-and-critique-resolution.md) | Adversarial review (2 rounds); every finding/blocker → resolution with traceability |
+| 09 | [RBAC matrix](09-rbac-matrix.md) | The single authoritative role/action matrix and approval-authority policy |
+| 10 | [Request authorization flow](10-request-authorization-flow.md) | Two-stage egress-grant tokens and authenticated per-job broker ingress |
+| 11 | [Data retention & deletion](11-data-retention-and-deletion.md) | Raw-output handling, retention classes, per-engagement cryptographic erasure |
 
 ## The one idea everything follows from
 

@@ -41,9 +41,10 @@ Each downstream phase must satisfy its acceptance criteria, pass its exit tests,
 **Acceptance criteria.**
 - Engagement CRUD is tenant-owned and stores engagement owner, written-authorization reference, scope, and expiry; testing cannot begin without a confirmed authorization record (reference + owner + expiry).
 - Scope model expresses allowlisted domains, IPv4 and IPv6 addresses, CIDRs, ports, protocols/schemes, URL path prefixes, and API definitions, plus explicit exclusions that override allows.
-- A single scope-validation service is the sole egress chokepoint; for any (scheme, host, IP, port, path) it returns allow/deny with a reason, and every egress caller routes through one shared client that calls it.
+- A single **Scope Authority** is the sole decision authority and a single **Guarded Egress Broker** is the sole target-socket creator; for any (scheme, host, IP, port, path) the Authority returns allow/deny with a reason and mints a signed, single-use, request-line-bound Stage-1 grant (no resolved IP), and the Broker verifies the grant, validates+pins resolved IPs at broker time, and authenticates each per-job ingress (never a generic CONNECT proxy).
 - DNS resolution check resolves the host, validates every A/AAAA result against scope, pins the validated IP for the actual connection, and re-validates at request time to defeat rebinding.
-- Hard-blocked regardless of allowlist: loopback/localhost, RFC1918, link-local (169.254.0.0/16, fe80::/10), unique-local (fc00::/7), 0.0.0.0/unspecified, and cloud-metadata endpoints (169.254.169.254, fd00:ec2::254, metadata.google.internal, etc.).
+- **Tier A hard-blocked by any means** (no allowlist entry, no elevated flag, no approval): loopback/localhost, unspecified (0.0.0.0/::), cloud-metadata (169.254.169.254, fd00:ec2::254, metadata.google.internal, etc.), multicast, broadcast, and reserved/future/documentation ranges. **Tier B** (RFC1918, ULA fc00::/7, link-local 169.254.0.0/16 & fe80::/10, CGNAT 100.64.0.0/10) denied **unless** an explicit elevated scope entry, a dual-approved restricted-range approval, and authorization-granted internal testing are all present; metadata stays Tier A even inside an elevated link-local range.
+- Every outbound target request is authorized via the two-stage flow (Scope Authority Stage-1 grant + Guarded Egress Broker Stage-2 broker-time IP validation/pinning); grants are single-use and audience-bound; authorization attestation and scope expansion require dual control (≥2 role-verified approvers, SoD, per-decision hash binding); scope-breadth limits (min CIDR prefix, wildcard/host/address ceilings) and scope expansion are gated by elevated dual approval.
 - URLs are canonicalized before scope checks: percent-decoding, case folding, dot-segment removal, IDN/punycode, trailing dots, embedded userinfo (@), and alternate IP encodings (decimal/octal/hex/IPv4-mapped IPv6).
 - Redirects are inspected against scope; out-of-scope targets are not followed and the event is recorded.
 - Per-engagement concurrency and request-rate limits are configurable with conservative safe defaults; testing windows and auto-expiration at authorization expiry are enforced; an emergency stop halts all in-flight and queued work immediately; per-target circuit breakers exist.
@@ -59,16 +60,21 @@ Each downstream phase must satisfy its acceptance criteria, pass its exit tests,
 - Defense-in-depth scheduler test: an out-of-scope target is rejected both at enqueue time and again at execution time.
 - Expiry/window tests: advancing the clock past expiry or outside the testing window refuses new tasks and stops running ones.
 - Emergency-stop test: triggering the kill switch drains/pauses the queue and produces zero further egress.
-- Audit-immutability test: attempts to edit/delete an audit event fail and hash-chain verification detects tampering.
+- Audit-immutability test: attempts to edit/delete an audit event fail and hash-chain verification detects tampering; per-stream chains (engagement/tenant/global) each verify independently.
 - Deny-by-default test: with no scope config, every candidate request is denied.
+- Two-stage/token tests: a request with a forged/expired/replayed (consumed jti) or wrong-audience grant is refused before any TCP SYN; a grant for GET /app cannot drive POST /admin; the resolved IP is validated and pinned at the broker.
+- Dual-control tests: a single actor cannot attest+approve or expand+approve; below-threshold requests never reach approved; a decision pinning a different plan hash does not count; SoD-conflicting roles cannot both be exercised by one user on one engagement.
+- Breadth tests: over-broad CIDR/wildcard/host-count/address-count is rejected or gated to elevated dual approval; a CIDR below the absolute floor (/16 v4, /32 v6) is hard-rejected even with approval.
+- Audit-split test: the request.intent event is durably committed before the socket opens; a crash between intent and send leaves a provable attempt and no egress.
 
 **Safety gates.**
-- Scope-escape invariant: no egress path bypasses the single scope-validation chokepoint (code-level single-egress-client proof plus a test that a direct out-of-scope request is refused).
-- SSRF invariant: rebinding protection plus private/link-local/metadata denial demonstrated at the application layer.
-- Authorization-first invariant: no task executes without a valid, unexpired, in-window authorization record.
-- Emergency-stop invariant demonstrated to halt in-flight and queued work.
-- Audit tamper-evidence invariant (append-only hash chain) demonstrated.
-- Cross-tenant invariant: scope/authorization records are tenant-scoped and unreadable/unwritable by other tenants.
+- Scope-escape invariant (SI-001/SI-053): no egress path bypasses the two-stage Scope Authority / Guarded Egress Broker chokepoint (code-level single-socket-creator proof plus a refused direct out-of-scope request); broker ingress is authenticated per-job, not a generic CONNECT proxy.
+- SSRF / network-policy invariant (SI-006/SI-044): Tier A unreachable by any means (incl. under a broad/elevated covering entry and transition IPv6 forms); Tier B reachable only under full elevation; rebinding defeated by broker-time resolve+validate+pin.
+- Authorization-first + dual-control invariant (SI-011/SI-047): no task executes without a valid, unexpired, in-window authorization; attestation and scope expansion require enforced dual control.
+- Scope-breadth invariant (SI-059): breadth ceilings and scope expansion gated by elevated dual approval demonstrated.
+- Emergency-stop invariant (SI-013) demonstrated to halt in-flight and queued work.
+- Audit invariant (SI-026/SI-055/SI-056): append-only hash chains, split intent/completion events, and tenant/global streams demonstrated.
+- Cross-tenant invariant (SI-024/SI-050): scope/authorization/evidence records are tenant-scoped (composite FK + RLS + per-engagement encryption) and unreadable/unwritable by other tenants.
 
 ## Phase 3 — Target Intake + Passive Analysis
 
@@ -133,9 +139,11 @@ Each downstream phase must satisfy its acceptance criteria, pass its exit tests,
 - Hard restrictions are enforced in the engine: never dump databases, never retrieve secrets/keys/files/user data as proof, no reverse shells or OS commands, no executable uploads, no modify/delete/corrupt operations, no brute force/spray/MFA-bypass/ATO, no destructive race or resource-exhaustion, and no WAF/detection bypass.
 - Every check runs through the scope engine, rate limits, and its declared request budget; SSRF checks only use engagement-approved, allowlisted callback infrastructure and reject arbitrary callback hosts.
 - Checks default to passive/safe-active classification; any intrusive check requires a recorded operator approval before it can execute; cleanup routines run and are verified for any artifact a check creates (e.g., a harmless uploaded file).
+- Raw external-tool output and raw response bodies are not persisted by default; findings carry only minimized, allowlisted, redacted evidence; access-control/IDOR checks capture only a non-sensitive discriminator (SI-048, SI-057).
 
 **Exit tests.**
 - Contract-enforcement test: a check missing any required field or safety classification is rejected by the registry and cannot run.
+- Raw-output test (SI-057): a default check run persists no raw body/console text; with the debug quarantine enabled, artifacts are encrypted under the per-engagement key, role-gated, size-capped, TTL-purged, and cannot be promoted un-redacted.
 - Non-destructive SQLi test: the differential check is verified to use inert, non-mutating payloads (no DROP/UPDATE/DELETE/data-extraction payloads) and cannot return row data as proof.
 - Inert-marker XSS test: detection relies on reflection/encoding of a unique non-executing marker, not real script execution.
 - SSRF-callback test: the check refuses to run without approved callback infrastructure and rejects arbitrary/attacker-controlled callback hosts (SSRF).
@@ -300,13 +308,15 @@ Each downstream phase must satisfy its acceptance criteria, pass its exit tests,
 - TLS/DB test: only TLS is served with a strong configuration, the DB is not publicly exposed, and app credentials are least-privilege.
 - Backup/restore drill restores to a known-good state with verified integrity; key-rotation drill rotates secrets without data loss and revokes old keys.
 - Alerting test: a simulated scope violation and emergency stop each fire an alert.
-- Secure-deletion test: engagement deletion removes data, evidence, and backups per retention policy and is verified unrecoverable (report-data exposure); prod log-redaction test confirms no secrets in centralized logs (secret leakage).
+- Cryptographic-erasure test (SI-058): destroying an engagement's per-engagement DEK renders sampled ciphertext undecryptable in primary, WORM/object-lock, AND backup stores without mutating any immutable store; the redacted audit trail still verifies; an active legal hold blocks erasure; a `dek.destroyed` event and a deletion-verification result are recorded (report-data exposure).
+- Egress-posture test (SI-054): a tool/browser sandbox can reach ONLY the broker; a worker can reach ONLY its internal-service allowlist plus the broker; both are blocked from targets/internet/metadata.
+- Prod log-redaction test confirms no secrets in centralized logs (secret leakage).
 
 **Safety gates.**
-- Network-layer egress-filtering invariant as defense in depth (SSRF, scope escape).
+- Network-layer egress-filtering invariant as defense in depth (SI-033/SI-054): tool/browser sandbox broker-only; worker narrow internal allowlist + broker; no direct target/internet route.
 - Not-public-by-default invariant.
 - Worker-isolation and segmentation invariant containing tool/plugin execution (unsafe plugin execution).
-- Secret-management and key-rotation invariant (secret leakage); secure-deletion and retention invariant (report-data exposure).
+- Secret-management and key-rotation invariant (secret leakage); secure-deletion via per-engagement cryptographic erasure reconciled with WORM/audit/backups (SI-058, report-data exposure).
 - Monitoring/alerting on safety events operational; backup/restore integrity invariant demonstrated.
 
 ## Phase 12 — Final Review + Release

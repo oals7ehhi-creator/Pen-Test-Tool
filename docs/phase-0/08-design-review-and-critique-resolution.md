@@ -30,8 +30,8 @@ The review flagged that the same concept appeared under three names with slightl
 
 | Canonical term | Role | Does I/O? | Where DNS resolution & IP pinning happen |
 |---|---|---|---|
-| **Scope Authority** (was "scope-validation service") | The *single source of truth* for "is (engagement, authz, method, url, ip, port, path, time, approval) permitted?" Mints short-TTL, signed **decision tokens**. | No target I/O. | — (evaluates; does not dial) |
-| **Guarded Egress Broker** (was "ScopeGuard egress client" / "Guarded Egress Broker") | The *single enforcer* and the *only socket-creator* in the data plane. Re-verifies the decision token, resolves DNS, pins the validated IP, dials it, handles redirects, rate limits, breakers, and audit emission. | Yes — it is the one component that dials targets. | **In the broker, co-located with socket creation** (so the validated IP is the dialed IP; no client-side resolution anywhere). |
+| **Scope Authority** (was "scope-validation service") | The *single source of truth* for "is (engagement, authz, method, url, ip, port, path, time, approval) permitted?" Mints short-TTL, signed, single-use **Stage-1 egress grants** (round-2 two-stage model, §7 / `10`). | No target I/O; no target DNS. | — (evaluates; does not dial) |
+| **Guarded Egress Broker** (was "ScopeGuard egress client") | The *single enforcer* and the *only target-socket creator* in the data plane. Authenticates per-job ingress, re-verifies the grant, resolves DNS, validates and pins the IP **at broker time**, dials it, handles redirects, rate limits, breakers, and split audit. | Yes — the one component that dials targets. | **In the broker, co-located with socket creation** (so the validated IP is the dialed IP; no client-side resolution anywhere). |
 
 All other layers (scheduler, worker, adapter) **call** the Scope Authority and route through the Broker; none re-implements matching or opens its own socket. This removes the "four overlapping checks that can drift permissive" risk the reviewer flagged. The glossary in `00-overview.md` records these terms.
 
@@ -45,7 +45,7 @@ Severity is the reviewer's. "Resolution" points to the concrete change in the Ph
 | G2 | SSRF/scope escape — HTTPS CONNECT-tunnel blind spot | critical | **SI-042**, **T-030**; §2 decision (request-by-request driving *or* sandbox-only-CA TLS termination; invariants apply only where broker can see the request). Phase 6 gate. |
 | G3 | Scope escape — decision-token granularity (no path/method) | high | **SI-043**; token now binds canonical path-prefix and (where restricted) HTTP method. Test: GET /app token cannot be replayed for POST /admin. |
 | G4 | Secret leakage / report-data exposure — denylist redaction fails open | high | **SI-045**, **T-034**; inverted to allowlist/minimization, redact-**before**-write to the immutable audit trail. Fuzz corpus with novel-format + URL-embedded secrets. |
-| G5 | SSRF — forbidden-range completeness (6to4/Teredo/NAT64; metadata via covering CIDR) | high | **SI-044**, **T-031**; classifier decodes transition forms and re-classifies embedded IPv4; metadata reachable only via exact /32 or /128, never a covering CIDR. |
+| G5 | SSRF — forbidden-range completeness (6to4/Teredo/NAT64; metadata via covering CIDR) | high | **SI-044**, **T-031**; classifier decodes transition forms and re-classifies embedded IPv4. **Revised in round 2 (§7, blocker 1):** cloud metadata is permanent Tier A — NEVER reachable by any allow, elevated entry, or approval (the earlier "exact /32" carve-out is removed). |
 | G6 | Scope escape (insider) — no dual control on authorization | high | **SI-047**, **T-035**; dual control (two approvers, never the executing tester) for attestation and any scope expansion; SoD role conflict blocked; document_sha256 pinned. |
 | G7 | Inconsistency — "technically enforced" vs operator-defined business-logic checks | high | Resolved honestly (see §5.1): for app-specific/business-logic checks the enforceable controls are approval-gate + method/verb constraints + dry-run plan review + rollback declaration, **not** code-level destructiveness detection. Non-goals and Phase 5 wording corrected. |
 | G8 | Fail-safe defaults specified only for the secret store | high | **SI-046**; universal fail-closed for scope verdict, authorization freshness, e-stop state, window/expiry, resolver, and clock. Fault-injection tests kill each dependency and assert zero egress. |
@@ -80,6 +80,27 @@ These are logged in the Phase 0 risk register (`00-overview.md` §7) and carried
 | Non-goal A4 vs IDOR evidence capture | Resolved — SI-048, §5 |
 | Fail-closed only for secret store | Resolved — SI-046 |
 | Enforcement mechanism named three ways | Resolved — §3 |
-| SI-006 "exact range" ambiguity for metadata | Resolved — SI-044 (exact /32 or /128 only) |
+| SI-006 "exact range" ambiguity for metadata | Resolved — round 2 (§7, blocker 1): metadata is permanent Tier A hard-deny, never reachable by any means (SI-006, SI-044) |
 
 All seven reviewer-identified inconsistencies are resolved in this Phase 0 package.
+
+---
+
+## 7. Round 2 — Phase 0 revision (blockers 1–10)
+
+A second review pass raised ten blockers that had to be resolved before Phase 1. Each is addressed below; new invariants **SI-053–SI-059** and new documents **`09`/`10`/`11`** and **ADR-12–15** carry the changes.
+
+| # | Blocker | Resolution |
+|---|---|---|
+| 1 | One consistent network policy | Permanent **Tier A** hard-deny (metadata, loopback, unspecified, multicast, broadcast, reserved) — never overridable by any allow/elevated/approval. **Tier B** (RFC1918/ULA/link-local/CGNAT) internal apps supported **only** via elevated dual approval + `internal_testing_granted`; metadata stays Tier A even inside an elevated link-local range. Contradictory wording removed from SI-006, SI-044, T-031, and `07`. (`04` §6, SI-006, SI-044, SI-059) |
+| 2 | Two-stage request authorization | The scheduling grant cannot bind a resolved IP before DNS resolution. Redesigned into **Stage-1** (Scope Authority mints a signed, single-use, audience-bound grant binding `iss/aud/sub/job_id/jti/iat/nbf/exp/tenant/engagement/authorization/scope_hash/method/canonical URL+host+port+scheme+path/mode/request_class/approval_ref` — **no IP**) and **Stage-2** (broker resolves DNS, validates every resolved IP, pins it, records it in the completion event). Replay protection via single-use `jti` + short TTL + `aud` binding. (`10`, `04` §7, SI-001, SI-053; ADR-12) |
+| 3 | Two-approver approval model | Replaced single `decided_by` with `approval_request` + one `approval_decision` per approver: `required_approvals` threshold (floor 2 for attestation/scope/mode/business-logic), verified approver roles, per-decision plan **and** document-hash binding, and enforced SoD. (`04` §10, SI-047, SI-018, SI-020; ADR-14) |
+| 4 | Definitive RBAC matrix | Published one authoritative role×action matrix + approval-authority table, with Reviewer and Administrator approval permissions made explicit (Administrator SoD-separated from engagement approval; Reviewer a valid approver, not an executor). Referenced from FR-002, SI-040, `04` §10, `06`. (`09`) |
+| 5 | Schema strengthening | Composite tenant foreign keys on every child table (parent `UNIQUE(id, tenant_id)`); strict per-`entry_class` shape CHECK constraints; explicit host binding (`bound_host_ascii`) for `path_prefix`/`api_resource`; a canonical `scope_hash` over **every** security-relevant semantic field plus breadth counters. (`04` §1, §4.1, §4.2, SI-024) |
+| 6 | Networking clarification | Tool/browser sandbox → **broker only**; worker → **narrow internal-service allowlist + broker**, no direct target/internet route; **authenticated per-job broker ingress** (per-job identity/capability matching the grant) — **never a generic CONNECT proxy**. (`10` §4, `03` §3.1/§3.3, SI-053, SI-054, SI-033; ADR-13) |
+| 7 | Split audit + non-engagement streams | Request events split into a durable **`request.intent`** (committed before the socket opens) and **`request.completed`/`request.failed`**; three tamper-evident streams — `engagement`, `tenant`, `global` — so login, global emergency stop, tool inventory, role/retention/feed events are all chained. (`04` §9, SI-055, SI-056) |
+| 8 | Raw-output retention | **No persistent raw output by default**; findings carry only minimized, allowlisted, redacted evidence. Optional per-engagement debug quarantine: encrypted under the per-engagement DEK, role-restricted, size-capped, short-TTL auto-purged, redacted before any promotion. (`11` §2, SI-057) |
+| 9 | Secure deletion vs WORM | **Per-engagement cryptographic erasure** — destroy the per-engagement DEK to make all ciphertext in primary/WORM/backup stores undecryptable without mutating any immutable store; audit trail (redacted, secret-free) retained under its own policy; legal-hold override; verifiable deletion + `dek.destroyed` event; documented audit-anchor residual window. (`11` §3–§4, SI-058, SI-051; ADR-15) |
+| 10 | Scope-breadth limits | Enforceable limits + elevated dual approval for broad CIDRs (min prefix, absolute floor /16 v4 & /32 v6), wildcard domains (PSL/apex hard-rejected), host/address ceilings, and **any** scope expansion (dual approval + re-attestation). (`04` §4.6, SI-059, FR-064) |
+
+Canonical component names — **Scope Authority** and **Guarded Egress Broker** — are now used in every document; the earlier "scope-validation service" / "ScopeGuard" terminology has been removed except where a document explicitly notes the supersession for traceability.

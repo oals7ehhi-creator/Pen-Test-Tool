@@ -1,7 +1,7 @@
 # Phase 0 — Functional & Non-Functional Requirements
 > **Phase 0 design artifact — no implementation code.** This document is part of the Phase 0 requirements & threat-model package for an *authorized, non-destructive* defensive web-application security assessment platform. It is subordinate to the safety model: every control described here is intended to be enforced **technically**, not by warning.
 
-**60 functional requirements (FR-###)** and **37 non-functional requirements (NFR-###)**, each atomic, traceable, and verifiable. Functional requirements are grouped by their primary owning phase; non-functional requirements by category. Priority uses MoSCoW (must / should / could).
+**67 functional requirements (FR-###)** and **37 non-functional requirements (NFR-###)**, each atomic, traceable, and verifiable. Functional requirements are grouped by their primary owning phase; non-functional requirements by category. Priority uses MoSCoW (must / should / could).
 
 ## Functional Requirements
 
@@ -10,14 +10,15 @@
 | Phase | Requirement IDs |
 |---|---|
 | Phase 1 | FR-001, FR-002, FR-003, FR-004 |
-| Phase 2 | FR-005, FR-006, FR-007, FR-008, FR-009, FR-010, FR-011, FR-012, FR-013, FR-014, FR-015, FR-016, FR-017, FR-018, FR-019, FR-020, FR-021, FR-022, FR-023, FR-024, FR-025 |
+| Phase 2 | FR-005, FR-006, FR-007, FR-008, FR-009, FR-010, FR-011, FR-012, FR-013, FR-014, FR-015, FR-016, FR-017, FR-018, FR-019, FR-020, FR-021, FR-022, FR-023, FR-024, FR-025, FR-061, FR-062, FR-063, FR-064, FR-065 |
 | Phase 3 | FR-026, FR-027, FR-028, FR-029, FR-030, FR-031, FR-032 |
 | Phase 4 | FR-033, FR-034, FR-035, FR-036, FR-037, FR-038 |
-| Phase 5 | FR-039, FR-040, FR-041, FR-042, FR-043, FR-044, FR-045, FR-046 |
+| Phase 5 | FR-039, FR-040, FR-041, FR-042, FR-043, FR-044, FR-045, FR-046, FR-066 |
 | Phase 6 | FR-047, FR-048, FR-049, FR-050 |
 | Phase 7 | FR-051, FR-052, FR-053, FR-054 |
 | Phase 8 | FR-055, FR-056 |
 | Phase 9 | FR-057, FR-058, FR-059, FR-060 |
+| Phase 11 | FR-067 |
 
 ### Phase 1
 
@@ -29,9 +30,9 @@ The platform shall require every human and API client to authenticate before any
 
 **FR-002 — Role-based access control with five named roles**  ·  _priority: must_
 
-The platform shall implement RBAC with the roles Administrator, Engagement Manager, Tester, Reviewer, and Read-only Auditor, enforcing least-privilege such that each role can perform only its authorized actions (e.g. only Engagement Manager/Administrator can approve authorization; only approvers can release approval-gated validation; Read-only Auditor cannot mutate state).
+The platform shall implement RBAC with the roles Administrator, Engagement Manager, Tester, Reviewer, and Read-only Auditor, enforcing least-privilege such that each role can perform only its authorized actions (e.g. only Engagement Manager/Administrator can approve authorization; only approvers can release approval-gated validation; Read-only Auditor cannot mutate state). The authoritative role-to-action matrix (including who may approve authorization attestation, scope expansion, and intrusive validation) is defined once in 09-rbac-matrix.md and referenced everywhere.
 
-> **Verification:** Authorization test matrix per role x action asserting allow/deny; negative tests for privilege escalation.
+> **Verification:** Authorization test matrix per role x action asserting allow/deny; negative tests for privilege escalation. The authorization test matrix is generated from 09-rbac-matrix.md so doc/code drift fails CI.
 
 **FR-003 — No arbitrary shell or OS command execution from UI or API**  ·  _priority: must_
 
@@ -103,9 +104,9 @@ The platform shall support importing and exporting scope configurations in a str
 
 **FR-014 — Pre-flight scope validation on every request**  ·  _priority: must_
 
-The platform shall invoke a central scope-validation service before every outbound target request, and shall block any request whose canonicalized destination is not in scope.
+The platform shall authorize every outbound target request through a two-stage flow: the central Scope Authority evaluates scope/authorization/mode/window/budget and mints a signed, single-use, audience-bound Stage-1 egress grant binding the exact request line (method + canonical URL/path) with no resolved IP; the Guarded Egress Broker then verifies the grant, resolves DNS, validates and pins every resolved IP at broker time, and connects only to a pinned in-scope IP.
 
-> **Verification:** Instrumentation test asserting no outbound request path bypasses the validator; property-based URL tests.
+> **Verification:** Instrumentation test asserting no outbound target socket opens without a valid grant; grant-claim, replay (single-use jti), and audience-binding tests; broker-time resolved-IP validation and pinning tests.
 
 **FR-015 — DNS resolution with in-scope IP verification**  ·  _priority: must_
 
@@ -172,6 +173,36 @@ The platform shall record every security-relevant action (scope decisions, autho
 The platform shall enforce scope, authorization, window, and mode constraints at both the scheduling layer and the execution layer, so that an out-of-scope or unauthorized request can be neither queued nor executed even if one layer is bypassed.
 
 > **Verification:** Property-based and fault-injection tests proving out-of-scope/unauthorized requests are rejected at scheduler and again at executor.
+
+**FR-061 — Authenticated per-job broker ingress (no generic proxy)**  ·  _priority: must_
+
+The Guarded Egress Broker shall accept egress requests only over an authenticated, per-job identity/capability matching the grant's tenant/engagement/run/job, and shall never expose a generic CONNECT proxy or serve any destination not carried by a Scope-Authority grant.
+
+> **Verification:** Ingress-auth tests: unauthenticated or mismatched-identity callers rejected; attempts to open an arbitrary host:port tunnel refused; every served destination traces to a grant.
+
+**FR-062 — Dual-control approval for the legal gate**  ·  _priority: must_
+
+The platform shall require dual control (a configurable threshold with a floor of two distinct, role-verified approvers, none being the requester or executing tester, each pinning the plan and authorization-document hash) for authorization attestation and any scope expansion, via an approval_request plus one approval_decision per approver.
+
+> **Verification:** Approval-threshold and separation-of-duties tests: single-actor attest+approve rejected; below-threshold never approved; a decision whose pinned plan hash differs does not count.
+
+**FR-063 — Two-tier network guard with elevated internal testing**  ·  _priority: must_
+
+The platform shall permanently hard-deny Tier A ranges (metadata, loopback, unspecified, multicast, broadcast, reserved) by any means, and shall permit Tier B ranges (RFC1918, ULA, link-local, CGNAT) only when an explicit elevated scope entry names them, a dual-approved restricted-range approval exists, and the authorization grants internal testing.
+
+> **Verification:** Table-driven range tests incl. transition forms; assert Tier A unreachable even under a broad/elevated covering entry; assert Tier B reachable only under the full elevation condition.
+
+**FR-064 — Scope-breadth limits and elevated approval**  ·  _priority: must_
+
+The platform shall bound scope breadth (minimum CIDR prefix with an absolute floor, wildcard-domain gating, host and total-address ceilings) and shall require elevated dual approval plus re-attestation for any scope expansion; scopes exceeding ceilings cannot mint grants without the approved elevation.
+
+> **Verification:** Breadth tests: over-broad CIDR/wildcard/count rejected or gated; below the absolute floor hard-rejected even with approval; scope expansion requires dual approval + re-attestation.
+
+**FR-065 — Split audit request events and non-engagement streams**  ·  _priority: must_
+
+The platform shall record each outbound request as a durable pre-send intent event and a post-send completion/failure event, and shall maintain separate tamper-evident tenant and global audit streams for events without an engagement (login, global emergency stop, tool-inventory changes, role changes, retention/feed changes).
+
+> **Verification:** Intent-before-send ordering test (crash between intent and send leaves a provable attempt); per-stream chain tamper tests; coverage test that non-engagement actions are logged in the correct stream.
 
 ### Phase 3
 
@@ -305,6 +336,12 @@ The platform shall capture evidence, compute a confidence value, perform any dec
 
 > **Verification:** Tests asserting each check run yields evidence and confidence, invokes cleanup, and degrades safely on error.
 
+**FR-066 — Raw-output minimization with gated quarantine**  ·  _priority: should_
+
+The platform shall not persist raw external-tool output or raw target response bodies by default, storing only minimized, allowlisted, redacted evidence; an optional per-engagement debug quarantine shall be encrypted under the per-engagement key, role-restricted, size-capped, short-TTL auto-purged, and redacted before any promotion to long-term storage.
+
+> **Verification:** Default-run test asserts no raw body/console text persisted; quarantine-enabled test asserts encryption, TTL purge, role gating, and redaction-before-promotion.
+
 ### Phase 6
 
 **FR-047 — Isolated tool adapters with pinned, verified versions and curated allowlists**  ·  _priority: must_
@@ -396,6 +433,14 @@ The platform shall provide a progress dashboard with request-budget indicators, 
 The platform shall not provide any one-click "attack everything" capability and shall never perform intrusive validation automatically without explicit per-action operator approval.
 
 > **Verification:** UX and workflow review confirming no bulk-attack control exists and that intrusive actions always require explicit approval.
+
+### Phase 11
+
+**FR-067 — Retention classes and cryptographic erasure**  ·  _priority: must_
+
+The platform shall implement per-engagement cryptographic erasure (destroying the per-engagement data key) as the secure-deletion mechanism reconciled with WORM storage, audit retention, and backups, retaining the redacted audit trail under its own policy, honoring legal holds, and recording a verifiable deletion result.
+
+> **Verification:** Crypto-erase test: after key destruction sampled ciphertext no longer decrypts in primary/WORM/backup; audit remains verifiable; legal hold blocks erasure; dek.destroyed recorded.
 
 ## Non-Functional Requirements
 

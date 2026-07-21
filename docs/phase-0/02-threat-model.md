@@ -7,7 +7,7 @@ Methodology: STRIDE + abuse-case analysis over the platform's assets, actors, tr
 
 | Asset | Sensitivity | Description |
 |---|---|---|
-| Scope configuration / allowlist | critical | Per-engagement allowlist of domains, IPs, CIDRs, ports, protocols, URL prefixes, APIs plus explicit exclusions. The single source of truth the scope-validation service enforces on every outbound request. Tampering with it is the direct path to scope escape and third-party attack. |
+| Scope configuration / allowlist | critical | Per-engagement allowlist of domains, IPs, CIDRs, ports, protocols, URL prefixes, APIs plus explicit exclusions. The single source of truth the Scope Authority evaluates and the Guarded Egress Broker enforces on every outbound request. Tampering with it is the direct path to scope escape and third-party attack. |
 | Authorization records | critical | Written-authorization reference, engagement owner, signatory, expiry timestamp, testing window, and bound scope. Legal proof-of-consent gating all activity; forged or altered records enable attacking systems the operator has no right to test. |
 | Operator-supplied target auth sessions & test-account credentials | critical | Session cookies, bearer tokens, and low-priv test accounts the operator provides so the scanner can reach authenticated surface of the in-scope target. High-value secrets that must only ever be transmitted to in-scope hosts. |
 | Audit trail / audit events | critical | Tamper-evident, hash-chained record of every action (scope edits, approvals, requests dispatched, tool runs, exports). Forensic and legal record; its integrity is what proves the engagement stayed non-destructive and in-scope. |
@@ -47,7 +47,7 @@ Methodology: STRIDE + abuse-case analysis over the platform's assets, actors, tr
 | Browser <-> Backend API | Operator UI/API surface where all human intent enters the system. | TLS; strong authN (MFA-capable) + short-lived sessions; RBAC on every endpoint; object-level authorization (engagement/tenant scoping); anti-CSRF; strict server-side input validation and canonicalization; no client-side safety toggles — safety invariants enforced server-side; per-role rate limiting. |
 | Backend API <-> Worker (via job queue) | Control-plane to execution-plane boundary; the only way scan work reaches workers. | HMAC/signed queue messages with per-message nonce and TTL; strict typed message schema with no free-form command/argument fields; tenant+engagement id bound and re-verified on dequeue; workers cannot self-authorize scope — they re-run scope validation before any request. |
 | Worker <-> Tool sandbox | Execution of untrusted external tools separated from worker/host. | One-shot isolated container per run; read-only root FS + ephemeral scratch; non-root user; seccomp/AppArmor; dropped capabilities; no host mounts; CPU/mem/time/PID/request caps; args passed via argv arrays (never a shell); structured output over a file/pipe, never console scraping. |
-| Platform <-> Target (egress boundary) | Every outbound request to a target crosses here; the core safety perimeter. | Mandatory scope-validation service on each request; DNS resolve + IP re-check + connection pinning (rebinding protection); RFC1918/link-local/metadata/loopback default-deny; redirect-target scope check with no auto-follow off-scope; per-engagement concurrency/rate caps and circuit breakers; testing-window + authorization-expiry gate; forced egress proxy allowlist (no direct sockets). |
+| Platform <-> Target (egress boundary) | Every outbound request to a target crosses here; the core safety perimeter. | Two-stage authorization (Scope Authority Stage-1 grant + Guarded Egress Broker Stage-2) on each request; authenticated per-job broker ingress (no generic CONNECT proxy); DNS resolve + IP re-check + connection pinning (rebinding protection); Tier A hard-deny (metadata/loopback/unspecified/multicast/broadcast/reserved) and Tier B (RFC1918/ULA/link-local/CGNAT) only via elevated dual approval; redirect re-authorized per hop; per-engagement concurrency/rate caps and circuit breakers; testing-window + authorization-expiry gate; forced egress allowlist (no direct sockets). |
 | Platform <-> Supply-chain sources | Fetching dependencies, tool binaries, and templates. | Pinned versions + checksum/signature verification at fetch and at load; isolated fetch with restricted egress; curated non-destructive template allowlist; SBOM + dependency/secret scanning in CI; no runtime auto-update of tools/templates. |
 | Tenant / engagement isolation boundary | Logical boundary between engagements and tenants inside DB, queue, and storage. | Row-level tenant/engagement scoping on every query; authorization checks keyed to engagement membership; separate secret namespaces per engagement; queue messages and evidence blobs tagged and filtered by engagement; no cross-engagement joins in reporting. |
 | Untrusted-data boundary | Boundary where target responses and tool output enter storage/rendering. | Treat all target/tool data as hostile; schema-validate and size-cap before parse; parse in memory-limited sandboxed parsers (no entity expansion, no eval); contextual output-encoding on all UI/report rendering; store raw output separately from verified findings. |
@@ -59,7 +59,7 @@ Methodology: STRIDE + abuse-case analysis over the platform's assets, actors, tr
 |---|---|---|---|
 | Define scope & authorization | Operator browser → Backend API -> Database | Allowlist entries, exclusions, authorization reference, owner, expiry, testing window | yes |
 | Enqueue scan job | Backend API → Job queue -> Worker | Signed job descriptor (engagement id, mode, target set, budgets) | yes |
-| Scope + DNS validation | Worker → Scope-validation service / DNS resolver | Candidate target URL/host, resolved IPs, in/out-of-scope verdict | yes |
+| Scope + DNS validation | Worker → Scope Authority (Stage-1) → Guarded Egress Broker (Stage-2 DNS resolve) | Candidate target URL/host, resolved IPs, in/out-of-scope verdict | yes |
 | Outbound test request to target | Worker / tool sandbox → Target system (via egress proxy) | HTTP request with non-destructive payloads; operator target session only if host in scope | yes |
 | Target response ingest | Target system → Worker (untrusted-data boundary) | Untrusted response headers/body, redirects, TLS/cert data | yes |
 | Tool invocation | Worker → Tool sandbox container | argv array, curated template id, resource limits (no shell, no user CLI args) | yes |
@@ -98,12 +98,12 @@ The specification mandates coverage of ten named threats. Mapping to threat entr
 - **Likelihood / Impact:** medium / critical
 - **Assets at risk:** Scope configuration / allowlist, Audit trail / audit events
 
-A target outside the engagement allowlist is scheduled or executed because the scope allowlist is altered after approval, or a defect in the scope-validation service (missing check on a code path, exclusion not honored) lets an off-scope request through.
+A target outside the engagement allowlist is scheduled or executed because the scope allowlist is altered after approval, or a defect in the Scope Authority (missing check on a code path, exclusion not honored) lets an off-scope request through.
 
 **Vector.** Direct API edit of scope during an active engagement; a scan code path that reaches the egress proxy without calling the scope service; exclusion list evaluated after the allow decision.
 
 **Mitigations.**
-- Single mandatory choke-point: every outbound request passes the scope-validation service — no code path may open a socket without a verdict
+- Single mandatory choke-point: every outbound request passes the two-stage Scope Authority / Guarded Egress Broker flow — no code path may open a target socket without a valid grant
 - Fail-closed default deny; empty/absent scope denies all
 - Exclusions evaluated before allows; deny wins ties
 - Scope changes on an active engagement require re-approval and are hash-chained into the audit log
@@ -359,9 +359,9 @@ IPv4-embedding IPv6 transition forms — 6to4 (2002::/16, e.g. 2002:a9fe:a9fe:: 
 **Vector.** A target hostname or redirect resolving to a transition-form IPv6 address that decodes to a forbidden IPv4 range.
 
 **Mitigations.**
-- SI-044: forbidden-range classifier decodes IPv4-mapped, IPv4-compatible, 6to4, Teredo, and NAT64 forms and re-classifies the embedded IPv4 against all forbidden ranges
-- Cloud-metadata addresses reachable ONLY via an exact-/32 (or /128) elevated allow entry, never via a covering CIDR
-- Table-driven test corpus including 2002:a9fe:a9fe::
+- SI-044: the network-guard classifier decodes IPv4-mapped, IPv4-compatible, 6to4, Teredo, and NAT64 forms and re-classifies the embedded IPv4 against all ranges
+- SI-006: cloud-metadata (and all Tier A) addresses are NEVER reachable by any allow, elevated entry, or approval; a Tier B covering entry (e.g. an elevated 169.254.0.0/16, or a 0.0.0.0/0 allow) does not permit any Tier A address within it
+- Table-driven test corpus including 2002:a9fe:a9fe:: (decodes to 169.254.169.254 → hard-denied)
 
 **Residual risk.** Novel transition/encoding schemes may emerge; mitigated by deny-by-default on any address that cannot be positively classified as in-scope.
 
@@ -642,16 +642,17 @@ A crafted host/URL triggers catastrophic backtracking or a crash in the scope/UR
 - **Likelihood / Impact:** medium / high
 - **Assets at risk:** Scope configuration / allowlist, In-scope target systems
 
-Sandboxed third-party tools reach HTTPS targets through an HTTP CONNECT proxy. Inside the TLS tunnel the broker sees only host:port for the initial CONNECT — it cannot see the request path, cannot re-validate redirects, and cannot inspect/size-cap/redact bodies. Per-hop redirect re-validation, path-prefix scoping, and body caps become unenforceable for tool HTTPS traffic unless a specific model is chosen.
+If a naive HTTP `CONNECT` tunnel were used, the Guarded Egress Broker would see only host:port for the initial CONNECT — it could not see the request path, re-validate redirects, or inspect/size-cap/redact bodies. Per-hop redirect re-validation, path-prefix scoping, and body caps would be unenforceable for tool HTTPS traffic. **The design therefore forbids a generic CONNECT proxy** and requires the broker's authenticated, per-job, request-line-bound ingress (SI-053).
 
 **Vector.** An in-scope host redirecting or path-traversing to an off-scope path/host inside an opaque TLS tunnel driven by a tool.
 
 **Mitigations.**
-- SI-042: one model chosen and documented — (a) broker TLS-termination using an internal CA installed ONLY inside the sandbox to inspect the tool's own egress, or (b) request-by-request adapter driving (ZAP API mode, Nuclei with proxy + redirects disabled) so each request/redirect crosses the broker in cleartext-to-broker form
-- Path/redirect/body invariants explicitly apply only where the broker can see them; tools that cannot be so constrained are gated
-- Host:port + resolved-IP scope still enforced for the CONNECT itself (rebinding-safe)
+- SI-053: the broker never exposes a generic `CONNECT host:port` proxy; each request carries a per-job identity and a single-use grant bound to the exact request line, and the broker serves only that line.
+- SI-042: one visibility model chosen and documented per adapter — (a) broker TLS-termination using an internal CA installed ONLY inside the sandbox to inspect the tool's own egress, or (b) request-by-request adapter driving (ZAP API mode, Nuclei with proxy + redirects disabled) so each request/redirect crosses the broker in broker-visible form.
+- Path/redirect/body invariants apply wherever the broker can see the request (both models above); tools that cannot be so constrained are gated out.
+- Host:port + resolved-IP scope + IP pinning always enforced (rebinding-safe), even before body visibility.
 
-**Residual risk.** Model (a) requires disciplined sandbox-only CA custody; model (b) constrains which tool features are usable. Documented explicitly rather than left implicit.
+**Residual risk.** Model (a) requires disciplined sandbox-only CA custody; model (b) constrains which tool features are usable. Documented explicitly rather than left implicit; a generic tunnel is disallowed outright.
 
 ### T-032 — Report / PDF renderer SSRF and exfiltration
 
@@ -821,7 +822,7 @@ _Prevention._ Safety invariants are enforced server-side, not as client toggles;
 
 | Component | Failure | Detection | Response | Fails safe |
 |---|---|---|---|---|
-| Scope-validation service | Service unavailable, throws, or times out while evaluating a candidate request. | Health checks; per-request error/timeout on the scope call; missing verdict. | Deny the request, halt the job, alert the operator; never dispatch without an explicit allow verdict. | yes |
+| Scope Authority | Service unavailable, throws, or times out while evaluating a candidate request. | Health checks; per-request error/timeout on the scope call; missing verdict. | Deny the request, halt the job, alert the operator; never dispatch without an explicit allow verdict (fail-closed, SI-046). | yes |
 | DNS resolver / rebinding guard | Resolution fails, returns records outside scope, or the connected peer IP differs from the validated IP. | Compare resolved A/AAAA records to scope + deny-list; verify connected socket peer equals the pinned validated IP. | Refuse the request and pin only validated IPs; on mismatch abort the connection. | yes |
 | Authorization / expiry / testing-window checker | Checker down, clock skew, or cached authorization goes stale. | Heartbeat on checker; trusted time source with skew detection; per-request re-check. | Treat as expired/out-of-window and stop testing; drain running jobs. | yes |
 | Egress filtering proxy | Proxy down or misconfigured, or a component attempts a direct socket. | Connection errors; egress-policy audit; alerts on direct-socket attempts. | Block all outbound traffic; no direct-connection fallback is permitted. | yes |

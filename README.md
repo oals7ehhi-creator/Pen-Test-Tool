@@ -38,7 +38,7 @@ This project follows a strict phased delivery process. Each phase stops for revi
 | 11 | Deployment & operations | ⏳ |
 | 12 | Final review & release | ⏳ |
 
-**Phase 0 deliverables** live in [`docs/phase-0/`](docs/phase-0/README.md): requirements, threat model, architecture, the authorization/scope schema, 52 safety invariants, phase-gate acceptance criteria for Phases 1–12, non-goals, and the adversarial design review. No implementation code exists yet — by design.
+**Phase 0 deliverables** live in [`docs/phase-0/`](docs/phase-0/README.md): requirements, threat model, architecture, the authorization/scope schema, 59 safety invariants, phase-gate acceptance criteria for Phases 1–12, non-goals, the two-round adversarial design review, the definitive RBAC matrix, the two-stage request-authorization flow, and the data-retention/deletion design. No implementation code exists yet — by design.
 
 Start here: **[docs/phase-0/00-overview.md](docs/phase-0/00-overview.md)**.
 
@@ -58,7 +58,10 @@ Start here: **[docs/phase-0/00-overview.md](docs/phase-0/00-overview.md)**.
         ├── 05-safety-invariants.md
         ├── 06-acceptance-criteria.md
         ├── 07-non-goals-and-refusals.md
-        └── 08-design-review-and-critique-resolution.md
+        ├── 08-design-review-and-critique-resolution.md
+        ├── 09-rbac-matrix.md
+        ├── 10-request-authorization-flow.md
+        └── 11-data-retention-and-deletion.md
 ```
 
 The monorepo (backend API, worker service, web UI, database migrations, CI) is introduced in **Phase 1**, only after Phase 0 is approved.
