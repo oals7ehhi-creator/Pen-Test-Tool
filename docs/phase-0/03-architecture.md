@@ -1,0 +1,290 @@
+> **Phase 0 design artifact — no implementation code.** This document is part of the Phase 0 requirements & threat-model package for an *authorized, non-destructive* defensive web-application security assessment platform. It is subordinate to the safety model: every control described here is intended to be enforced **technically**, not by warning.
+
+# Phase 0 — Architecture & Technology Stack
+## Authorized Defensive Web Application Security Assessment Platform
+
+This document proposes the system architecture and stack. It is design/analysis only. Every decision is subordinate to the **authorization-first, non-destructive, technically-enforced safety model**: the architecture must make out-of-scope or destructive action *structurally impossible*, not merely discouraged.
+
+The single most important architectural idea in this document: **there is exactly one path to the network, and that path is a scope-enforcing choke point that no component can bypass.** Everything else follows from that.
+
+---
+
+## 1. High-Level Component Architecture
+
+Two planes, separated by trust and by network policy:
+
+- **Control plane** — human-facing, holds authority (who, what scope, what approvals). Never touches target systems directly.
+- **Data plane** — executes checks against targets, network-isolated, has *no* authority of its own and *no* unmediated route to the internet.
+
+```
+                        ┌────────────────────────────────────────────────────────┐
+                        │                     OPERATORS                            │
+                        │      Admin · Eng.Manager · Tester · Reviewer · Auditor   │
+                        └───────────────────────────┬────────────────────────────┘
+                                                    │ HTTPS (mTLS at edge, OIDC)
+              ══════════════════════════════════════▼══════════════════════════════ CONTROL PLANE
+              │                                                                     │
+              │   ┌───────────────┐        ┌───────────────────────────────────┐   │
+              │   │  Web UI (SPA) │◄──────►│  Backend API / BFF                 │   │
+              │   │  React/TS     │  REST  │  authN, RBAC, engagement CRUD,     │   │
+              │   └───────────────┘  +WS   │  approval gates, job intake,       │   │
+              │                             │  finding review, reporting        │   │
+              │                             └──┬────────────┬──────────┬────────┘   │
+              │                                │            │          │            │
+              │         ┌──────────────────────▼──┐   ┌─────▼─────┐  ┌─▼──────────┐ │
+              │         │  Scope-Validation Svc     │  │ Job Queue │  │  Audit Log │ │
+              │         │  (authority for "is this  │  │ (durable, │  │  Store     │ │
+              │         │  in scope, now, approved")│  │  txn'l)   │  │ (hash-     │ │
+              │         └──────────┬────────────────┘  └─────┬─────┘  │  chained)  │ │
+              │                    │  signed scope decisions │        └────────────┘ │
+              │         ┌──────────▼─────────────────────────▼──────┐               │
+              │         │  PostgreSQL  (tenants, engagements, scope, │               │
+              │         │   authz records, findings; RLS-isolated)  │               │
+              │         └───────────────────────────────────────────┘               │
+              │              │                                                       │
+              │   ┌──────────▼─────────┐   ┌──────────────────┐   ┌──────────────┐  │
+              │   │  Secrets Manager   │   │  Object Storage  │   │ Report Store │  │
+              │   │  (Vault/KMS)       │   │  (evidence, WORM)│   │ (rendered)   │  │
+              │   └────────────────────┘   └──────────────────┘   └──────────────┘  │
+              ═══════════════════════════════════╪═════════════════════════════════
+                                                 │  jobs pulled (no inbound to workers)
+              ═══════════════════════════════════▼═════════════════════════════════ DATA PLANE
+              │   default-deny egress netns · no NAT to internet · only route = broker │
+              │                                                                        │
+              │   ┌─────────────────────────────────────────────────────────────┐    │
+              │   │                  WORKER POOL (stateless executors)           │    │
+              │   │   pull job → NEVER opens a socket to a target directly       │    │
+              │   └───────────┬─────────────────────────────┬───────────────────┘    │
+              │               │ structured check request     │ structured tool spec   │
+              │   ┌───────────▼──────────────┐   ┌───────────▼───────────────────┐    │
+              │   │  Scanner Sandbox / Tool   │   │  (native safe checks also go  │    │
+              │   │  Adapters (gVisor/microVM)│   │   through the broker)         │    │
+              │   │  Nuclei · ZAP · testssl   │   └───────────┬───────────────────┘    │
+              │   │  SCA · secret-scan        │               │                        │
+              │   └───────────┬──────────────┘                │                        │
+              │               └────────────────┬──────────────┘                        │
+              │                                 ▼                                       │
+              │            ╔══════════════════════════════════════════╗                │
+              │            ║   GUARDED EGRESS BROKER  (THE choke point) ║                │
+              │            ║   • re-validates scope on EVERY request    ║                │
+              │            ║   • own DNS resolve + IP pinning (anti-    ║                │
+              │            ║     rebinding) • redirect scope checks     ║                │
+              │            ║   • per-engagement rate/concurrency limits ║                │
+              │            ║   • circuit breakers + emergency stop      ║                │
+              │            ║   • records every request as audit event  ║                │
+              │            ╚═════════════════════╪══════════════════════╝                │
+              ══════════════════════════════════╪═══════════════════════════════════════
+                                                 │  ONLY sanctioned internet path
+                                                 ▼
+                                    ┌──────────────────────────┐
+                                    │  IN-SCOPE TARGET SYSTEMS │
+                                    └──────────────────────────┘
+```
+
+**Component responsibilities (concise):**
+
+| Component | Responsibility | Explicitly *not* allowed |
+|---|---|---|
+| Web UI (SPA) | Guided workflow, triage, approvals, dashboards | Never constructs raw requests or commands |
+| Backend API / BFF | AuthN, RBAC, engagement/scope/authz CRUD, job intake, approval-gate state machine, report orchestration | Never contacts targets; never spawns processes |
+| Scope-Validation Service | *Sole authority* on "is (method,url,ip,port,path,time,approval) permitted for engagement E." Issues short-lived, signed scope decisions | Does not perform I/O to targets |
+| Job Queue | Durable, transactional, per-engagement fair scheduling, budgets | Cannot enqueue a job lacking a valid scope token |
+| Worker Pool | Pull jobs, orchestrate checks/adapters, capture evidence | No direct socket to targets; no shell |
+| Scanner Sandbox / Adapters | Run pinned third-party tools in isolation, parse structured output | No arbitrary flags; no network except via broker |
+| Guarded Egress Broker | The only egress path; enforces scope, DNS pinning, redirects, rate limits, breakers, audit | Cannot be bypassed by network policy |
+| PostgreSQL | System of record; tenant isolation via RLS | — |
+| Object Storage (evidence) | Redacted evidence blobs, WORM/object-lock | — |
+| Secrets Manager | Target auth sessions, tool creds, signing keys | Secrets never land in DB rows or logs |
+| Audit Log Store | Append-only, hash-chained, tamper-evident event log | No update/delete API |
+
+---
+
+## 2. Recommended Technology Stack
+
+Bias: typed, memory-safe, well-audited, boring-where-it-counts. The security-critical hot path (egress broker, scope guard) gets the strongest language guarantees; the control plane optimizes for developer velocity and typed correctness.
+
+### 2.1 Languages
+
+| Concern | Primary recommendation | Why | Safe alternative & trade-off |
+|---|---|---|---|
+| **Guarded Egress Broker + Scope guard core** | **Rust** (tokio + hyper/reqwest with custom connector) | This is the safety kernel. Memory-safe with no GC pauses, precise control over socket creation, DNS resolution, TLS, and connection reuse — exactly what IP-pinning and redirect interception need. Small, auditable, fuzz-friendly surface. | **Go**: simpler, faster to staff, excellent net stack and `net/http` hooks. Trade-off: GC, and slightly weaker guarantees around low-level connection control; still an excellent choice and acceptable. |
+| **Backend API / BFF** | **TypeScript on Node with NestJS** | Strong typing end-to-end shared with the SPA, mature RBAC/guard/interceptor primitives that map cleanly to the approval-gate state machine, huge audited ecosystem, first-class OpenAPI generation. | **Python + FastAPI + Pydantic**: superb typed validation, great for the analysis/parsing domain, and lets API + workers share models. Trade-off: two language runtimes if workers are Go/Rust. |
+| **Worker runtime / tool adapters** | **Go** | Great concurrency for orchestrating containers and I/O, static binaries, easy sandbox packaging, strong stdlib, `os/exec` with argv arrays (no shell). | **Rust** (max safety, steeper velocity) or **Python** (fast adapter glue, but keep it strictly no-shell). |
+| **Passive analysis engine** | **Python** modules (or TS) | Best library coverage for TLS/cert parsing, HAR/OpenAPI/Postman parsing, header/CSP analysis. | TypeScript equivalents exist; keep parser inputs treated as untrusted regardless. |
+
+Opinion: a three-language footprint (**Rust broker / TS control plane / Go workers**) is justified precisely because the components have different risk profiles. If the team wants to minimize languages, collapse to **Go everywhere except the SPA** — Go for broker, workers, and API — accepting slightly weaker memory guarantees on the broker in exchange for one runtime.
+
+### 2.2 Data, queue, storage
+
+| Concern | Primary | Why | Alternative / trade-off |
+|---|---|---|---|
+| **Database** | **PostgreSQL 16+** | ACID, Row-Level Security for tenancy, rich constraints (CHECK/exclusion) to encode scope invariants at the storage layer, `SKIP LOCKED` for queueing. | CockroachDB if multi-region HA is a hard requirement (Phase 11); more ops overhead. |
+| **Job queue** | **Postgres-backed durable queue** (River for Go / graphile-worker or pg-boss for TS) | Transactional enqueue: a job and its scope precondition commit together, so an out-of-scope job *cannot* be enqueued. Full audit lives in the same DB. | **NATS JetStream** or **Redis Streams** for higher throughput. Trade-off: enqueue no longer shares a transaction with scope state — mitigated by requiring a signed scope token at dequeue (see §4). Prefer Postgres queue for this platform; request volumes are deliberately low. |
+| **Migrations** | Stack-native, versioned, forward-only in prod: **Drizzle/Prisma** (TS), **Alembic** (Py), **sqlx/refinery** (Rust) | Typed schema, reviewable diffs, CI-gated. | — |
+| **Object storage (evidence)** | **S3-compatible with Object Lock / WORM** — MinIO (single-server), AWS S3/equivalent (prod) | Immutable, retention-locked, versioned evidence; separates large untrusted blobs from the relational core; SSE encryption. | Filesystem + application-enforced immutability for the smallest deployments; weaker tamper-evidence. |
+| **Secrets manager** | **HashiCorp Vault** (dynamic secrets, transit engine for signing, short TTL leases) | Central custody of target auth sessions, tool creds, and the broker/audit signing keys; audited access; rotation. | Cloud KMS + Secrets Manager (managed, less portable) for cloud-only deployments. |
+| **Audit log store** | **Append-only Postgres table, hash-chained**, keys in Vault transit, periodically anchored to WORM object storage | Tamper-evident without a new datastore; cryptographic chain detects mutation/gaps. | Dedicated immutable ledger (e.g., QLDB-style) if regulatory needs demand; added complexity. |
+
+### 2.3 Frontend, containers, isolation, egress control
+
+| Concern | Primary | Why | Alternative / trade-off |
+|---|---|---|---|
+| **Frontend** | **React + TypeScript + Vite**, TanStack Query, a headless component lib (Radix) + design system | Typed API client generated from the API's OpenAPI; strong forms for scope/approval; WebSocket for live progress. | SvelteKit/Vue if team prefers; equivalent. |
+| **Containerization** | **OCI/Docker images**, orchestrated by **Kubernetes** (prod) / **Docker Compose** (dev/single-server) | Declarative network policy, resource limits, and pod-level isolation are exactly the primitives the safety model needs. | HashiCorp Nomad if K8s is too heavy for target deployments. |
+| **Scanner/tool sandbox** | **gVisor (runsc)** runtime, or **Firecracker microVMs** for the highest-risk adapters | Kernel-level syscall interception (gVisor) or true VM boundary (Firecracker) contains untrusted tool binaries far better than vanilla containers. Combined with read-only rootfs, seccomp, dropped caps, `no-new-privileges`, non-root UID. | Plain containers + seccomp + AppArmor as a floor; weaker isolation, acceptable only for the most trusted, pinned tools. |
+| **Egress control** | **Network namespaces with default-deny egress**; enforce with **Cilium/K8s NetworkPolicy** (prod) or **nftables** (single-server). Worker & sandbox namespaces have **no NAT/route to the internet** — the *only* reachable next hop is the egress broker's address. | Makes bypass a network-layer impossibility, not an application check. Even a fully compromised scanner can only talk to the broker. | Sidecar egress proxy per pod (Envoy) enforcing the same; more moving parts. The broker approach is simpler to audit. |
+
+---
+
+## 3. Where Each Safety Control Lives
+
+The safety model maps to specific, single-owner components. No control is duplicated in a way that lets one copy drift permissive.
+
+### 3.1 The single egress choke point — Guarded Egress Broker
+**All outbound requests from the data plane traverse the broker. There is no second path.** Enforced at two layers:
+1. **Network layer (primary, non-bypassable):** worker and sandbox network namespaces are default-deny egress with no route to `0.0.0.0/0`; the sole allowed destination is the broker service. A compromised worker/tool physically cannot reach a target except through the broker.
+2. **Application layer (defense in depth):** the broker independently re-validates every request against the Scope-Validation Service before opening any socket.
+
+The broker owns, per request:
+- **Scope re-validation** (calls/verifies a signed scope decision — never trusts the caller's assertion).
+- **DNS resolution with IP pinning:** the broker resolves the hostname itself, checks *every* resulting A/AAAA record against scope, then **connects to the exact pinned IP it validated** and sets the TLS SNI/Host to the original name. This closes DNS rebinding: the resolved-and-validated IP is the one dialed; a later re-resolution to a private IP cannot occur.
+- **RFC1918 / loopback / link-local / cloud-metadata (169.254.169.254, fd00:ec2::254, etc.) / ULA / documentation-range rejection**, for both IPv4 and IPv6, applied to the *resolved IP*, not just the hostname.
+- **Redirect handling:** the broker does not blindly follow redirects; each hop's target is re-validated for scope, and out-of-scope redirects stop the chain and are recorded.
+- **Per-engagement rate limit, concurrency cap, and request budget** (token buckets keyed by engagement).
+- **Circuit breakers** (error-rate, latency, target-5xx spikes) and the **emergency-stop** signal (a kill switch that flips the engagement to `halted`, draining in-flight and refusing new egress).
+- **Testing-window & authorization-expiry enforcement:** the broker refuses egress outside the window or after expiry, even if a job slipped through scheduling.
+- **Audit emission:** every attempted request (allowed or denied, with reason) becomes an audit event.
+
+### 3.2 The scope guard — Scope-Validation Service
+Authority for *"is this permitted?"* lives in exactly one service. It evaluates: allowlisted domains/IPs/CIDRs/ports/URL-prefixes/APIs, explicit exclusions (exclusions win), canonicalized URL, IP family, active testing window, non-expired authorization, and — for intrusive actions — an existing approval record. It returns a **short-lived, signed scope decision** consumed at enqueue and re-verified at the broker. Because the broker re-checks and the network layer is default-deny, a stale or forged decision cannot produce out-of-scope traffic.
+
+### 3.3 Per-worker / per-sandbox network policy
+Each worker and each scanner sandbox runs in its own namespace with: default-deny egress, no internet route, allow-list only to the broker; read-only rootfs; dropped capabilities; seccomp/AppArmor; non-root; CPU/mem/PID/time quotas; no host mounts. This localizes blast radius per job.
+
+### 3.4 Approval gates
+The **approval-gate state machine lives in the Backend API** and is persisted in Postgres. Intrusive/validation checks cannot transition to `schedulable` without a recorded operator approval (who, when, plan hash). The signed scope decision for an intrusive check embeds the approval reference; the broker refuses intrusive-class egress whose decision lacks a valid approval. Human approval is thus enforced at both the scheduling boundary and the egress boundary.
+
+### 3.5 Redaction
+Redaction is a **mandatory pipeline stage owned by the worker before any evidence leaves the data plane** and re-asserted by the API before storage/reporting. Secrets/tokens/cookies/authz headers/PII/sensitive bodies are stripped/tokenized at capture time; the raw-vs-redacted separation is enforced so unredacted data never reaches the audit log, findings, or reports.
+
+---
+
+## 4. Data Flow — One Check Request, End to End
+
+```
+Operator selects check  ──►  API validates RBAC + engagement state
+        │
+        ▼
+API asks Scope-Validation Svc: (engagement, method, target, port, path, class, now)
+        │                        │
+        │      DENY ◄────────────┘  (reason recorded; operator sees why)
+        ▼ ALLOW  → issues SIGNED, short-TTL scope decision (embeds approval ref if intrusive)
+        │
+        ▼
+API enqueues job + scope decision in ONE Postgres transaction
+   (budget checked & decremented transactionally; out-of-scope job literally cannot commit)
+        │
+        ▼
+Worker pulls job (SKIP LOCKED) → validates scope-decision signature + TTL + budget
+        │
+        ▼
+Worker builds a STRUCTURED check request (typed struct, never a command string)
+   • native check: prepared HTTP request object
+   • tool check: typed tool-spec referencing a pinned template/tool ID (no free-form flags)
+        │
+        ▼  (only path out of the netns)
+Guarded Egress Broker:
+   re-validate scope ─► resolve DNS ─► check ALL resolved IPs ─► reject private/meta/link-local
+   ─► rate/concurrency/window/expiry gates ─► connect to PINNED IP (SNI=orig host)
+   ─► send request ─► redirect? re-validate each hop, stop if out-of-scope
+   ─► emit audit event (request, decision, outcome)  [circuit breaker may trip → halt]
+        │
+        ▼
+Target responds (in-scope only) ──► response returns to worker/sandbox
+        │
+        ▼
+Evidence capture (size-capped, body-retention-limited)
+        │
+        ▼
+REDACTION stage (mandatory): strip cookies/authz/tokens/PII/sensitive bodies → redacted evidence
+        │
+        ▼
+Redacted evidence → Object Storage (WORM, encrypted); pointer + hash → DB
+        │
+        ▼
+Check logic computes result → Finding (id, CWE/OWASP refs, confidence, non-destructive repro,
+        evidence pointer, provenance)  → written to DB (tenant-scoped via RLS)
+        │
+        ▼
+API surfaces finding to Reviewer → triage/lifecycle; audit event closes the loop
+```
+
+Key invariant: **at every stage the request is data, validated independently, and the only way onto the wire re-checks scope.** A bug in one layer cannot alone cause an out-of-scope or destructive request.
+
+---
+
+## 5. Multi-Tenancy Model & Isolation
+
+**Model: shared control-plane infrastructure, per-tenant logical isolation, per-engagement execution isolation.** Tenancy hierarchy: **Tenant (org) → Engagement → Authorization/Scope → Jobs/Findings/Evidence.**
+
+- **Database isolation — PostgreSQL Row-Level Security.** Every tenant-owned table carries `tenant_id`; RLS policies bind reads/writes to the authenticated tenant context set per request (`SET LOCAL app.tenant_id`). This is defense that survives ORM/application bugs. Cross-tenant access requires no application check to be *added*; it requires an RLS policy to be *removed*, which is CI-guarded.
+- **Object storage isolation.** Evidence objects keyed by `tenant_id/engagement_id/...`; bucket policies + per-tenant prefixes; encryption keys optionally per-tenant via Vault transit for stronger separation.
+- **Secrets isolation.** Vault namespaces/policies per tenant; target auth sessions are never shared across engagements.
+- **Queue & worker isolation.** Jobs carry tenant + engagement identity; per-engagement rate/concurrency budgets prevent one tenant's engagement from starving another (queue-abuse threat). Workers are stateless and scrubbed between jobs; a worker never holds two tenants' target sessions simultaneously.
+- **Egress isolation.** Broker token buckets and scope decisions are per-engagement; audit events are tenant-tagged. Circuit breakers and emergency-stop are scoped to an engagement so one halt does not disrupt others.
+- **Audit isolation.** Hash-chained audit stream is partitioned/tagged per tenant; auditors get read-only, tenant-scoped access.
+
+For customers requiring hard isolation, the architecture supports a **dedicated-worker-pool / dedicated-broker per tenant** deployment variant without code change (Phase 11), since the data plane is already namespace-isolated.
+
+---
+
+## 6. Deployment Topology (high level; details → Phase 11)
+
+- **Dev:** Docker Compose. Postgres, MinIO, Vault-dev, API, worker, broker, SPA. Egress default-deny enforced via nftables in the compose network so developers exercise the real safety path. **Intentionally vulnerable target apps run only on a separate, explicitly-allowlisted local network** — never reachable except by adding them to scope.
+- **Single-server:** One host, containers, nftables egress policy forcing worker/sandbox traffic through the broker; MinIO for evidence; local Vault; TLS terminated at a reverse proxy. Not publicly accessible by default. Suitable for a solo tester or small team.
+- **Production:** Kubernetes with **network segmentation into control-plane and data-plane namespaces**; NetworkPolicy (Cilium) default-deny egress on data-plane pods with the broker as the only permitted destination; gVisor/Firecracker runtime class for scanner sandboxes; managed Postgres with encryption + PITR; S3 with Object Lock; Vault HA; centralized logging/monitoring/alerting; the platform itself sits behind mTLS and is not internet-exposed. Horizontal scaling of stateless workers behind per-engagement budgets.
+
+Common to all tiers: **the egress choke point and default-deny data-plane network are non-negotiable and present even in dev**, so the safety model is exercised continuously rather than only in prod.
+
+---
+
+## 7. Guaranteeing No Arbitrary Shell & No User CLI Args Reach a Shell
+
+This is a structural guarantee, achieved by never having a shell in the execution path and never letting user input become a command line.
+
+1. **The API/UI accepts structured job specs only.** A job references a **registered check ID or a pinned tool-template ID** plus **typed, schema-validated parameters**. There is no field anywhere in the UI or API that accepts a command, a command fragment, a flag string, or a script. Requests that don't validate against the check/tool schema are rejected before enqueue.
+2. **Adapters spawn processes with `execve`-style argv arrays, never a shell.** Go `exec.Command(binary, args...)` / Rust `Command` with an argv vector — **no `sh -c`, no shell interpolation, no string concatenation into a command line.** There is no shell interpreter in the sandbox image at all.
+3. **Binary paths are fixed and pinned.** Each adapter hard-codes the absolute path of its tool binary and the pinned version/digest. Users cannot select the binary.
+4. **Flags come from an allowlist mapped from typed parameters, not from user strings.** The adapter owns a fixed table: typed parameter → specific, safe flag. Unsafe/destructive tool options are never in the table and thus never reachable. Values that must be passed (e.g., a target URL) go through **strict typed validation and are delivered as discrete argv elements or via files/stdin**, never spliced into a shell string. Template selection is from the **curated, pinned allowlist registry**, not free text.
+5. **Tool output is parsed as structured data, treated as untrusted.** Adapters read JSON/structured output, never scrape console text, and never `eval` results. Raw output is retained separately from verified findings.
+6. **The sandbox has no route to a shell or the host.** No shell binary, read-only rootfs, dropped caps, seccomp allowlist, non-root, no host mounts, network egress only to the broker. Even if a tool tried to spawn a shell, there is nothing to spawn and nowhere to go.
+7. **CI enforcement.** Static checks fail the build on any `sh -c`, string-built command line, or reachable-from-request path to `exec`. Adapter parameter tables are reviewed as security-critical code.
+
+Result: there is **no path from UI/API input to a shell**, and **no user-controlled string ever becomes part of a command line.**
+
+---
+
+## 8. ADR-Candidates (key decisions & rationale)
+
+- **ADR-1: Single Guarded Egress Broker as the sole data-plane egress path.** Rationale: converts "don't go out of scope" from a check that can be forgotten into a network-topology invariant. Trade-off: broker is a critical dependency and a throughput bottleneck — acceptable given deliberately low request volumes; scale horizontally with per-engagement affinity.
+- **ADR-2: Network-layer default-deny egress on workers/sandboxes, broker as only next hop.** Rationale: even a fully compromised scanner cannot reach targets except through scope enforcement. Trade-off: more network plumbing per environment; justified by the threat model (scope escape, SSRF, malicious scanner output).
+- **ADR-3: DNS resolve-and-pin inside the broker.** Rationale: eliminates DNS rebinding by dialing the exact validated IP. Trade-off: broker must own DNS and TLS SNI handling rather than delegating to a stock HTTP client — a reason to write it in Rust/Go with low-level connection control.
+- **ADR-4: Scope authority centralized in one service issuing signed, short-TTL decisions, re-verified at the broker.** Rationale: one place to reason about "permitted," defense-in-depth via re-check. Trade-off: extra hop; mitigated by caching decisions for a job's lifetime only.
+- **ADR-5: PostgreSQL-backed transactional job queue.** Rationale: a job and its scope precondition/budget commit atomically — an out-of-scope job cannot exist in the queue. Trade-off: lower throughput than a dedicated broker; a non-issue at this platform's intentionally conservative volumes.
+- **ADR-6: Row-Level Security for tenant isolation.** Rationale: isolation enforced at the datastore, surviving application bugs; cross-tenant leakage requires actively removing a policy (CI-guarded). Trade-off: RLS discipline in every query path; enforced by tests (Phase 10 tenant-isolation tests).
+- **ADR-7: gVisor/Firecracker sandbox for third-party tools; no shell in images.** Rationale: untrusted tool binaries and untrusted tool output are named threats; kernel/VM isolation contains them. Trade-off: performance overhead and runtime-class complexity — worth it for the highest-risk components.
+- **ADR-8: Structured job specs + pinned template registry; adapters use argv arrays with allowlisted flags.** Rationale: eliminates command injection and arbitrary-CLI classes by construction. Trade-off: adding a new tool option requires a code change and review — intentionally, since that is a security boundary.
+- **ADR-9: Hash-chained append-only audit log with WORM anchoring; mandatory redaction before evidence egress.** Rationale: tamper-evident audit trail and no secret/PII leakage into logs, findings, or reports (secret-leakage and report-data-exposure threats). Trade-off: redaction must be conservative and may occasionally over-redact — the correct failure direction.
+- **ADR-10: Rust for the safety kernel, TypeScript for the control plane, Go for workers.** Rationale: strongest memory-safety guarantees where a bug is most dangerous; developer velocity and shared types where iteration matters. Trade-off: three runtimes to operate; collapse to Go-everywhere-plus-SPA if the team needs fewer languages, accepting marginally weaker broker guarantees.
+- **ADR-11: Pinned tool/template versions verified by digest; egress-restricted, resource-capped sandboxes.** Rationale: supply-chain-compromise threat — a swapped tool image or malicious template cannot run un-pinned or reach the network freely. Trade-off: version bumps become deliberate, reviewed events.
+
+---
+
+### Phase 0 acceptance-criteria hooks this architecture must satisfy downstream
+- **Provable single egress path:** an integration test shows a worker with a target IP in hand cannot open a connection except through the broker (network-policy test, Phase 10).
+- **Scope cannot be bypassed:** property-based tests prove no `(job, scope decision)` pair reaches the wire without passing broker re-validation, and out-of-scope jobs cannot be enqueued (Phase 2/10).
+- **No shell reachable:** CI static analysis proves no request-reachable path to a shell and no string-built command lines (Phase 1/6).
+- **Tenant isolation:** RLS tests prove no cross-tenant read/write (Phase 10).
+- **Redaction:** report/audit outputs contain no secrets/PII across a fuzzed corpus (Phase 8/10).
+
+This architecture is deliberately opinionated around one principle: **make the unsafe action structurally impossible.** Scope, egress, isolation, and approval are enforced at network and datastore layers — not by warnings — so that application bugs degrade toward *refusing to act* rather than acting unsafely.
