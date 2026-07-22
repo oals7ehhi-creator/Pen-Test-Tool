@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
     "migrate": "node dist/migrate.js up",
     "migrate:down": "node dist/migrate.js down",
     "migrate:ci": "node dist/migrate.js ci"

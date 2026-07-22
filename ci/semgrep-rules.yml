@@ -1,0 +1,35 @@
+# Repository-owned, reviewed Semgrep ruleset (Phase 1). Pinned and version-controlled here rather than pulled from
+# a mutable remote pack (e.g. p/typescript), so the SAST gate is reproducible: the exact rules that run are the
+# ones in this file at this commit. Rules encode the codebase's safety baselines for a defensive security tool.
+rules:
+  - id: no-subprocess-execution
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      Subprocess/shell execution (child_process) is forbidden — it is the primary command-injection sink and the
+      platform must never shell out (defense in depth beyond the ESLint no-restricted-imports rule).
+    pattern-regex: "(require\\s*\\(|from\\s+)['\"](node:)?child_process['\"]"
+
+  - id: no-eval
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: 'eval() executes arbitrary code and is forbidden.'
+    pattern: eval(...)
+
+  - id: no-function-constructor
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: 'The Function constructor compiles and executes arbitrary code and is forbidden.'
+    pattern: new Function(...)
+
+  - id: no-tls-verification-disabled
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: 'Disabling TLS certificate verification (rejectUnauthorized: false) is forbidden.'
+    pattern-regex: "rejectUnauthorized\\s*:\\s*false"
+
+  - id: no-global-tls-bypass
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: 'Disabling Node TLS verification via NODE_TLS_REJECT_UNAUTHORIZED is forbidden.'
+    pattern-regex: 'NODE_TLS_REJECT_UNAUTHORIZED'

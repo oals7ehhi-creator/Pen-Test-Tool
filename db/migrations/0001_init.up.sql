@@ -1,6 +1,7 @@
 -- 0001 init (up). Phase 1 baseline only. The full authorization/scope schema (Phase 0 doc 04) lands in Phase 2.
--- pgcrypto provides digest()/gen_random_uuid() used by later content-addressed/audit tables.
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- No extensions are created here: gen_random_uuid() is in core PostgreSQL (>= 13). Any extension a later phase
+-- needs (e.g. pgcrypto for digest()) is provisioned as a documented operator prerequisite by the migration that
+-- first requires it, so every down migration stays an exact inverse of its up.
 
 -- Minimal tenant baseline so isolation wiring has something to build on. Real columns/constraints arrive in Phase 2.
 CREATE TABLE tenant (

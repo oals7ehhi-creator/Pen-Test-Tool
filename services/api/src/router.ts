@@ -40,6 +40,18 @@ export function listRoutes(): RouteDef[] {
   return ROUTES_INTERNAL.map((r) => ({ ...r }));
 }
 
+/** Safe placeholder logged in place of a route when the request matched no known route. */
+export const UNMATCHED_ROUTE = '(unmatched)';
+
+/**
+ * The ALLOWLIST of route strings that may appear in a log's `route` field: every known route template plus the
+ * `UNMATCHED_ROUTE` sentinel. A raw URL, path, or query string is not in this set, so it can never be logged.
+ */
+export const ROUTE_TEMPLATES: readonly string[] = Object.freeze([
+  ...ROUTES_INTERNAL.map((r) => r.path),
+  UNMATCHED_ROUTE,
+]);
+
 export type AuthzOutcome =
   | { readonly status: 200; readonly route: string; readonly permission: Permission | null }
   | { readonly status: 401; readonly route: string } // no authenticated identity for a protected route

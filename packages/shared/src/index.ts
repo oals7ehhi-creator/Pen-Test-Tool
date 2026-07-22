@@ -12,5 +12,15 @@ export {
   LOG_LEVELS,
   NODE_ENVS,
 } from './config.js';
-export { sanitizeContext, REDACTED, RESERVED_FIELDS, type Scalar } from './sanitize.js';
+export {
+  field,
+  buildFields,
+  BASE_EVENT_FIELDS,
+  RESERVED_FIELDS,
+  UNKNOWN_EVENT,
+  type Scalar,
+  type FieldValidator,
+  type EventSchema,
+  type EventRegistry,
+} from './logsafe.js';
 export { createLogger, type Logger, type LogRecord, type LoggerOptions } from './logger.js';

@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { loadConfig, createLogger, type AppConfig, type Logger } from '@pentest/shared';
-import { authorizeRequest } from './router.js';
+import { authorizeRequest, UNMATCHED_ROUTE } from './router.js';
+import { API_EVENTS } from './logevents.js';
 
 /**
  * Phase 1 API skeleton on the Node standard library (no framework dependency yet). It demonstrates the
@@ -27,18 +28,20 @@ function injectedDevRole(req: IncomingMessage, devAuthEnabled: boolean): string 
 }
 
 export function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): void {
-  const correlationId = randomUUID();
-  const rlog = deps.log.child({ correlationId });
+  // Authoritative per-request correlation id: it becomes the record's reserved `correlationId`, and because it is
+  // set via childWithCorrelationId (not context) it cannot be spoofed or overridden by any caller-supplied field.
+  const rlog = deps.log.childWithCorrelationId(randomUUID());
   const method = req.method ?? 'GET';
   const path = (req.url ?? '/').split('?')[0] ?? '/';
   const role = injectedDevRole(req, deps.devAuthEnabled);
 
   const outcome = authorizeRequest(method, path, role);
-  // MINIMIZED logging (SI-045): only method, the MATCHED route template (a known-safe string, never the raw URL),
-  // and the status. Never headers, query, body, or cookies.
+  // SI-045 allowlist: the `request` event permits ONLY method, the MATCHED route template (from the frozen
+  // allowlist — never the raw URL/path/query), and a numeric status. Headers, query, body and cookies have no
+  // field to land in and are structurally impossible to log.
   rlog.info('request', {
     method,
-    route: outcome.status === 404 ? '(unmatched)' : outcome.route,
+    route: outcome.status === 404 ? UNMATCHED_ROUTE : outcome.route,
     status: outcome.status,
   });
 
@@ -72,11 +75,11 @@ function statusError(status: number): string {
 }
 
 export function start(config: AppConfig): ReturnType<typeof createServer> {
-  const log = createLogger({ level: config.logLevel });
+  const log = createLogger({ level: config.logLevel, events: API_EVENTS });
   const deps: HandlerDeps = { log, devAuthEnabled: config.devAuthEnabled };
   const server = createServer((req, res) => handle(req, res, deps));
   server.listen(config.apiPort, config.apiHost, () => {
-    log.info('api listening', {
+    log.info('api_listening', {
       host: config.apiHost,
       port: config.apiPort,
       env: config.nodeEnv,

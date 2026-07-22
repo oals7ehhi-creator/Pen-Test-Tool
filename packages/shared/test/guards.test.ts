@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { isRole, isPermission, createLogger, type LogLevel } from '../src/index.js';
+import {
+  isRole,
+  isPermission,
+  createLogger,
+  field,
+  type LogLevel,
+  type EventRegistry,
+} from '../src/index.js';
 
 describe('type guards', () => {
   it('isRole', () => {
@@ -16,21 +23,25 @@ describe('type guards', () => {
 });
 
 describe('logger emits at every level and supports child bindings', () => {
-  it('renders trace..error and merges child context', () => {
+  const EVENTS: EventRegistry = { ping: { seq: field.int(0, 1_000_000) } };
+
+  it('renders trace..error and merges child bindings into the allowlisted fields', () => {
     const lines: string[] = [];
     const base = createLogger({
       level: 'trace',
+      events: EVENTS,
       sink: (l) => lines.push(l),
       now: () => new Date(0),
     });
     const child = base.child({ component: 'api' });
     const levels: LogLevel[] = ['trace', 'debug', 'info', 'warn', 'error'];
-    for (const lvl of levels) child[lvl](`msg-${lvl}`, { seq: 1 });
+    for (const lvl of levels) child[lvl]('ping', { seq: 1 });
     expect(lines).toHaveLength(5);
     for (const line of lines) {
-      const rec = JSON.parse(line) as { ctx: Record<string, unknown> };
-      expect(rec.ctx.component).toBe('api');
-      expect(rec.ctx.seq).toBe(1);
+      const rec = JSON.parse(line) as { event: string; fields: Record<string, unknown> };
+      expect(rec.event).toBe('ping');
+      expect(rec.fields.component).toBe('api');
+      expect(rec.fields.seq).toBe(1);
     }
   });
 });

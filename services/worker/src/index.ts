@@ -1,5 +1,6 @@
 import { writeFileSync } from 'node:fs';
 import { loadConfig, createLogger } from '@pentest/shared';
+import { WORKER_EVENTS } from './logevents.js';
 
 /**
  * Phase 1 worker skeleton. Boots on the same fail-closed config and minimized structured logging as the API.
@@ -18,7 +19,9 @@ export interface WorkerHandle {
 
 export function main(): WorkerHandle {
   const config = loadConfig();
-  const log = createLogger({ level: config.logLevel }).child({ component: 'worker' });
+  const log = createLogger({ level: config.logLevel, events: WORKER_EVENTS }).child({
+    component: 'worker',
+  });
   const livenessFile = process.env.WORKER_READINESS_FILE;
 
   const beat = (): void => {
@@ -27,10 +30,10 @@ export function main(): WorkerHandle {
   };
 
   beat(); // config validated + first heartbeat written = ready
-  log.info('worker started', { env: config.nodeEnv });
+  log.info('worker_started', { env: config.nodeEnv });
   const timer = setInterval(() => {
     beat();
-    log.debug('heartbeat', { env: config.nodeEnv });
+    log.debug('worker_heartbeat', { env: config.nodeEnv });
   }, HEARTBEAT_MS);
 
   return { stop: () => clearInterval(timer) };

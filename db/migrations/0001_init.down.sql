@@ -1,3 +1,3 @@
--- 0001 init (down). Reverses 0001_init.up.sql exactly, restoring the prior (empty) schema.
+-- 0001 init (down). Exact inverse of 0001_init.up.sql: drops everything the up created, restoring the prior
+-- (empty) schema. No extension is dropped because the up creates none.
 DROP TABLE IF EXISTS tenant;
--- pgcrypto is left installed intentionally (extensions are shared infrastructure, not migration-owned state).

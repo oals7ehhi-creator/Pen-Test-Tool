@@ -1,0 +1,19 @@
+title = "pen-test-tool gitleaks configuration"
+
+# Extend the upstream default ruleset (do NOT replace it), then allowlist a SMALL, explicit set of intentional
+# NON-secret fixtures this repository commits on purpose. The scope is deliberately narrow — specific fixture
+# strings and the documented dev-only .env.example placeholder — so a real secret committed anywhere else,
+# INCLUDING in a test file, is still detected. This removes a known false positive without weakening the gate.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Intentional non-secret fixtures: the SI-045 test sentinel that proves the logger never emits it, and the dev-only session-key placeholder."
+regexTarget = "line"
+regexes = [
+  '''S3CR3T-must-never-be-logged''',
+  '''dev-insecure-session-key-change-me-\d+''',
+]
+paths = [
+  '''(^|/)\.env\.example$''',
+]
