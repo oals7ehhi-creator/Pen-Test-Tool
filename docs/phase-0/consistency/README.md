@@ -19,7 +19,13 @@ It asserts, among other things:
 - **Approval-policy agreement** — the `request_type → (threshold, approver roles)` table in
   `04` §10 matches the one in `09-rbac-matrix.md`.
 - **Round-3 model present** — `request_spec` + `spec_sha256`, just-in-time grant minting, broker
-  reconstruction, reserve/commit/release budget, and WebSocket caps are described where required.
+  reconstruction, conservative charge-before-send budget leases, and WebSocket caps are described where required.
+- **Assertion-specific semantic detectors (round 6)** — each stale statement fixed in a revision round
+  (e.g. "grant binds the exact request line", "reserve-at-mint / commit-on-send", metadata lumped with
+  allowlist-able third-party infra, tool sandboxes reaching "destinations the broker permits per grants")
+  has a detector that flags it as a *live* claim, plus a negative fixture proving the detector fires. The
+  budget/race semantics (charge-before-send state machine, owned/fenced leases, sweeper exclusions,
+  audit-chain tenant/engagement binding, non-circular dynamic approval bootstrap) are asserted structurally.
 - **Code-fence balance** per file.
 
 **CI usage.** This script is wired into CI from Phase 1 (see `06-acceptance-criteria.md` Phase 1)

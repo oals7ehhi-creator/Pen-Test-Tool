@@ -73,7 +73,7 @@ Legend: **✔** allowed · **—** denied · **A(n)** = valid approver, contribu
 ¹ **Authorization attestation** requires **2** approvers and **at least one must be an Engagement Manager**; the second may be Engagement Manager, Reviewer, or (as break-glass, SoD-bound) Administrator.
 ² **Administrator as an engagement approver** counts toward a threshold *only* when explicitly assigned an approver role on that engagement, and never as the sole approver of a dual-control action.
 
-## 4. Approval-authority summary (drives `approval_request.approver_roles` and thresholds)
+## 4. Approval-authority summary (content of the immutable `approval_policy` — thresholds, `approver_roles`, and `role_quorum`)
 
 | `request_type` | Threshold (floor) | Eligible approver roles |
 |---|:--:|---|

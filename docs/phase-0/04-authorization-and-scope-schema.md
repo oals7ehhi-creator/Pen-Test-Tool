@@ -238,7 +238,9 @@ TABLE authorization (
   CONSTRAINT auth_dates_valid CHECK (expires_at > effective_from),
   CONSTRAINT attest_true      CHECK (written_auth_attested = TRUE),
   CONSTRAINT active_needs_dual_approval CHECK (          -- cannot go active without a resolved attestation approval
-     status <> 'active' OR attestation_approval_id IS NOT NULL)
+     status <> 'active' OR attestation_approval_id IS NOT NULL),
+  CONSTRAINT draft_not_attested CHECK (                 -- a DRAFT authorization carries no approval and grants nothing
+     status <> 'draft' OR attestation_approval_id IS NULL)  -- the §7 gate additionally requires status='active'
 );
 ```
 
@@ -345,6 +347,11 @@ TABLE scope_entry (
      elevated = FALSE OR entry_class IN ('ip','cidr','domain')),  -- Tier B nets, or broad/wildcard domains
   CONSTRAINT elevated_domain_wildcard CHECK (
      NOT (entry_class='domain' AND elevated=TRUE) OR wildcard = TRUE),  -- an elevated domain must be a wildcard (§4.4)
+  CONSTRAINT exclusion_not_elevated CHECK (is_exclusion = FALSE OR elevated = FALSE),  -- exclusions never elevate (§4.5)
+  CONSTRAINT cidr_absolute_floor CHECK (        -- absolute floors, enforceable regardless of approval (§4.6)
+     entry_class <> 'cidr'
+     OR (ip_version = 4 AND prefix_len >= 16)
+     OR (ip_version = 6 AND prefix_len >= 32))
 
   -- STRICT PER-CLASS SHAPE: each class populates exactly its fields and nulls the rest.
   CONSTRAINT shape_domain CHECK (entry_class <> 'domain' OR (
@@ -402,7 +409,7 @@ TABLE scope_entry (
 
 - An `is_exclusion=TRUE` entry of any class removes matching candidates **regardless of any allow match**.
 - Precedence at evaluation (§7): **exclusions first**. Any exclusion match ⇒ DENY.
-- Exclusions cannot be `elevated` and never *grant*; they only subtract.
+- Exclusions cannot be `elevated` and never *grant*; they only subtract (enforced by `exclusion_not_elevated`, §4.2).
 
 ### 4.6 Scope-breadth limits & elevated approval (blocker 10)
 
@@ -410,7 +417,7 @@ Broad scope is the quiet path from an authorized assessment to an unauthorized o
 
 | Breadth dimension | Enforced limit | Consequence when exceeded |
 |---|---|---|
-| IPv4 CIDR prefix | `prefix_len` must be ≥ `engagement.min_ipv4_prefix` (default `/24`) | Broader than the engagement floor ⇒ entry must be `elevated` + dual-approved; below the **absolute floor** `/16` ⇒ **hard reject** regardless of approval. |
+| IPv4 CIDR prefix | `prefix_len` must be ≥ `engagement.min_ipv4_prefix` (default `/24`) | Broader than the engagement floor ⇒ entry must be `elevated` + dual-approved; below the **absolute floor** `/16` ⇒ **hard reject** regardless of approval — enforced by the `cidr_absolute_floor` CHECK (§4.2). |
 | IPv6 CIDR prefix | `prefix_len` ≥ `engagement.min_ipv6_prefix` (default `/48`) | Same pattern; absolute floor `/32` ⇒ hard reject. |
 | Wildcard domain | Any `*.host` entry | Must be `elevated` + dual-approved; PSL/apex wildcards hard-rejected. |
 | Distinct hosts | `scope_version.host_count` ≤ `engagement.max_scope_hosts` (default 1024) | Above ceiling ⇒ elevated dual approval required to raise the ceiling. |
@@ -527,13 +534,17 @@ TABLE request_spec (               -- the IMMUTABLE, CONTENT-ADDRESSED queued ob
   scheme             TEXT NOT NULL CHECK (scheme IN ('https','http','wss','ws')),
   canonical_path     TEXT NOT NULL,
   query_keys_canonical TEXT,                  -- canonical, sorted query PARAMETER NAMES only (structure; never values)
-  query_value_digest   CHAR(64),              -- PROTECTED representation of query values: sha256 over the canonical
-                                              --   (name -> value-placeholder) map; raw values NEVER stored, injected at broker
+  query_value_ref      CHAR(64),              -- FK to an IMMUTABLE, content-addressed query-value set (catalog_template
+                                              --   kind='payload'); the broker injects EXACTLY those values
+  query_value_kind     TEXT GENERATED ALWAYS AS ('payload') STORED,
+  query_value_digest   CHAR(64),              -- KEYED digest (HMAC) over the canonical ACTUAL values the broker injects;
+                                              --   the broker recomputes it from the injected values and MUST match before send
   session_ref        UUID,                    -- FK to an immutable operator_session lease; the SECRET is injected by
                                               --   the broker and never stored; session_ref itself is EXCLUDED from spec_sha256
-  session_digest     CHAR(64),                -- NON-SECRET binding: sha256(account_id, session_version) of the
-                                              --   operator_session; BOUND INTO spec_sha256 so a spec is tied to one
-                                              --   account + session version (a rotated session invalidates the binding)
+  session_digest     CHAR(64),                -- NON-SECRET binding = the referenced operator_session's IMMUTABLE,
+                                              --   GENERATED session_digest (sha256(account_id, session_version));
+                                              --   BOUND INTO spec_sha256 and FK-verified to equal the session's digest,
+                                              --   so a spec is tied to one account + session version (rotation invalidates)
   mode               TEXT NOT NULL CHECK (mode IN ('passive','safe_active','approval_gated')),  -- advisory display only
   approval_ref       UUID,                    -- present iff approval_required (below)
   approval_required  BOOLEAN NOT NULL,        -- DERIVED by trigger from referenced templates' safety_class and
@@ -549,7 +560,9 @@ TABLE request_spec (               -- the IMMUTABLE, CONTENT-ADDRESSED queued ob
   FOREIGN KEY (engagement_id, tenant_id)    REFERENCES engagement(id, tenant_id),
   FOREIGN KEY (authorization_id, tenant_id) REFERENCES authorization(id, tenant_id),
   FOREIGN KEY (approval_ref, tenant_id)     REFERENCES approval_request(id, tenant_id),
-  FOREIGN KEY (session_ref, tenant_id)      REFERENCES operator_session(id, tenant_id),
+  FOREIGN KEY (session_ref, tenant_id, engagement_id) REFERENCES operator_session(id, tenant_id, engagement_id),
+  FOREIGN KEY (session_ref, session_digest) REFERENCES operator_session(id, session_digest),  -- digest MUST match the session
+  FOREIGN KEY (query_value_ref, query_value_kind) REFERENCES catalog_template(digest, kind),
   FOREIGN KEY (check_digest, check_kind)                 REFERENCES catalog_template(digest, kind),
   FOREIGN KEY (tool_template_digest, tool_template_kind) REFERENCES catalog_template(digest, kind),
   FOREIGN KEY (header_set_digest, header_set_kind)       REFERENCES catalog_template(digest, kind),
@@ -568,10 +581,12 @@ TABLE request_spec (               -- the IMMUTABLE, CONTENT-ADDRESSED queued ob
 --   (engagement_id, scope_hash, authorization_id, request_class, kind,
 --    check_digest, tool_template_digest, header_set_digest, payload_digest, ws_frame_set_digest,
 --    method, canonical_url, canonical_host, port, scheme, canonical_path,
---    query_keys_canonical, query_value_digest, session_digest, approval_required, approval_ref).
---   session_ref, run_id, job_id, and the ADVISORY `mode` are EXCLUDED — the secret session is resolved at the
---   broker, run/job are INSTANCE identity (so the same digest can recur across jobs/runs), and the approval gate
---   is driven by the DERIVED approval_required, never by the self-declared mode.
+--    query_keys_canonical, query_value_ref, query_value_digest, session_digest, approval_required).
+--   approval_ref, session_ref, run_id, job_id, and the ADVISORY `mode` are EXCLUDED. approval_ref is INSTANCE
+--   linkage — excluding it breaks the spec↔approval circularity for dynamic requests: the manifest binds the STABLE
+--   content digest, and approval_ref merely links this instance to the approval that authorized it. The secret
+--   session is resolved at the broker; run/job are INSTANCE identity (so the same digest can recur across jobs/runs);
+--   and the approval gate is driven by the DERIVED approval_required, never by the self-declared mode.
 
 TABLE catalog_template (           -- GLOBAL, content-addressed, immutable template store
   digest       CHAR(64) PRIMARY KEY,          -- sha256 of canonical(kind,name,version,content,safety_class)
@@ -586,8 +601,10 @@ TABLE catalog_template (           -- GLOBAL, content-addressed, immutable templ
 );
 -- Content-addressed & immutable: digest MUST equal sha256(canonical(...)) (trigger-verified); UPDATE/DELETE
 -- revoked. A new version is a new row with a new digest. Curated/pinned like tool images (SI-031, SI-065).
--- Safety-class gate: a BEFORE trigger on request_spec sets approval_required = TRUE when ANY referenced template
--- has safety_class='requires_approval' (or request_class is intrusive); the self-declared `mode` is never trusted.
+-- Derived-approval gate: a BEFORE trigger on request_spec sets approval_required from EVERY relevant semantic input —
+-- TRUE when the HTTP method / action class is state-changing (POST/PUT/PATCH/DELETE, or a state-changing check action
+-- class) OR the MAX safety_class over ALL referenced templates (check, tool_template, header_set, payload, ws_frame_set,
+-- query_value) is 'requires_approval'. The self-declared `mode` is NEVER trusted for the approval gate.
 
 TABLE operator_session (           -- operator-supplied auth session; the VALUE lives in the secret manager
   id               UUID PRIMARY KEY,
@@ -597,12 +614,16 @@ TABLE operator_session (           -- operator-supplied auth session; the VALUE 
   session_version  INT  NOT NULL DEFAULT 1,   -- bumped on rotation; part of session_digest
   secret_ref       TEXT NOT NULL,             -- secret-manager lease id (value NEVER stored in the DB)
   designated_hosts TEXT[] NOT NULL,           -- the in-scope hosts this session may be used against
+  session_digest   CHAR(64) GENERATED ALWAYS AS (   -- IMMUTABLE, generated; request_spec.session_digest FK-binds THIS
+                     encode(digest(account_id || ':' || session_version::text, 'sha256'), 'hex')) STORED,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (id, tenant_id),
+  UNIQUE (id, tenant_id, engagement_id),      -- target of request_spec's same-tenant-AND-engagement session FK
+  UNIQUE (id, session_digest),                -- target of request_spec's session-digest binding FK
   FOREIGN KEY (engagement_id, tenant_id) REFERENCES engagement(id, tenant_id)
 );
--- session_digest bound into request_spec = sha256(canonical(account_id, session_version)); no secret is hashed,
--- so a spec is tied to one account + session version and a rotation (version bump) invalidates the binding.
+-- session_digest is GENERATED (no secret hashed) and immutable; because request_spec FK-binds (session_ref,
+-- session_digest), a spec is tied to one account + session version and a rotation (version bump) invalidates it.
 ```
 
 - **Content-addressed & immutable.** A `request_spec` is created once — by the check engine for native checks, or by the broker for tool/browser requests (§7.2) — and never mutated. Every security/request-context reference (check, tool template, header-set, payload, WS frame-set) is an **immutable content digest** into `catalog_template`, and all digests are folded into `spec_sha256`, so nothing can be silently repointed. **The queue stores only `(spec_id, tenant_id)`**, not a grant.
@@ -623,7 +644,7 @@ INPUT: spec_id (the immutable request_spec)
     d. engagement.active_scope_hash == spec.scope_hash == authorization.scope_hash  else DENY(scope_binding_broken)
     e. now inside a testing window AND not blackout                          else DENY(outside_testing_window)
     f. spec.mode ∈ authorization.allowed_modes ∩ engagement.allowed_modes    else DENY(mode_not_authorized)
-    g. budget available (total − used − live reservations, from the ledger §8.1) > 0  else DENY(budget_exhausted)
+    g. budget available (total − used − live 'claimed' leases, from the ledger §8.1) > 0  else DENY(budget_exhausted)
     h. approval_gated/intrusive class: spec.approval_ref resolves to an APPROVED, unexpired approval whose
        immutable MANIFEST CONTAINS spec.spec_sha256 (policy threshold met, §10)  else DENY(approval_missing)
  1-5. PARSE/CANONICALIZE, SCHEME, IP-LITERAL NETWORK GUARD (§6), EXCLUSIONS, ALLOWLIST — over the spec's
@@ -639,41 +660,42 @@ STAGE 2 — GUARDED EGRESS BROKER (data-plane enforcer; the ONLY socket creator)
  6. INGRESS AUTH: authenticate the calling job's per-job identity/capability; NOT a generic CONNECT proxy.
  7. VERIFY GRANT: signature, iss, aud==self, nbf/exp, jti unused (consume single-use). AND
     grant.spec_sha256 == sha256(presented spec) — the spec is exactly the one authorized.  Mismatch ⇒ DENY.
- 8. RECONSTRUCT + NORMALIZE the outbound request DETERMINISTICALLY from the immutable spec: method,
-    URL (canonical_url + query_canonical), headers (from header_set_id template only), body (from the inert
-    payload_id catalog only), operator session (injected from the secret lease named by session_ref). The
-    broker NEVER sends a worker-serialized request; it re-canonicalizes and asserts the reconstructed
-    request equals the spec's fields                                          else DENY(reconstruction_mismatch)
+ 8. RECONSTRUCT + NORMALIZE the outbound request DETERMINISTICALLY from the immutable spec: method, URL
+    (canonical_url + query_keys_canonical + the immutable query_value_ref values, whose keyed digest MUST equal
+    query_value_digest), headers (from the header_set_digest template only), body (from the inert payload_digest
+    catalog only), operator session (secret injected from the lease named by session_ref, whose account/version
+    digest MUST equal session_digest). The broker NEVER sends a worker-serialized request; it re-canonicalizes and
+    asserts the reconstructed request equals the spec's fields                 else DENY(reconstruction_mismatch)
  9. RE-CHECK LIVE STATE (fail-closed, SI-046): auth not expired/revoked, window open, e-stop clear,
-    rate/concurrency slot. Any unknown ⇒ DENY.
-10. ATOMIC RESERVE + INTENT — ONE TRANSACTION, BEFORE ANY EGRESS (no DNS/TCP/TLS yet): SELECT the engagement
-    budget row FOR UPDATE; verify availability (total − used − live reservations) > 0; INSERT a fenced
-    budget_reservation LEASE (owner = this broker's id, fence_token = next monotonic token for the engagement,
-    grant_jti, crash-expiry deadline); AND durably commit request.intent (spec_sha256, grant jti, reservation id,
-    canonical target). All in the same transaction; nothing leaves the box until it commits. Any failure ⇒ DENY.
+    rate/concurrency slot. Any unknown ⇒ DENY (any pre-charge claim is released).
+10. ATOMIC CHARGE + INTENT — ONE TRANSACTION, BEFORE ANY EGRESS (no DNS/TCP/TLS yet): SELECT the engagement
+    budget row FOR UPDATE; verify availability > 0; write the fenced budget_reservation and TRANSITION it to
+    'charged' (request_budget_used += 1, IRREVERSIBLE) with fence_token = (fence_seq += 1) and owner = this broker;
+    AND durably commit request.intent (spec_sha256, grant jti, reservation id, canonical target). All one
+    transaction — the budget is charged BEFORE any byte is sent (§8.1). Any failure ⇒ DENY (any claim is released).
 11. DNS RESOLUTION + RESOLVED-IP RE-CHECK (rebinding) — the FIRST egress: resolve canonical_host; EVERY
     resolved IP must pass the network guard (§6) AND the frozen scope_version; PIN a validated IP.
 12. CONNECT to the pinned IP (TCP + TLS; cert host == canonical_host); SEND the reconstructed request.
 13. REDIRECT: never auto-follow. On 3xx, canonicalize Location → form a NEW request_spec → request a FRESH
     JIT grant. Out-of-scope ⇒ STOP, record. Bounded hop depth; each hop independently specced + granted.
-14. COMPLETE: request.completed/failed records the resolved+pinned IP, status, byte counts (redacted).
-    On send idempotently COMMIT the reservation (state reserved→committed; used += 1) — the commit MUST present
-    the lease's current fence_token, so a superseded/expired lease holder can never commit. On any pre-send
-    DENY/failure/crash idempotently RELEASE or EXPIRE it (§8.1). Committed (sent) count never exceeds total.
+14. COMPLETE: request.completed/failed is INFORMATIONAL — it records the resolved+pinned IP, status, and byte
+    counts (redacted) but does NOT change the charge, which was applied at step 10 before any send. A pre-charge
+    denial released the claim; a post-charge crash leaves a 'charged' lease (conservative over-charge, §8.1). So
+    "sent ⇒ charged" always holds and the sent count never exceeds request_budget_total.
 ```
 
 ### 7.2 Tool / browser (broker-mediated) and WebSocket semantics
 
 - **Tool-driven / browser requests are not pre-enqueued per subrequest.** A headless browser or a self-driving tool is an autonomous request engine; the broker is its mediating proxy (`10` §4). For **each** intercepted request line the broker **forms a `request_spec` on the fly**, computes `spec_sha256`, and requests a **JIT grant** from the Scope Authority (Stage 1 over the frozen scope). Only if a grant is minted does it proceed to Stage 2. A browser that fetches an out-of-scope subresource, or follows a redirect off-scope, simply gets **no grant → the request is blocked**. The Scope Authority remains the sole minter and the broker the sole socket creator even for autonomous engines.
 - **WebSocket (`ws`/`wss`).** A `kind='websocket'` spec authorizes the **HTTP Upgrade handshake** (a `GET` to the canonical WS path); the handshake is scoped, resolved, IP-pinned, and connected **exactly like an HTTP request**. Scope is fixed at the pinned handshake — an established socket can never change target. The established connection is bounded by per-connection caps (§8: `ws_max_duration_s`, `ws_max_messages`, `ws_max_message_bytes`) and counts against `max_ws_connections` (`ws_in_flight`); **e-stop, window close, or authorization expiry terminate active connections**. Redirects do not apply to an established WS; a handshake redirect is re-authorized like any HTTP redirect (new spec + JIT grant). **Outbound frames are drawn ONLY from the approved, content-addressed inert frame set named by `ws_frame_set_digest`** (a `ws_frame_set` catalog_template); the broker cannot emit a frame outside that set, frame count/size are bounded (§8), and any non-catalog frame requires an approval manifest — never destructive fuzzing (SI-063).
-- **Pause / approve / resume (dynamic requests).** When a broker-mediated (tool/browser) request needs approval — a referenced template's `safety_class = 'requires_approval'`, or a new scope element is required — the broker **PAUSES** the dynamic session (holds it, emits no further requests, consumes no budget), raises an `approval_request` whose **frozen manifest** contains that spec's `spec_sha256`, and **RESUMES** only once the approval reaches its policy threshold and role quorum; otherwise it **ABORTS** and records `dynamic.rejected`. A paused session remains subject to e-stop / window / expiry.
+- **Pause / approve / resume (dynamic requests).** When a broker-mediated (tool/browser) request needs approval — a referenced template's `safety_class = 'requires_approval'`, or a new scope element is required — the broker **PAUSES** the dynamic session (holds it, emits no further requests, consumes no budget), obtains a **scope-only pre-verdict** (distinct from Stage-1, §10), raises an `approval_request` whose **frozen manifest** contains that spec's `spec_sha256` (non-circular because `approval_ref` is excluded from `spec_sha256`), and **RESUMES** only once the approval reaches its policy threshold and role quorum; otherwise it **ABORTS** and records `dynamic.rejected`. A paused session remains subject to e-stop / window / expiry.
 
 ### 7.3 Key protections baked in
 - **Immutable spec + JIT grant:** the queued object is hash-frozen; grants are minted just-in-time bound to `spec_sha256`, so no grant sits in the queue and a tampered spec is rejected at mint (SI-001, SI-060).
 - **Broker reconstruction:** the wire request is rebuilt deterministically from the signed spec and must equal it; a worker cannot inject a deviation (SI-061).
 - **DNS rebinding / redirects:** resolve → validate → pin at the broker; every redirect is a new spec + grant (SI-003, SI-004, SI-005).
-- **Budget correctness:** an identifiable `budget_reservation` per grant `jti` with **idempotent** commit/release and **crash-expiry** — never double-spent, never spent on an unsent request, never stranded by a crashed worker (SI-017, SI-062).
-- **Intent before egress:** the durable `request.intent` is committed **before any DNS/TCP/TLS action**, in one transaction with the reservation, so nothing is ever contacted without a prior durable record (SI-055).
+- **Budget correctness (conservative charge-before-send):** an identifiable `budget_reservation` per grant `jti`; the broker transitions the lease to **`charged`** (`request_budget_used += 1`, IRREVERSIBLE) **before any byte is sent**, so `sent ⇒ charged` always holds and sent-but-uncharged traffic is impossible. A pre-charge denial releases the claim; a crashed `claimed` lease is swept and its capacity freed; a `charged` lease is terminal (never released, never expired) — a crash around the send is a conservative over-charge, never an under-charge (SI-017, SI-062).
+- **Intent before egress:** the durable `request.intent` is committed **before any DNS/TCP/TLS action**, in the **same transaction** that transitions the lease to `charged`, so nothing is ever contacted without a prior durable record and the budget is already irreversibly charged (SI-055).
 - **Fail-closed & double-checkpoint:** any non-affirmative state at either stage denies; window/expiry/e-stop re-checked at JIT mint and Stage 2 (SI-002, SI-046, SI-049).
 
 ## 8. Rate-limit, testing-window & expiry enforcement (runtime fields)
@@ -686,6 +708,8 @@ TABLE engagement_runtime_counter (
   requests_in_window   INT NOT NULL DEFAULT 0,
   in_flight            INT NOT NULL DEFAULT 0,     -- HTTP requests currently on the wire
   ws_in_flight         INT NOT NULL DEFAULT 0,     -- established ws/wss connections (<= engagement.max_ws_connections)
+  fence_seq            BIGINT NOT NULL DEFAULT 0,  -- AUTHORITATIVE monotonic fence source; advanced under the §7.1
+                                                   --   FOR UPDATE lock — every reservation/claim takes fence_seq += 1
   last_request_at      TIMESTAMPTZ,
   circuit_state        TEXT NOT NULL DEFAULT 'closed' CHECK (circuit_state IN ('closed','open','half_open')),
   circuit_opened_at    TIMESTAMPTZ,
@@ -699,7 +723,7 @@ TABLE engagement_runtime_counter (
 | Global / per-host RPS | `global_max_rps`, `per_host_max_rps` | Token buckets per engagement/host (broker send path); excess queued, not dropped. |
 | Concurrency | `max_concurrency`, `per_host_concurrency`, `in_flight` | Distributed semaphore consulted before every request. |
 | Min spacing | `min_request_interval_ms` | Enforced against `last_request_at`. |
-| Request budget | `request_budget_total`, `request_budget_used`, **`budget_reservation` ledger (§8.1)** | **Identifiable reserve / idempotent commit / idempotent release / crash-expiry:** grant-mint inserts a `budget_reservation` row keyed by the grant `jti` only if availability (`total − used − live reservations`) > 0; a sent request idempotently commits it (`used += 1`); a pre-send denial idempotently releases it; a crashed worker's reservation auto-expires past its deadline. Committed (sent) count never exceeds `request_budget_total` and no reservation strands. Exhaustion auto-pauses. |
+| Request budget | `request_budget_total`, `request_budget_used`, **`budget_reservation` ledger (§8.1)** | **Conservative charge-before-send (§8.1):** availability = `total − used − count(live 'claimed' leases)`; checked under a `SELECT … FOR UPDATE` lock. In that same locked transaction the broker transitions the lease to **`charged`** (`used += 1`, IRREVERSIBLE) and commits the durable intent **before any byte is sent**, so `sent ⇒ charged` always holds. A pre-charge denial releases the claim; a crashed `claimed` lease is swept (capacity freed); a `charged` lease is terminal. Sent count never exceeds `request_budget_total`; the only crash residue is a conservative over-charge, never sent-but-uncharged traffic. Exhaustion auto-pauses. |
 | Body cap | `max_response_body_bytes` | Response reading truncates; oversize bodies never fully buffered. |
 | WebSocket | `max_ws_connections`, `ws_in_flight`, `ws_max_duration_s`, `ws_max_messages`, `ws_max_message_bytes` | Handshake scoped/pinned like HTTP (§7.2); established connection bounded by duration / message-count / message-size; `ws_in_flight <= max_ws_connections`; e-stop / window-close / expiry terminate active connections. |
 | Testing window / expiry | `testing_window`, `authorization.expires_at` | Re-evaluated at Stage-1 (**JIT grant-mint**) **and** Stage-2, on the trusted clock (SI-049); a spec that waits in the queue past the window simply gets no grant. |
@@ -709,35 +733,52 @@ TABLE engagement_runtime_counter (
 
 ### 8.1 Budget reservation ledger
 
-Budget is accounted by an **identifiable ledger**, not a bare counter, so commit/release are idempotent and a crashed worker cannot strand a unit:
+Budget is accounted by an **identifiable ledger**, not a bare counter, running a **conservative charge-before-send state machine** so that no request is ever sent without its budget already irreversibly charged, and a crashed worker can neither send-uncharged nor strand a unit:
 
 ```sql
-TABLE budget_reservation (
-  id             UUID PRIMARY KEY,           -- the reservation identity
+TABLE budget_reservation (               -- CONSERVATIVE charge-before-send lease (no sent-but-uncharged traffic)
+  id             UUID PRIMARY KEY,
   tenant_id      UUID NOT NULL,
   engagement_id  UUID NOT NULL,
   spec_id        UUID NOT NULL,
-  grant_jti      TEXT NOT NULL,              -- ties the reservation to exactly one single-use grant
-  state          TEXT NOT NULL DEFAULT 'reserved'
-                 CHECK (state IN ('reserved','committed','released','expired')),
+  grant_jti      TEXT NOT NULL,              -- ties the lease to exactly one single-use grant
+  state          TEXT NOT NULL DEFAULT 'claimed'
+                 CHECK (state IN ('claimed','charged','released','expired')),
   owner          TEXT NOT NULL,              -- the broker instance holding this LEASE
-  fence_token    BIGINT NOT NULL,            -- monotonic per engagement; a commit/resume MUST present the current
-                                             --   token, so a superseded or resumed-after-pause lease cannot write
-  reserved_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  expires_at     TIMESTAMPTZ NOT NULL,       -- crash-expiry deadline (>= grant exp + margin)
-  resolved_at    TIMESTAMPTZ,                -- when committed/released/expired
+  fence_token    BIGINT NOT NULL,            -- from engagement_runtime_counter.fence_seq (authoritative, monotonic)
+  claimed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  charged_at     TIMESTAMPTZ,                -- set when claimed->charged (WITH the intent commit, BEFORE any send)
+  expires_at     TIMESTAMPTZ NOT NULL,       -- CLAIM deadline; renewable while 'claimed'
+  resolved_at    TIMESTAMPTZ,                -- when released/expired
   UNIQUE (id, tenant_id),
-  UNIQUE (tenant_id, grant_jti),             -- one reservation per grant → the idempotency anchor
+  UNIQUE (tenant_id, grant_jti),             -- one lease per grant
   FOREIGN KEY (engagement_id, tenant_id) REFERENCES engagement(id, tenant_id),
-  FOREIGN KEY (spec_id, tenant_id)       REFERENCES request_spec(id, tenant_id)
+  FOREIGN KEY (spec_id, tenant_id)       REFERENCES request_spec(id, tenant_id),
+  CONSTRAINT charged_has_time        CHECK (state <> 'charged' OR charged_at IS NOT NULL),
+  CONSTRAINT no_release_after_charge CHECK (NOT (state='released' AND charged_at IS NOT NULL)),
+  CONSTRAINT no_expire_after_charge  CHECK (NOT (state='expired'  AND charged_at IS NOT NULL))
 );
+-- CONSERVATIVE charge-before-send state machine — NO sent-but-uncharged traffic:
+--   claimed --(atomic WITH the durable intent commit, BEFORE any send)--> charged  [request_budget_used += 1, IRREVERSIBLE]
+--   claimed --(denied before charge)---------------------------------> released    [capacity freed]
+--   claimed --(deadline, sweeper)------------------------------------> expired      [capacity freed]
+-- 'charged' is TERMINAL: never released, never expired, never uncharged. Bytes are sent ONLY when state='charged',
+-- so "sent => charged" ALWAYS holds. A DB/network crash around the send may leave a 'charged' lease whose bytes never
+-- left (a conservative OVER-charge, acceptable per "ambiguous sends may consume budget"); the inverse (sent-but-
+-- uncharged) is IMPOSSIBLE. request.completed/failed is INFORMATIONAL and does NOT change the charge.
+-- FENCE TOKENS: fence_token comes from the authoritative per-engagement fence_seq (advanced under the §7.1 FOR UPDATE
+-- lock). Only the `owner` may transition a lease and MUST present the current fence_token. RENEW extends expires_at
+-- (same token, only while 'claimed'). CLAIM takes over an EXPIRED 'claimed' lease by writing a NEW fence_token (fencing
+-- off the old owner, whose token is now stale) and becoming owner — a 'charged' lease is NEVER claimable. The SWEEPER
+-- expires ONLY 'claimed' leases past expires_at and outside the renewal grace window; it MUST EXCLUDE 'charged' and
+-- 'released' leases.
 ```
 
-- **Atomic reserve + intent.** The broker creates the reservation under a `SELECT … FOR UPDATE` on the engagement budget row (atomic budget lock), **in the same transaction as the durable intent, before any egress**; the availability check and the insert cannot race.
-- **Owned / fenced lease.** Each reservation is a lease held by one `owner` with a monotonic `fence_token`; commit/resume must present the current token, so a paused-then-resumed or superseded holder can never double-commit.
-- **Availability** = `request_budget_total − request_budget_used − count(state='reserved' AND expires_at > now)`; a grant is minted only when this is > 0.
-- **Idempotent commit/release.** State is monotonic: `reserved → committed` (on send; `request_budget_used += 1`) or `reserved → released` (on pre-send denial). Committing an already-`committed` row, or releasing an already-`released` row, is a **no-op keyed by `grant_jti`**; a terminal state can never change — so a retried commit or a double release cannot corrupt the count.
-- **Crash-expiry.** A sweeper marks `reserved` rows past `expires_at` as `expired`, freeing the capacity; a crashed or hung worker never strands budget. A reservation that has `expired` cannot later commit (its grant has also expired).
+- **Charge before send (conservative).** In the atomic `SELECT ... FOR UPDATE` transaction that commits the durable intent, the broker transitions the lease to **`charged`** and does `request_budget_used += 1` **IRREVERSIBLY, before any egress**. Bytes are sent ONLY when the lease is `charged`, so **sent => charged** always holds; the inverse — sent-but-uncharged traffic — is impossible.
+- **Crash boundary.** A crash before the charge commits leaves a `claimed` (or no) lease => nothing was sent => the sweeper reclaims it. A crash around/after the send leaves a `charged` lease whose bytes may or may not have left — a conservative **over-charge**, never an under-charge. `request.completed`/`failed` is informational and does not alter the charge.
+- **Availability** = `request_budget_total - request_budget_used - count(state='claimed' AND expires_at > now)`; `used` counts `charged` leases. A grant is minted only when availability > 0, checked under the same `FOR UPDATE` lock so the check and the charge cannot race.
+- **Owned / fenced lease.** Each lease has one `owner` and a `fence_token` from the authoritative per-engagement `fence_seq`. Only the owner may transition it, presenting the current token. **RENEW** extends `expires_at` while `claimed`; **CLAIM** takes over an *expired* `claimed` lease by writing a new fence token (fencing the old owner); a **`charged`** lease is never claimable or releasable.
+- **Sweeper exclusions.** The sweeper expires only `claimed` leases past `expires_at` outside the renewal grace window; it **never touches `charged` or `released`** leases (charged is terminal and irreversible).
 
 ---
 
@@ -763,6 +804,7 @@ TABLE audit_chain (                -- one row per chain → gives every chain a 
   head_hash     CHAR(64) NOT NULL DEFAULT repeat('0',64),   -- genesis sentinel
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (chain_key),                          -- chain_key is NON-NULL, so this uniqueness ACTUALLY holds
+  UNIQUE (id, tenant_id, engagement_id),       -- target of audit_event's tenant/engagement<->chain binding FK
   CONSTRAINT stream_keys CHECK (
      (stream='engagement' AND engagement_id IS NOT NULL AND tenant_id IS NOT NULL)
      OR (stream='tenant'  AND engagement_id IS NULL     AND tenant_id IS NOT NULL)
@@ -794,6 +836,9 @@ TABLE audit_event (
   signature       TEXT,                          -- periodic-anchor signature (write-only signing svc, SI-051)
 
   FOREIGN KEY (chain_id) REFERENCES audit_chain(id),
+  FOREIGN KEY (chain_id, tenant_id, engagement_id) REFERENCES audit_chain(id, tenant_id, engagement_id),
+                                                 -- the event's tenant/engagement MUST equal its chain's (a trigger
+                                                 -- enforces equality for global/tenant chains where FK MATCH SIMPLE skips NULLs)
   FOREIGN KEY (related_event_id, chain_id) REFERENCES audit_event(id, chain_id),  -- related event MUST be same chain
   UNIQUE (id, tenant_id),                        -- target of composite child FKs (e.g. approval linkage)
   UNIQUE (id, chain_id),                         -- target of the same-chain related-event FK
@@ -811,7 +856,7 @@ TABLE audit_event (
 
 **Integrity rules**
 - **Genesis & non-null chain identity.** Each chain is an `audit_chain` row with a NON-NULL `chain_key`/`id`; genesis `head_hash = 0*64`. Each event's `prev_hash` = the chain's current `head_hash`, and committing an event advances the chain's `head_seq`/`head_hash`. Uniqueness of `seq` and `event_hash` is enforced on the NON-NULL `chain_id` — closing the earlier gap where NULL tenant/engagement keys made the constraint vacuous for tenant/global chains. Any altered/removed/reordered event breaks that chain from that point.
-- **Request intent precedes ANY egress (SI-055):** the `request.intent` event — recording the `spec_sha256`, the grant `jti`, and the `budget_reservation` id — is durably committed **before any DNS query, TCP connect, or TLS handshake for the request**, in the **same transaction** as the reservation, so a crash can neither contact a target without a record nor leak a reserved unit. The `request.completed`/`request.failed` event references it via `related_event_id` (same chain) and **idempotently** commits or releases the reservation. A crash after intent but before completion leaves a durable, provable "attempted" record and its reservation crash-expires.
+- **Request intent precedes ANY egress (SI-055):** the `request.intent` event — recording the `spec_sha256`, the grant `jti`, and the `budget_reservation` id — is durably committed **before any DNS query, TCP connect, or TLS handshake**, in the **same transaction** that transitions the lease to `charged` (`request_budget_used += 1`, §8.1), so a target is never contacted without a prior durable record AND the budget is already irreversibly charged before any byte is sent. The `request.completed`/`request.failed` event references it via `related_event_id` (same chain) and is **informational only** — it does not change the charge. A crash after intent leaves a durable "attempted" record and a `charged` lease (conservative over-charge), never sent-but-uncharged traffic.
 - **Redaction before hashing (SI-045):** secrets, cookies, `Authorization` headers, tokens, credentials-in-URL, PII, and raw bodies are stripped/omitted first; `payload_sha256` covers the redacted form. Raw target auth material and bodies are **never** written to any stream.
 - **Append-only:** `UPDATE`/`DELETE` revoked at the grant level and rejected by triggers.
 - **Anchoring & key custody (SI-051):** each chain head is periodically signed by a **write-only** signing service (whose key Administrators cannot read) and anchored to WORM/external notary; the residual rewrite window between anchors is documented in `11-data-retention-and-deletion.md`.
@@ -842,7 +887,8 @@ TABLE approval_request (
   document_sha256    CHAR(64),         -- authorization_attestation: hash of the authorization artifact
   potential_impact   TEXT NOT NULL CHECK (char_length(potential_impact) <= 4000),
   target_summary     TEXT NOT NULL,
-  scope_check_result JSONB NOT NULL,   -- snapshot of the §7 Stage-1 decision (must be PASS)
+  scope_check_result JSONB NOT NULL,   -- snapshot of the SCOPE-ONLY pre-verdict (§10, no approval check) — must be PASS;
+                                       --   NOT the full Stage-1 approval validation (that would be circular, §10)
   required_account   TEXT,
   expected_response  TEXT,
   evidence_plan      TEXT NOT NULL,
@@ -876,8 +922,11 @@ TABLE approval_request (
 -- referenced by approval_policy_id, so a requester can never set their own threshold or eligible roles.
 -- TRIGGERS: (1) approval_policy_id MUST reference the current, non-superseded policy whose request_type matches
 --   (pins the current matching policy at request time); (2) approval_manifest_entry rows are frozen (no inserts)
---   once manifest_frozen = TRUE, and a decision is REJECTED unless manifest_frozen = TRUE AND
---   sha256(sorted approval_manifest_entry.spec_sha256) = manifest_sha256 (freeze + trigger-verify before decisions).
+--   once manifest_frozen = TRUE (manifest_frozen is MONOTONIC, FALSE->TRUE only, with manifest_frozen_at set), and a
+--   decision is REJECTED unless manifest_frozen = TRUE AND sha256(sorted approval_manifest_entry.spec_sha256) =
+--   manifest_sha256 (freeze + trigger-verify before any decision). Non-manifest request types (attestation,
+--   scope-change) carry the CANONICAL EMPTY manifest (manifest_sha256 = sha256 of the empty set), so the verify is
+--   uniform: manifest membership is checked at §7 Stage-1 only for types whose manifest is non-empty.
 
 TABLE approval_policy (             -- IMMUTABLE, Administrator-managed, versioned policy (the source of truth)
   id                 UUID PRIMARY KEY,
@@ -894,6 +943,10 @@ TABLE approval_policy (             -- IMMUTABLE, Administrator-managed, version
   created_by         UUID NOT NULL,           -- Administrator only (doc 09); recorded in the global audit stream
   UNIQUE (policy_digest),
   UNIQUE (request_type, version),
+  -- EXACTLY ONE current policy per request_type (partial unique index):
+  --   CREATE UNIQUE INDEX one_current_policy ON approval_policy (request_type) WHERE superseded = FALSE;
+  -- ROLE-QUORUM VALIDITY (trigger): every key of role_quorum must be an eligible role in approver_roles, and
+  --   Σ(role_quorum values) ≤ required_approvals — an unsatisfiable or ineligible quorum is rejected at write.
   CONSTRAINT threshold_floor CHECK (
      (request_type = 'intrusive_validation' AND required_approvals >= 1)
      OR required_approvals >= 2)
@@ -932,7 +985,7 @@ TABLE approval_decision (
 
 **Decision rules (enforced in app + trigger, tested as SI-047 / SI-018 / SI-020):**
 
-1. **Threshold, role quorum & frozen manifest (from the immutable policy).** Decisions are accepted only when `manifest_frozen = TRUE` and the frozen manifest hashes to `manifest_sha256` (trigger-verified). `approval_request` becomes `approved` **iff** the count of *distinct* `approval_decision` rows with `decision='approve'`, `approver_role ∈ approval_policy.approver_roles`, `approved_policy_digest = the referenced policy's digest`, and `approved_manifest_sha256 = manifest_sha256` (and `approved_document_sha256 = document_sha256` when present) is **≥ `approval_policy.required_approvals`**, **every per-role minimum in `approval_policy.role_quorum` is met**, **and** no `reject` decision exists. Any `reject` ⇒ `rejected`. The threshold, eligible roles, and role quorum all come from the current, non-superseded `approval_policy` pinned at request time — never from the request.
+1. **Threshold, role quorum & frozen manifest (from the immutable policy).** **For manifest-bearing types** (`intrusive_validation`, `business_logic_test`) decisions are accepted only when `manifest_frozen = TRUE` and the frozen manifest hashes to `manifest_sha256` (trigger-verified); non-manifest types (attestation/scope-change) carry no manifest (or the canonical empty-set digest) and skip that check. `approval_request` becomes `approved` **iff** the count of *distinct* `approval_decision` rows with `decision='approve'`, `approver_role ∈ approval_policy.approver_roles`, `approved_policy_digest = the referenced policy's digest`, and — **when the type is manifest-bearing** — `approved_manifest_sha256 = manifest_sha256` (and `approved_document_sha256 = document_sha256` when present) is **≥ `approval_policy.required_approvals`**, **every per-role minimum in `approval_policy.role_quorum` is met**, **and** no `reject` decision exists. Any `reject` ⇒ `rejected`. The threshold, eligible roles, and role quorum all come from the current, non-superseded `approval_policy` pinned at request time — never from the request.
 2. **Separation of duties.** No approver may equal `requested_by`; no approver may be the tester executing the action; approvers must be distinct users; each approver must hold a role in the **policy's** `approver_roles`; a user may not hold two SoD-conflicting roles on the same engagement (doc 09).
 3. **Manifest/document-hash binding.** Each approver pins the exact `manifest_sha256` (and `document_sha256` for attestation) and the `approved_policy_digest`. If the manifest, document, or policy version changes, prior decisions are void and the threshold must be re-met — an approval can never be moved onto a different manifest or a weaker policy.
 4. **Scope precondition (conditional).** For *within-scope* request types (`intrusive_validation`, `business_logic_test`, `mode_elevation`) an approval cannot be created unless its target already passes §7 Stage-1 — the DDL `scope_must_pass` CHECK requires `scope_check_result.decision = 'pass'`. For *scope-changing* types (`scope_expansion`, `restricted_range_allow`, `authorization_attestation`) the target is by definition **not yet in scope**, so the CHECK deliberately does **not** require a pass; these approvals gate a *new* `scope_version` that becomes the in-scope set only once re-attested. (This resolves the earlier contradiction where the unconditional CHECK would have rejected every scope-expansion approval.)
@@ -949,6 +1002,8 @@ TABLE approval_decision (
 | `mode_elevation` | 2 | Engagement Manager, Reviewer |
 | `business_logic_test` | 2 | Engagement Manager, Reviewer |
 | `intrusive_validation` | 1 | Engagement Manager, Reviewer |
+
+**Scope-only pre-verdict vs Stage-1 approval validation (non-circular dynamic bootstrap).** The Scope Authority exposes two distinct verdicts over a candidate: a **scope-only pre-verdict** — scheme/exclusion/allowlist/network-guard PASS with **no** approval check — and the **Stage-1 full verdict** — the scope-only checks PLUS approval-manifest membership and policy threshold (which mints the grant, §7.1 step h). A dynamic (broker-mediated) request that turns out to need approval is bootstrapped **without circularity** because `approval_ref` is EXCLUDED from `spec_sha256` (§7.0): (1) the broker forms the spec and gets its stable `spec_sha256`; (2) a **scope-only pre-verdict** confirms it is in scope (and is what satisfies `approval_request.scope_check_result`); (3) an `approval_request` is created and its manifest **frozen** with that `spec_sha256`; (4) after approvals reach threshold + role quorum, the **Stage-1 full verdict** now finds the digest in the frozen manifest and mints the grant → the paused session resumes. The pre-verdict never depends on the approval, and the approval's manifest binds the already-stable content digest — so neither waits on the other.
 
 ---
 
@@ -1025,13 +1080,13 @@ These are the testable guarantees this schema exists to make provable (Phase 2 "
 10. **Breadth is bounded.** Broad CIDRs, wildcards, and excessive host/address counts are hard-capped or gated by elevated dual approval; scope expansion re-attests (SI-059).
 11. **Import is hash-verified & fail-closed.** A bundle whose recomputed `scope_hash` differs is rejected; Tier B/wildcard entries never self-activate.
 12. **Composite-tenant integrity.** No child row can reference a parent in another tenant — every FK is composite `(id, tenant_id)` (the engagement↔authorization↔scope_version and authorization↔attestation-approval cycles use DEFERRABLE composite FKs) — and RLS scopes every query (SI-024).
-13. **Budget is reserve/commit/release.** A unit is reserved at JIT grant-mint (only if `used + reserved < total`), committed on send, released on any pre-send denial; sent requests never exceed `request_budget_total` and no unit leaks (SI-017, SI-062).
+13. **Budget is charge-before-send.** In one `FOR UPDATE`-locked transaction the broker charges the lease (`used += 1`, IRREVERSIBLE) and commits the durable intent **before any byte is sent** (availability = `total − used − live 'claimed'` checked under the same lock), so `sent ⇒ charged` always holds; a pre-charge denial releases the claim, a crashed `claimed` lease is swept, and a `charged` lease is terminal — the only crash residue is a conservative over-charge, never sent-but-uncharged traffic (SI-017, SI-062).
 14. **Window/expiry/e-stop are JIT + Stage-2.** Re-evaluated at grant-mint and again at the broker; a spec that waited past the window gets no grant, and a fired e-stop/expiry aborts in-flight work including WebSockets (SI-011, SI-012, SI-013, SI-049).
-15. **Approval binds the exact spec.** Intrusive approvals pin `plan_sha256` covering each authorized `spec_sha256`; scope-changing approvals correctly do NOT require the not-yet-in-scope target to pass §7 (SI-018, SI-047).
+15. **Approval binds the exact spec.** Intrusive approvals bind an explicit `approval_manifest_entry` set (hashed as `manifest_sha256`) containing each authorized `spec_sha256`; scope-changing approvals correctly do NOT require the not-yet-in-scope target to pass §7 (SI-018, SI-047, SI-064).
 16. **Breadth accounting is computable.** An IPv4-equivalent address budget + a CIDR-entry cap are enforced; IPv6 breadth is governed by prefix floors + elevated approval (never an address sum); exclusions are not subtracted (SI-059).
 17. **WebSocket is bounded and catalog-controlled.** ws/wss handshakes are scoped/pinned like HTTP; established connections are bounded by duration/message/size/count caps and terminated on e-stop/window/expiry; outbound frames come only from the approved content-addressed frame set (SI-063).
-18. **Intent precedes any egress.** `request.intent` is durably committed before any DNS/TCP/TLS action, in one transaction with the reservation (SI-055).
-19. **Budget reservations are identifiable & idempotent.** One `budget_reservation` per grant `jti`; commit/release are idempotent (monotonic state) and crashed reservations auto-expire — sent never exceeds total, nothing strands (SI-017, SI-062).
+18. **Intent precedes any egress.** `request.intent` is durably committed before any DNS/TCP/TLS action, in the same transaction that charges the budget lease (SI-055).
+19. **Budget leases are identifiable, owned & fenced.** One `budget_reservation` per grant `jti` with an `owner` and a monotonic `fence_token` (from `engagement_runtime_counter.fence_seq`); only the owner may transition a lease and must present the current token; a `charged` lease is terminal (never released, never claimable), the sweeper reclaims only expired `claimed` leases — sent never exceeds total, nothing strands, and no stale owner can charge after being fenced off (SI-017, SI-062).
 20. **Requests are content-addressed & repeatable.** All template references are immutable digests bound into `spec_sha256`; there is no `UNIQUE(spec_sha256)`, so identical requests may recur across jobs/runs as distinct instances (SI-065).
 21. **Approval policy is immutable; approval binds a manifest.** Threshold + roles come from an immutable, Admin-versioned `approval_policy`, never requester fields; intrusive approvals authorize only the explicit set of `spec_sha256` digests in their manifest (SI-064).
 22. **Audit chains have non-null identity.** Every chain is an `audit_chain` row with a NON-NULL `chain_id`; per-chain `seq`/`event_hash` uniqueness is enforced on that non-null key (SI-026).

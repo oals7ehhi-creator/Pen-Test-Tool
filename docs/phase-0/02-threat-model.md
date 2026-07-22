@@ -31,7 +31,7 @@ Methodology: STRIDE + abuse-case analysis over the platform's assets, actors, tr
 | Administrator | internal-trusted | Configures the platform, manages users/roles, tool inventory and pinned versions, callback infra, and global safety defaults. Highest privilege; cannot silently disable safety invariants (enforced server-side and audited). |
 | Engagement Manager | internal-trusted | Creates engagements, records authorization (owner, reference, expiry, window), defines scope, and approves approval-gated validation. Separation of duties: cannot also be the executing Tester on the same gated action. |
 | Tester | internal-limited | Runs passive and safe-active scans within assigned engagements and supplies target auth sessions. Cannot approve intrusive validation, cannot edit authorization, cannot access other engagements. |
-| Reviewer | internal-limited | Triages and grades findings, marks false positives, comments, manages status lifecycle. Cannot launch scans or approve intrusive validation. |
+| Reviewer | internal-limited | Triages and grades findings, marks false positives, comments, manages status lifecycle. Does not execute checks (SoD from Tester); is an eligible approver for intrusive validation and a valid second approver for scope/legal actions (RBAC `09` §3–§4). |
 | Read-only Auditor | internal-limited | Views reports, findings, and the audit trail for oversight. No mutating actions. |
 | Malicious or careless insider operator | internal-limited | An authenticated operator who tries (deliberately or through negligence) to point the platform at systems they are not authorized to test, broaden scope, or run intrusive checks. Primary abuse-case actor. |
 | Target system under test | system | The in-scope application/host. Responds to requests and may be attacker-controlled or compromised; its responses, redirects, DNS, and any content are untrusted input to the scanner. |
@@ -642,12 +642,12 @@ A crafted host/URL triggers catastrophic backtracking or a crash in the scope/UR
 - **Likelihood / Impact:** medium / high
 - **Assets at risk:** Scope configuration / allowlist, In-scope target systems
 
-If a naive HTTP `CONNECT` tunnel were used, the Guarded Egress Broker would see only host:port for the initial CONNECT — it could not see the request path, re-validate redirects, or inspect/size-cap/redact bodies. Per-hop redirect re-validation, path-prefix scoping, and body caps would be unenforceable for tool HTTPS traffic. **The design therefore forbids a generic CONNECT proxy** and requires the broker's authenticated, per-job, request-line-bound ingress (SI-053).
+If a naive HTTP `CONNECT` tunnel were used, the Guarded Egress Broker would see only host:port for the initial CONNECT — it could not see the request path, re-validate redirects, or inspect/size-cap/redact bodies. Per-hop redirect re-validation, path-prefix scoping, and body caps would be unenforceable for tool HTTPS traffic. **The design therefore forbids a generic CONNECT proxy** and requires the broker's authenticated, per-job, spec-bound ingress — each grant bound to an immutable request specification by `spec_sha256` (SI-053).
 
 **Vector.** An in-scope host redirecting or path-traversing to an off-scope path/host inside an opaque TLS tunnel driven by a tool.
 
 **Mitigations.**
-- SI-053: the broker never exposes a generic `CONNECT host:port` proxy; each request carries a per-job identity and a single-use grant bound to the exact request line, and the broker serves only that line.
+- SI-053: the broker never exposes a generic `CONNECT host:port` proxy; each request carries a per-job identity and a single-use grant bound to the immutable request specification by `spec_sha256`, and the broker reconstructs and serves only the request that content-hashes to that spec.
 - SI-042: one visibility model chosen and documented per adapter — (a) broker TLS-termination using an internal CA installed ONLY inside the sandbox to inspect the tool's own egress, or (b) request-by-request adapter driving (ZAP API mode, Nuclei with proxy + redirects disabled) so each request/redirect crosses the broker in broker-visible form.
 - Path/redirect/body invariants apply wherever the broker can see the request (both models above); tools that cannot be so constrained are gated out.
 - Host:port + resolved-IP scope + IP pinning always enforced (rebinding-safe), even before body visibility.

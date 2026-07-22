@@ -25,10 +25,10 @@
 | SI-014 | Automatic circuit breakers MUST trip and halt an engagement (or a specific check/target) when tested thresholds are exceeded — tar… | queue abuse |
 | SI-015 | The number of concurrent in-flight outbound requests per engagement MUST never exceed the engagement's configured concurrency ceil… | queue abuse |
 | SI-016 | The outbound request rate per engagement MUST never exceed the configured requests-per-interval ceiling measured over any sliding… | queue abuse |
-| SI-017 | Each engagement and run has a finite total request budget enforced by an identifiable `budget_reservation` ledger: a just-in-time… | queue abuse |
+| SI-017 | Each engagement and run has a finite total request budget enforced by an identifiable `budget_reservation` ledger under a conservative charge-before-send state machine: the broker charges a lease (`used += 1`, irreversible) before any byte is sent, so charged requests never exceed `request_budget_total`… | queue abuse |
 | SI-018 | No action classified as intrusive, active-injection, or destructive-class MAY execute unless a stored approval record exists that… | scope escape, command injection |
 | SI-019 | The system MUST be structurally incapable of emitting destructive payloads: request bodies/parameters are constructed only from a… | command injection, scope escape |
-| SI-020 | Approval records and their bound plan hashes are immutable once created; any modification to the plan (target, request, payload, s… | scope escape, cross-tenant access |
+| SI-020 | Approval records and their bound manifest/document hashes (`manifest_sha256`/`document_sha256`) are immutable once created; any modification to the approved request set (target, request, payload, s… | scope escape, cross-tenant access |
 | SI-021 | Secrets, credentials, API keys, session tokens, cookies, Authorization headers, passwords, and PII MUST never be persisted in clea… | secret leakage, report-data exposure |
 | SI-022 | Evidence capture MUST enforce per-item body-size limits and retention policy, and response bodies stored as evidence MUST pass thr… | report-data exposure, secret leakage |
 | SI-023 | Generated reports in every format (HTML, JSON, CSV, PDF-ready) MUST contain only redacted content — no unredacted cookies, Authori… | report-data exposure, secret leakage |
@@ -38,7 +38,7 @@
 | SI-027 | If an audit event for a safety-relevant action cannot be durably written, the action MUST NOT proceed (fail-closed on audit): a re… | scope escape, malicious scanner output |
 | SI-028 | No user-, target-, or tool-supplied input EVER reaches a shell interpreter; all external processes (tool adapters, scanners) are l… | command injection, unsafe plugin execution |
 | SI-029 | Output from external tools (Nuclei, ZAP, TestSSL, SCA/secret scanners) MUST be consumed only as structured, untrusted data via a s… | malicious scanner output, unsafe plugin execution, command injection, scope escape |
-| SI-030 | External tools and plugins MUST run in isolated containers with default-deny network egress; their only permitted network destinat… | unsafe plugin execution, SSRF, scope escape, malicious scanner output |
+| SI-030 | External tools and plugins MUST run in isolated containers with default-deny network egress; their ONLY reachable network next hop is the Guarded Egress Broker (no direct target, internal-service, or internet route)… | unsafe plugin execution, SSRF, scope escape, malicious scanner output |
 | SI-031 | Every external tool binary, container image, and scan template/plugin MUST be version-pinned and integrity-verified (cryptographic… | supply-chain compromise, unsafe plugin execution, malicious scanner output |
 | SI-032 | Application dependencies and container base images MUST be locked with integrity hashes and verified at build/deploy; the build fa… | supply-chain compromise |
 | SI-033 | Worker network egress at the infrastructure layer MUST be default-deny, permitting only a narrow allowlist of internal control-pla… | scope escape, SSRF, unsafe plugin execution |
@@ -70,7 +70,7 @@
 | SI-059 | Broad or expanding scope MUST be limited technically and gated by elevated dual approval: CIDR entries broader than the engagement… | scope escape |
 | SI-060 | The object placed on the job queue MUST be an immutable, fully-hashed `request_spec` (`spec_sha256` over all request-determining f… | scope escape, queue abuse |
 | SI-061 | The Guarded Egress Broker MUST reconstruct and normalize the outbound request deterministically from the signed immutable spec (me… | scope escape, command injection |
-| SI-062 | Budget reservations MUST be identifiable (one `budget_reservation` per grant `jti`) with idempotent commit/release and crash-expir… | queue abuse, scope escape |
+| SI-062 | Budget leases MUST be identifiable (one `budget_reservation` per grant `jti`), owned, and fenced under a conservative charge-before-send state machine, so a crashed/retried worker can neither send-without-charging nor strand budget; window/expiry/e-stop re-evaluated at JIT mint AND Stage 2, with interlocks aborting in-flight work and reclaiming only pre-charge claims… | queue abuse, scope escape |
 | SI-063 | WebSocket (`ws`/`wss`) connections MUST be authorized, scoped, resolved, and IP-pinned at the handshake exactly like an HTTP reque… | scope escape, queue abuse |
 | SI-064 | Approval thresholds and eligible approver roles MUST be read from an immutable, Administrator-managed, versioned `approval_policy`… | scope escape, cross-tenant access |
 | SI-065 | Every security/request-context reference in a `request_spec` (check, tool template, header-set, payload, WebSocket frame-set) MUST… | scope escape, command injection, supply-chain compromise |
@@ -239,21 +239,21 @@
 
 ### SI-017
 
-**Each engagement and run has a finite total request budget enforced by an identifiable `budget_reservation` ledger: a just-in-time grant-mint inserts exactly one reservation row keyed by the grant `jti` only if availability (`total − used − live reservations`) > 0; a sent request idempotently commits it (`used += 1`); a pre-send denial idempotently releases it; a crashed worker's reservation auto-expires. The number of committed (sent) requests MUST never exceed `request_budget_total`, and no reservation may strand.**
+**Each engagement and run has a finite total request budget enforced by an identifiable `budget_reservation` ledger under a conservative charge-before-send state machine: the broker, under a `SELECT … FOR UPDATE` budget lock, admits a lease only if availability (`total − used − live 'claimed' leases`) > 0, then TRANSITIONS it to `charged` (`request_budget_used += 1`, IRREVERSIBLE) in the same transaction that commits the durable intent, BEFORE any byte is sent — so `sent ⇒ charged` always holds. A pre-charge denial releases the claim; a crashed `claimed` lease is swept (capacity freed); a `charged` lease is terminal. The number of `charged` (sendable) requests MUST never exceed `request_budget_total`, no lease may strand, and sent-but-uncharged traffic MUST be impossible.**
 
-- **Rationale.** A bare counter cannot be committed/released idempotently and strands budget when a worker crashes between reserve and send. An identifiable ledger with monotonic state gives idempotent commit/release and crash-expiry, so the cap holds exactly under concurrency, retries, and crashes.
-- **Enforcement point.** `budget_reservation` (one row per grant `jti`) with monotonic `reserved→committed`/`reserved→released` transitions and a crash-expiry sweeper (`04` §8.1); the **broker** creates the reservation under an atomic `SELECT … FOR UPDATE` budget lock in the same transaction as the intent, and each reservation is an **owned, fenced lease** (`owner` + monotonic `fence_token`) so a superseded or resumed-after-pause holder cannot double-commit; commit on send / release on denial.
-- **Test approach.** Total *committed* never exceeds the budget under concurrency (boundary total-1/total/total+1); a double commit and a double release are each no-ops (idempotent); killing a worker after reserve but before send leaves the unit reclaimed by expiry, not stranded; a race for the last unit admits exactly one.
+- **Rationale.** A bare counter cannot enforce "charge before the first byte" and strands budget when a worker crashes. An identifiable ledger with a monotonic state machine charges irreversibly before send, sweeps abandoned claims, and treats a `charged` lease as terminal — so the cap holds exactly under concurrency, retries, and crashes, and the only crash residue is a conservative over-charge (never an under-charge).
+- **Enforcement point.** `budget_reservation` (one row per grant `jti`) with monotonic `claimed→charged`/`claimed→released`/`claimed→expired` transitions and a sweeper that touches only expired `claimed` leases (`04` §8.1); the **broker** charges the lease under an atomic `SELECT … FOR UPDATE` budget lock in the same transaction as the intent, and each lease is an **owned, fenced lease** (`owner` + monotonic `fence_token`) so a superseded or resumed-after-pause holder cannot charge after being fenced off; `charged` is irreversible and terminal.
+- **Test approach.** Total *charged* never exceeds the budget under concurrency (boundary total-1/total/total+1); a re-charge attempt on an already-`charged` lease is a no-op; killing a worker in the `claimed` state reclaims the unit via the sweeper (not stranded), while a crash around the send leaves a `charged` lease (conservative over-charge, never uncharged); a race for the last unit admits exactly one; a fenced-off owner presenting a stale `fence_token` cannot charge.
 - **Violation impact.** Unbounded or under-counted scan volume; runaway crawls; stranded budget starving an engagement.
 - **Related threats.** queue abuse
 
 ### SI-018
 
-**No action classified as intrusive, active-injection, or destructive-class MAY execute unless a stored approval record exists that (a) references the exact plan hash of the concrete request(s) to be sent, (b) identifies an approver holding an authorized role, (c) is unexpired, and (d) has not been consumed beyond its permitted use; absent a matching valid approval, the action does not run.**
+**No action classified as intrusive, active-injection, or destructive-class MAY execute unless a stored approval record exists that (a) binds — via its frozen manifest (`manifest_sha256`) — the exact `spec_sha256` of every concrete request to be sent, (b) identifies an approver holding an authorized role, (c) is unexpired, and (d) has not been consumed beyond its permitted use; absent a matching valid approval, the action does not run.**
 
-- **Rationale.** Approval-Gated Validation is a core safety mode. Binding approval to the exact plan hash prevents approving a benign plan and then executing a different, harmful one.
-- **Enforcement point.** Validation executor gate that recomputes the plan hash at execution time and matches it to an immutable approval record before the Guarded Egress Broker sends; the Scope Authority refuses to mint a grant for an intrusive-class request lacking a valid approval reference, and the grant carries that reference.
-- **Test approach.** Integration test: attempt intrusive validation with (no approval / expired approval / approval for a different plan hash / approval by an unauthorized role) and assert refusal in every case; only an exact-hash, authorized, unexpired approval permits execution. Tamper test: mutate the plan after approval and assert the hash mismatch blocks it.
+- **Rationale.** Approval-Gated Validation is a core safety mode. Binding approval to the exact manifest of request digests prevents approving a benign request set and then executing a different, harmful one.
+- **Enforcement point.** Validation executor gate that recomputes each request's `spec_sha256` at execution time and asserts membership in the immutable approved manifest before the Guarded Egress Broker sends; the Scope Authority refuses to mint a grant for an intrusive-class request whose `spec_sha256` is not in a valid approval's manifest, and the grant carries that approval reference.
+- **Test approach.** Integration test: attempt intrusive validation with (no approval / expired approval / approval whose manifest omits the request's `spec_sha256` / approval by an unauthorized role) and assert refusal in every case; only an in-manifest, authorized, unexpired approval permits execution. Tamper test: mutate the request after approval and assert the missing-from-manifest check blocks it.
 - **Violation impact.** Intrusive/destructive actions executing without human authorization — the exact outcome the approval gate exists to prevent.
 - **Related threats.** scope escape, command injection
 
@@ -269,11 +269,11 @@
 
 ### SI-020
 
-**Approval records and their bound plan hashes are immutable once created; any modification to the plan (target, request, payload, scope, or count) invalidates the approval and requires a new approval, and an approval is single-run unless explicitly marked reusable with a bounded use count.**
+**Approval records and their bound manifest/document hashes (`manifest_sha256` / `document_sha256`) are immutable once created; any modification to the approved request set (target, request, payload, scope, or count) invalidates the approval and requires a new approval, and an approval is single-run unless explicitly marked reusable with a bounded use count.**
 
 - **Rationale.** Prevents approval reuse/replay and post-approval tampering, which would let a benign approval authorize a changed, harmful action.
-- **Enforcement point.** Append-only approval store; execution gate binds one approval to one plan hash and records consumption.
-- **Test approach.** Integration test: approve plan A, mutate to plan B, assert execution blocked; replay a consumed single-use approval and assert refusal. Tamper test on stored approval bytes detected via hash. Concurrency test: two workers racing to consume the same single-use approval, assert only one succeeds.
+- **Enforcement point.** Append-only approval store; execution gate binds one approval to one `manifest_sha256` and records consumption.
+- **Test approach.** Integration test: approve manifest A, mutate to manifest B, assert execution blocked; replay a consumed single-use approval and assert refusal. Tamper test on stored approval bytes detected via hash. Concurrency test: two workers racing to consume the same single-use approval, assert only one succeeds.
 - **Violation impact.** Replay/substitution of approvals to run unapproved intrusive actions.
 - **Related threats.** scope escape, cross-tenant access
 
@@ -369,11 +369,11 @@
 
 ### SI-030
 
-**External tools and plugins MUST run in isolated containers with default-deny network egress; their only permitted network destinations are those the Guarded Egress Broker permits per the current engagement's grants, enforced at the network/sandbox layer (not merely inside the tool), and they run under CPU/memory/time/request limits.**
+**External tools and plugins MUST run in isolated containers with default-deny network egress whose ONLY reachable network next hop is the Guarded Egress Broker — no direct target route, no internal-service route, no internet route — enforced at the network/sandbox layer (not merely inside the tool); the broker, never the tool, applies scope/grant checks and opens the target socket, and tools run under CPU/memory/time/request limits.**
 
-- **Rationale.** Unsafe plugin execution and tool egress are named threats; a tool that can reach arbitrary hosts bypasses every scope control the application layer enforces.
-- **Enforcement point.** Container runtime + network policy (egress firewall / sandbox) that whitelists only Guarded Egress Broker-approved destinations for the tool's engagement; resource cgroup limits; read-only/ephemeral filesystem.
-- **Test approach.** Container-isolation test: from inside a tool container, attempt connections to out-of-scope hosts, metadata IP, other engagements' hosts, and the internet at large, asserting all are blocked at the network layer. Resource-limit tests asserting CPU/mem/time caps enforced (tool killed on breach). Assert the egress allowlist is derived from and stays in sync with the live scope verdict set.
+- **Rationale.** Unsafe plugin execution and tool egress are named threats; a tool that can reach anything other than the broker bypasses every scope control. Constraining the sandbox route to a single next hop (the broker) means scope enforcement cannot be evaded at the tool layer — the tool physically cannot address a target.
+- **Enforcement point.** Container runtime + network policy (egress firewall / sandbox netns) that permits egress ONLY to the Guarded Egress Broker's address (default-deny everything else); resource cgroup limits; read-only/ephemeral filesystem. The broker holds the grant/scope logic; the sandbox holds no destination allowlist of its own.
+- **Test approach.** Container-isolation test: from inside a tool container, attempt connections to out-of-scope hosts, in-scope target hosts *directly*, the metadata IP, other engagements' hosts, internal services, and the internet at large, asserting **all** are blocked at the network layer and that the broker is the only reachable next hop. Resource-limit tests asserting CPU/mem/time caps enforced (tool killed on breach).
 - **Violation impact.** A tool reaching unauthorized or internal hosts — SSRF/scope escape and lateral movement from the scanning layer.
 - **Related threats.** unsafe plugin execution, SSRF, scope escape, malicious scanner output
 
@@ -539,11 +539,11 @@
 
 ### SI-047
 
-**Authorization attestation and any scope expansion (a new host, domain, or IP range) MUST be approved under dual control: at least `required_approvals` (floor 2) distinct `approval_decision` rows, each by a distinct user holding an eligible approver role per the RBAC matrix (`09-rbac-matrix.md`), none of whom is the requester or the executing tester, each pinning the same plan hash and — for attestation — the same authorization `document_sha256`; the threshold is enforced by the system, not advisory. A single user MUST NOT hold two separation-of-duties-conflicting roles on the same engagement.**
+**Authorization attestation and any scope expansion (a new host, domain, or IP range) MUST be approved under dual control: at least `required_approvals` (floor 2) distinct `approval_decision` rows, each by a distinct user holding an eligible approver role per the RBAC matrix (`09-rbac-matrix.md`), none of whom is the requester or the executing tester, each pinning the same `manifest_sha256` (for intrusive/business-logic requests) and — for attestation — the same authorization `document_sha256`; the threshold is enforced by the system, not advisory. A single user MUST NOT hold two separation-of-duties-conflicting roles on the same engagement.**
 
 - **Rationale.** The primary abuse actor is a privileged insider; scope-hash binding stops silent drift but not a deliberate broaden-and-re-attest by one person. The legal gate the whole product rests on needs an enforced two-person rule with per-approver hash binding so approvals cannot be moved onto a changed plan.
 - **Enforcement point.** The `approval_request` / `approval_decision` threshold logic (`04` §10) with a DB trigger + application check; RBAC verification of each `approver_role` (doc 09); audit records each `approval.decided` and the `approval.threshold_met` event.
-- **Test approach.** Authorization tests: a single actor cannot attest+expand+approve; the requester and the executing tester cannot be approvers; two decisions by the same user count once; a decision whose `approved_plan_sha256` ≠ the request's plan hash does not count; below-threshold requests never reach `approved`. SoD test that conflicting roles cannot both be exercised by one user on one engagement.
+- **Test approach.** Authorization tests: a single actor cannot attest+expand+approve; the requester and the executing tester cannot be approvers; two decisions by the same user count once; a decision whose `approved_manifest_sha256` ≠ the request's `manifest_sha256` (or whose `approved_policy_digest` ≠ the pinned policy) does not count; below-threshold requests never reach `approved`. SoD test that conflicting roles cannot both be exercised by one user on one engagement.
 - **Violation impact.** Insider self-authorization enabling scope escape with a veneer of legitimacy.
 - **Related threats.** scope escape
 
@@ -619,10 +619,10 @@
 
 ### SI-055
 
-**A durable `request.intent` audit event MUST be committed BEFORE any outbound network action for the request — before any DNS query, TCP connect, or TLS handshake — in the same broker transaction that ATOMICALLY creates the fenced budget reservation (under a `SELECT … FOR UPDATE` budget lock) — the reservation is created here, at the broker, not at mint; a request that cannot durably record its intent performs NO egress. It records `spec_sha256`, the grant `jti`, the reservation id, and the canonical target; the completion event references it (same chain) and idempotently commits or releases the reservation.**
+**A durable `request.intent` audit event MUST be committed BEFORE any outbound network action for the request — before any DNS query, TCP connect, or TLS handshake — in the same broker transaction that (under a `SELECT … FOR UPDATE` budget lock) TRANSITIONS the fenced budget lease to `charged` (`request_budget_used += 1`, IRREVERSIBLE) — the lease is charged here, at the broker, before any byte is sent, not at mint; a request that cannot durably record its intent AND charge its budget performs NO egress. It records `spec_sha256`, the grant `jti`, the reservation id, and the canonical target; the completion event references it (same chain) and is INFORMATIONAL only — it does NOT change the charge.**
 
-- **Rationale.** DNS resolution is itself egress that can leak the target or fail silently; committing intent before ANY packet leaves the box means nothing is ever contacted without a prior durable record, and the shared transaction means a crash can neither egress-without-record nor leak a reserved unit.
-- **Enforcement point.** Guarded Egress Broker ordering (`04` §7.1 step 10 before step 11): intent + reservation commit precedes the first resolver call; a failed audit write blocks all egress including DNS.
+- **Rationale.** DNS resolution is itself egress that can leak the target or fail silently; committing intent before ANY packet leaves the box means nothing is ever contacted without a prior durable record, and charging in the same transaction means `sent ⇒ charged` always holds — a crash can neither egress-without-record nor produce sent-but-uncharged traffic (the only possible crash residue is a conservative over-charge of a `charged` lease whose bytes never left).
+- **Enforcement point.** Guarded Egress Broker ordering (`04` §7.1 step 10 before step 11): intent commit + budget charge precedes the first resolver call; a failed audit write blocks all egress including DNS.
 - **Test approach.** Fault-inject a crash after intent and before DNS → the intent event is durably present and a packet-capture shows ZERO egress (no DNS, no SYN). Make the audit sink fail → no DNS query is issued. Assert no resolver call precedes the intent commit.
 - **Violation impact.** A target contacted (even via DNS) with no durable record — a blind spot in the tamper-evident trail.
 - **Related threats.** scope escape, malicious scanner output
@@ -689,11 +689,11 @@
 
 ### SI-062
 
-**Budget reservations MUST be identifiable (one `budget_reservation` per grant `jti`) with idempotent commit/release and crash-expiry, so a crashed or retried worker can neither double-spend nor strand budget; and testing-window, authorization-expiry, and emergency-stop MUST be re-evaluated at just-in-time grant-mint AND again at Stage 2, with a fired interlock releasing reservations and aborting in-flight work (HTTP and WebSocket).**
+**Budget leases MUST be identifiable (one `budget_reservation` per grant `jti`), owned, and fenced (`owner` + monotonic `fence_token`) under a conservative charge-before-send state machine, so a crashed or retried worker can neither send-without-charging nor strand budget, and a fenced-off owner cannot charge; and testing-window, authorization-expiry, and emergency-stop MUST be re-evaluated at just-in-time grant-mint AND again at Stage 2, with a fired interlock aborting in-flight work (HTTP and WebSocket) and reclaiming only pre-charge `claimed` leases (a `charged` lease is terminal).**
 
-- **Rationale.** Because the queued spec can wait arbitrarily long, the time interlocks must be checked at the last possible moment (JIT mint) and again at the broker; and reservations must survive crashes without leaking or double-counting.
-- **Enforcement point.** `budget_reservation` idempotent transitions + owned/fenced lease (`owner` + `fence_token`) created under an atomic `FOR UPDATE` budget lock + crash-expiry sweeper (`04` §8.1); Guarded Egress Broker Stage-2 re-check + fence-token commit/release; interlock handlers release reservations and abort in-flight HTTP + WebSocket.
-- **Test approach.** A spec dwelling past window-close or expiry gets no grant; e-stop/expiry mid-scan releases reservations and aborts in-flight requests and WebSocket connections within the bound; a crash leaves no stranded reservation (expiry reclaims it); idempotent commit/release verified under retry.
+- **Rationale.** Because the queued spec can wait arbitrarily long, the time interlocks must be checked at the last possible moment (JIT mint) and again at the broker; and the budget machine must survive crashes without ever producing sent-but-uncharged traffic — the acceptable failure is a conservative over-charge, never an under-charge.
+- **Enforcement point.** `budget_reservation` monotonic transitions + owned/fenced lease (`owner` + `fence_token`) charged under an atomic `FOR UPDATE` budget lock, with a sweeper that reclaims only expired `claimed` leases and never touches `charged` (`04` §8.1); Guarded Egress Broker Stage-2 re-check + fence-token-gated charge; interlock handlers abort in-flight HTTP + WebSocket and release only pre-charge claims.
+- **Test approach.** A spec dwelling past window-close or expiry gets no grant; e-stop/expiry mid-scan aborts in-flight requests and WebSocket connections within the bound and reclaims only `claimed` leases; a crash leaves no stranded `claimed` lease (the sweeper reclaims it) and never a sent-but-uncharged request; a stale-`fence_token` charge attempt is rejected.
 - **Violation impact.** Testing past the authorized time boundary, or budget corruption (leak/double-spend).
 - **Related threats.** queue abuse, scope escape
 

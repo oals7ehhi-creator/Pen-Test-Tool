@@ -132,11 +132,11 @@ The platform shall canonicalize URLs (case, encoding, dot-segments, default port
 
 > **Verification:** URL-fuzzing/parser tests confirming equivalent obfuscated URLs canonicalize identically and cannot bypass scope.
 
-**FR-019 — IPv4/IPv6 validation and reserved-range blocking**  ·  _priority: must_
+**FR-019 — Two-tier network guard (Tier A hard-deny, Tier B elevated)**  ·  _priority: must_
 
-The platform shall reject localhost/loopback, RFC1918 private ranges, link-local, unique-local (IPv6 ULA), and cloud-metadata addresses (e.g. 169.254.169.254) for both IPv4 and IPv6 unless the operator has explicitly allowlisted them.
+The platform shall permanently block Tier A ranges — loopback, unspecified, cloud-metadata, multicast, broadcast, and reserved/documentation — for both IPv4 and IPv6 by any means (no allowlist entry, elevated flag, or approval), and shall permit Tier B ranges (RFC1918, ULA, link-local, CGNAT) only when an explicit elevated scope entry, a dual-approved restricted-range approval, and authorization-granted internal testing are all present; obfuscated and IPv6 transition encodings are decoded before classification.
 
-> **Verification:** Property-based tests over reserved ranges (v4 and v6) asserting denial by default and allow only when explicitly listed.
+> **Verification:** Table-driven range tests incl. transition forms; assert Tier A unreachable even under a broad/elevated covering entry; assert Tier B reachable only under the full elevation condition.
 
 **FR-020 — Per-engagement concurrency and rate limits**  ·  _priority: must_
 
@@ -184,7 +184,7 @@ The Guarded Egress Broker shall accept egress requests only over an authenticate
 
 The platform shall require dual control (a configurable threshold with a floor of two distinct, role-verified approvers, none being the requester or executing tester, each pinning the plan and authorization-document hash) for authorization attestation and any scope expansion, via an approval_request plus one approval_decision per approver.
 
-> **Verification:** Approval-threshold and separation-of-duties tests: single-actor attest+approve rejected; below-threshold never approved; a decision whose pinned plan hash differs does not count.
+> **Verification:** Approval-threshold and separation-of-duties tests: single-actor attest+approve rejected; below-threshold never approved; a decision whose pinned `manifest_sha256`/`document_sha256` differs does not count.
 
 **FR-063 — Two-tier network guard with elevated internal testing**  ·  _priority: must_
 
@@ -216,11 +216,11 @@ The platform shall reference every request template (check, tool, header-set, pa
 
 > **Verification:** Test that changing template content changes the digest (no silent repoint); that an unknown digest is rejected; and that the same content digest recurs across two jobs without a uniqueness violation.
 
-**FR-070 — Identifiable budget reservations**  ·  _priority: must_
+**FR-070 — Identifiable, owned & fenced budget leases (charge-before-send)**  ·  _priority: must_
 
-The platform shall account request budget with an identifiable reservation ledger keyed by grant jti, with idempotent commit/release and crash-expiry, so that committed (sent) requests never exceed the total and no reservation strands.
+The platform shall account request budget with an identifiable, owned, and fenced reservation ledger keyed by grant jti, running a conservative charge-before-send state machine in which the broker charges a lease (`request_budget_used += 1`, irreversible) in the same transaction as the durable intent, before any byte is sent, so that every sent request is already charged (sent implies charged), charged requests never exceed the total, and no lease strands.
 
-> **Verification:** Idempotent double-commit/double-release no-op tests; crash-after-reserve auto-expiry; concurrency boundary at total-1/total/total+1.
+> **Verification:** sent-implies-charged holds; a re-charge on an already-charged lease is a no-op; a crash in the 'claimed' state is swept (no strand) while a crash around the send leaves a terminal 'charged' lease (conservative over-charge, never sent-but-uncharged); concurrency boundary at total-1/total/total+1; a stale-fence-token charge is rejected.
 
 ### Phase 3
 
@@ -382,9 +382,9 @@ The platform shall run each tool in an isolated container with CPU, memory, time
 
 **FR-049 — Structured, untrusted tool-output handling with normalized schema**  ·  _priority: must_
 
-The platform shall parse structured tool output (not console text), treat it as untrusted input, normalize it to a single finding schema, and retain raw output separately from verified findings.
+The platform shall parse structured tool output (not console text), treat it as untrusted input, and normalize it to a single finding schema; raw tool output is not persisted by default — only minimized, redacted evidence is stored — and any opt-in debug quarantine of raw output is encrypted, role-restricted, size-capped, and short-TTL auto-purged.
 
-> **Verification:** Parser tests with malicious/malformed tool output asserting safe handling; schema-mapping tests; separation of raw vs normalized stores.
+> **Verification:** Parser fuzzing with malformed/adversarial output; assert no raw console text persists by default; quarantine controls (encryption/TTL/role) tested.
 
 **FR-050 — No shell-reaching CLI args and no exploit frameworks**  ·  _priority: must_
 
@@ -682,9 +682,9 @@ Every API endpoint and UI action shall enforce role-based authorization server-s
 
 > **Verification:** Automated per-endpoint authorization coverage test; negative role tests.
 
-**NFR-005 — Worker and tool isolation with default-deny egress**  ·  _target: Egress default-deny; only scope-allowlisted destinations reachable from tool containers._
+**NFR-005 — Worker and tool isolation with default-deny egress**  ·  _target: Egress default-deny; tool/browser sandboxes reach ONLY the Guarded Egress Broker; workers reach only a narrow internal-service allowlist plus the broker; no container has a direct route to any target or the internet._
 
-Workers and integrated tools shall run in isolated containers with a default-deny egress policy allowing only in-scope targets and approved callback/infra hosts.
+The platform shall enforce default-deny egress so that tool/browser sandboxes can reach only the Guarded Egress Broker and workers only a narrow internal-service allowlist plus the broker, with no direct route to any target or the internet from any container.
 
 > **Verification:** Container-isolation and egress tests attempting connections to non-allowlisted hosts and asserting denial.
 
