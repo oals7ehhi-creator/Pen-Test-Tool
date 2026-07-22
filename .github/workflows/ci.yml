@@ -93,6 +93,19 @@ jobs:
           semgrep scan --error --metrics=off --disable-version-check
           --config /src/ci/semgrep-rules.yml
           --exclude node_modules --exclude dist --exclude coverage /src
+      # Adversarial proof that .gitleaks.toml's allowlist is TIGHT: each permitted fixture is suppressed ONLY in its
+      # authorized path and by its exact value; a real secret anywhere else — including on the same line as a
+      # permitted fixture — is still detected. Runs the SAME pinned gitleaks version as the secret-scan gate (8.24.3),
+      # extracted from a digest-pinned container. `if: always()` so this security test is never skipped; it is a hard
+      # gate (the script exits non-zero on any mismatch and is not continue-on-error).
+      - name: Adversarial gitleaks allowlist test (pinned gitleaks 8.24.3)
+        if: always()
+        run: |
+          cid="$(docker create ghcr.io/gitleaks/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055)"
+          docker cp "$cid:/usr/bin/gitleaks" "$RUNNER_TEMP/gitleaks"
+          docker rm "$cid" >/dev/null
+          chmod +x "$RUNNER_TEMP/gitleaks"
+          GITLEAKS="$RUNNER_TEMP/gitleaks" GITLEAKS_CONFIG="$PWD/.gitleaks.toml" bash ci/gitleaks-allowlist-test.sh
 
   # Full-stack container gate: build every image and prove the whole stack (db + api + worker + web) comes up
   # HEALTHY. `--wait` blocks until each service's health check passes (or fails the job on timeout).

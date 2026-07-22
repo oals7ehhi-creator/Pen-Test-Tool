@@ -1,19 +1,35 @@
 title = "pen-test-tool gitleaks configuration"
 
-# Extend the upstream default ruleset (do NOT replace it), then allowlist a SMALL, explicit set of intentional
-# NON-secret fixtures this repository commits on purpose. The scope is deliberately narrow — specific fixture
-# strings and the documented dev-only .env.example placeholder — so a real secret committed anywhere else,
-# INCLUDING in a test file, is still detected. This removes a known false positive without weakening the gate.
+# Secret-scanning config for the production gate (gitleaks-action v3.0.0 → gitleaks 8.24.3) and the adversarial
+# allowlist test. The default ruleset is kept in full and NOT replaced.
+#
+# Why per-rule [[rules.allowlists]] rather than a global [[allowlists]] block: in gitleaks 8.24.3 the *global*
+# allowlist is the singular [allowlist] only — it has no `condition` field (so it silently behaves as OR) and no
+# rule scoping. The modern, AND-capable, rule-scoped allowlist in this version is the per-rule [[rules.allowlists]]
+# form. Re-declaring only the *id* of a default rule merges into it (extend keeps the default regex/entropy/keywords
+# and APPENDS these allowlists); no default rule is disabled or redefined. Attaching the allowlist to the specific
+# triggering rule IS the rule-scoping (there is no `targetRules` field in this version).
+#
+# Each exception below is intentionally tight: condition = "AND" (path AND secret must BOTH match), an anchored
+# exact file path, an anchored exact fixture value, and regexTarget = "secret" (match the extracted secret, never
+# the whole line). So a real secret anywhere else — including elsewhere in these same files or on the same line as
+# a permitted fixture — is still detected. No path is globally excluded.
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Intentional non-secret fixtures: the SI-045 test sentinel that proves the logger never emits it, and the dev-only session-key placeholder."
-regexTarget = "line"
-regexes = [
-  '''S3CR3T-must-never-be-logged''',
-  '''dev-insecure-session-key-change-me-\d+''',
-]
-paths = [
-  '''(^|/)\.env\.example$''',
-]
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "SI-045 test sentinel — the fake value committed only to PROVE the logger never emits it."
+  condition = "AND"
+  regexTarget = "secret"
+  paths = ['''^packages/shared/test/logsafe\.test\.ts$''']
+  regexes = ['''^S3CR3T-must-never-be-logged$''']
+
+  [[rules.allowlists]]
+  description = "Dev-only session-key placeholder (documented non-secret; low entropy, not flagged by the default rules)."
+  condition = "AND"
+  regexTarget = "secret"
+  paths = ['''^\.env\.example$''', '''^docker-compose\.yml$''']
+  regexes = ['''^dev-insecure-session-key-change-me-\d+$''']
