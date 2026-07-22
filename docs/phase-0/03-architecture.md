@@ -186,8 +186,8 @@ Check engine builds an IMMUTABLE, fully-hashed request_spec (spec_sha256 over th
 STAGE 1 — Scope Authority (JUST-IN-TIME): load spec; recompute+verify spec_sha256
         │                        │
         │      DENY ◄────────────┘  (reason recorded; spec stays queued or is dropped)
-        ▼ ALLOW  → re-check scope/auth/window/e-stop over CURRENT state; RESERVE 1 budget unit;
-        │          mint SIGNED, ≤30s, single-use GRANT bound to spec_sha256 (approval ref if intrusive; NO IP)
+        ▼ ALLOW  → re-check scope/auth/window/e-stop over CURRENT state; create a budget_reservation
+        │          (keyed by grant jti); mint SIGNED, ≤30s, single-use GRANT bound to spec_sha256 (NO IP)
         ▼
 Worker presents (per-job identity + grant + spec) to the broker's authenticated ingress
    (the worker does NOT serialize the HTTP request itself)
@@ -196,10 +196,10 @@ Worker presents (per-job identity + grant + spec) to the broker's authenticated 
 STAGE 2 — Guarded Egress Broker:
    auth per-job ingress ─► verify grant (sig/aud/exp/jti single-use) AND grant.spec_sha256==sha256(spec)
    ─► RECONSTRUCT+normalize the request FROM THE SPEC (assert == spec) ─► re-check live state
-   (auth/window/e-stop/rate, fail-closed) ─► resolve DNS ─► check ALL resolved IPs (Tier A/B)
-   ─► PIN validated IP ─► commit request.intent (spec_sha256, jti, reserved unit) BEFORE connect
-   ─► connect to PINNED IP (SNI=orig host) ─► send ─► redirect? new spec + FRESH grant, stop if off-scope
-   ─► request.completed/failed (resolved+pinned IP, redacted); COMMIT budget on send / RELEASE on denial
+   (auth/window/e-stop/rate, fail-closed) ─► commit request.intent (spec_sha256, jti, reservation id)
+   BEFORE ANY EGRESS ─► resolve DNS (first egress) ─► check ALL resolved IPs (Tier A/B) ─► PIN validated IP
+   ─► connect to PINNED IP (TCP+TLS, SNI=orig host) ─► send ─► redirect? new spec + FRESH grant, stop if off-scope
+   ─► request.completed/failed (resolved+pinned IP, redacted); idempotently COMMIT/RELEASE the reservation
         │
         ▼
 Target responds (in-scope only) ──► response returns to worker/sandbox
@@ -286,6 +286,9 @@ Result: there is **no path from UI/API input to a shell**, and **no user-control
 - **ADR-16: The queued object is an immutable, fully-hashed `request_spec`; grants are minted just-in-time.** Short-lived single-use grants cannot be enqueued (they would expire in the queue or force wide TTLs), so the queue holds an immutable `spec_sha256`-hashed spec and the Scope Authority mints a ≤30s grant only at dispatch, after re-verifying the hash and re-checking scope/auth/window/e-stop/budget against current state. Rationale: keeps the grant out of the queue and makes the authorized request tamper-evident. Trade-off: a JIT mint call on the dispatch hot path — acceptable at this platform's low volumes. Design: `04` §7, `10`.
 - **ADR-17: The broker reconstructs and normalizes the request from the signed spec.** The Guarded Egress Broker never sends a worker-serialized request; it rebuilds the wire request deterministically from the immutable spec (method, canonical URL, fixed header-set, inert payload, session-by-reference) and asserts equality. Rationale: a worker cannot inject a deviation between authorization and the wire. Trade-off: the broker owns request construction and the safe header/payload catalogs.
 - **ADR-18: Explicit WebSocket and budget semantics.** ws/wss handshakes are scoped/pinned like HTTP; established connections are bounded by duration/message/size/count caps and terminated on e-stop/window/expiry. Request budget uses reserve-at-mint / commit-on-send / release-on-denial so the sent count never exceeds the total and no unit leaks. Rationale: long-lived sockets and queue-dwell would otherwise escape the per-request scope/time/budget model. Trade-off: per-connection accounting and interlock-driven connection teardown.
+- **ADR-19: Durable intent before any egress + identifiable budget reservations.** `request.intent` is committed before any DNS/TCP/TLS action, in one transaction with a `budget_reservation` row keyed by the grant `jti`; commit/release are idempotent (monotonic state) and crashed reservations auto-expire. Rationale: DNS is itself egress that can leak/fail silently, and a bare counter strands budget on crash. Trade-off: a ledger write on the hot path and a reservation-expiry sweeper. Design: `04` §7.1/§8.1.
+- **ADR-20: Content-addressed templates; repeatable specs.** Every template reference (check, tool, header-set, payload, WS frame-set) is an immutable content digest into `catalog_template`, folded into `spec_sha256`; there is no `UNIQUE(spec_sha256)`, so identical requests recur across jobs/runs as distinct instances. Rationale: mutable ids could be silently repointed after authorization, and legitimate repeats must not collide. Trade-off: a content-addressed catalog and digest bookkeeping. Design: `04` §7.0.
+- **ADR-21: Immutable approval policy + approved-spec manifest; non-null audit-chain identity.** Approval threshold/roles live in an immutable, Administrator-versioned `approval_policy` (not requester fields), and intrusive approvals authorize an explicit manifest of `spec_sha256` digests. Audit chains carry a non-null `chain_id` so per-chain uniqueness is actually enforced for tenant/global streams. Rationale: a requester must not set their own policy, an approval must bind exact requests, and NULL chain keys made the old uniqueness constraint vacuous. Trade-off: policy versioning and an `audit_chain` table. Design: `04` §9/§10.
 
 ---
 

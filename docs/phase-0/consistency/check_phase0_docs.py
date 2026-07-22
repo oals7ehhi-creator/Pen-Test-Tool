@@ -2,177 +2,251 @@
 """
 Machine-checkable consistency checker for the Phase 0 design package (docs 00-11).
 
-This is a DESIGN gate, not application code: it verifies the specification documents
-are internally consistent so contradictions cannot silently accrue as they are edited.
-It is intended to run in CI (Phase 1 onward) and to block a release (Phase 12) on any drift.
+DESIGN gate, not application code: it verifies the specification documents are internally
+consistent so contradictions cannot silently accrue. Intended for CI (Phase 1 onward) and as a
+release gate (Phase 12). Exit 0 = consistent; 1 = one or more problems (printed).
 
-Exit code 0 = consistent; 1 = one or more problems (printed). No third-party deps.
+It also runs a NEGATIVE-FIXTURE self-test (`--selftest`, and always on a normal run): each known-bad
+statement / schema pattern is injected into the corpus and the checker asserts the detector flags it.
+If any bad fixture does NOT produce a problem, the checker is vacuous and exits non-zero. No third-party deps.
 
-Checks:
-  1. No live legacy component names ("ScopeGuard", "scope-validation service") outside
-     explicit historical "(was ...)" notes.
-  2. Safety-invariant index rows == body blocks, contiguous SI-001..SI-NNN, no duplicates.
-  3. Counts claimed in 00-overview (FR, SI) match reality; no duplicate FR/NFR/T/SI ids.
-  4. Internal doc links and backtick file refs (NN-*.md) resolve to files that exist.
-  5. Every SI-/T-/FR-/ADR- cross-reference resolves to a defined id.
-  6. Approval policy tables in 04 (§10) and 09 (RBAC) agree (request_type -> threshold + roles).
-  7. Contradiction scans (all LIVE claims; quoted removed-wording notes excluded):
-       - metadata reachable via allowlist / "exact /32"    (must be gone)
-       - grant/token binds a resolved IP at mint time       (must be gone)
-       - the queued object is a grant / grant enqueued       (must be gone)
-       - budget decremented at enqueue                       (must be gone)
-       - IPv6 address-sum breadth ceiling                    (must be gone)
-  8. Presence of the round-3 model: request_spec, spec_sha256, JIT grant minting,
-     broker reconstruction, reserve/commit/release budget, WebSocket caps.
-  9. Code-fence balance per file.
+Checks (see analyze()): legacy component names; SI index/body parity + contiguity; count parity + dup ids;
+internal links / backtick refs; SI/T/FR cross-references; approval-policy agreement (04 vs 09); contradiction
+scans (metadata-via-exact-/32, grant-binds-IP-at-mint, grant-in-queue, budget-at-enqueue, IPv6 address-sum);
+round-3/4 model presence; round-4 anti-pattern schema checks (UNIQUE spec_sha256, requester policy fields,
+bare reserved-counter budget authority, nullable audit uniqueness, intent-after-DNS ordering, WS catalog);
+code-fence balance.
 """
-import re, os, sys, glob
+import re, os, sys, glob, copy
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 PHASE0 = os.path.dirname(DIR)
-files = sorted(f for f in glob.glob(os.path.join(PHASE0, "*.md")))
-texts = {os.path.basename(f): open(f).read() for f in files}
-allbn = set(texts) | {"README.md"}
-problems, notes = [], []
 
-def has(bn, *subs):  # every substring present in a file
-    t = texts.get(bn, "")
-    return all(s in t for s in subs)
-
-# 1) legacy names
-for bn, t in texts.items():
-    for m in re.finditer(r"ScopeGuard", t):
-        ctx = t[max(0, m.start()-40):m.start()+14]
-        if 'was "ScopeGuard' in ctx or 'ScopeGuard" terminology' in ctx or '/ "ScopeGuard' in ctx:
-            continue
-        problems.append(f"{bn}: live 'ScopeGuard' -> ...{ctx.strip()}...")
-    for m in re.finditer(r"[Ss]cope-[Vv]alidation [Ss]ervice", t):
-        ctx = t[max(0, m.start()-32):m.start()+30]
-        if 'was "scope-validation service"' in ctx or 'earlier "scope-validation service"' in ctx:
-            continue
-        problems.append(f"{bn}: live 'scope-validation service' -> ...{ctx.strip()}...")
-
-# 2) SI index/body parity
-si = texts["05-safety-invariants.md"]
-body = re.findall(r"^### (SI-\d+)$", si, re.M)
-idx  = re.findall(r"^\| (SI-\d+) \|", si, re.M)
-if body != idx:
-    problems.append(f"SI index/body mismatch: {len(idx)} index rows vs {len(body)} blocks")
-nums = [int(x.split('-')[1]) for x in body]
-if nums != list(range(1, len(nums)+1)):
-    problems.append(f"SI ids not contiguous 1..N: {nums}")
-if len(set(body)) != len(body):
-    problems.append("duplicate SI ids in body")
-notes.append(f"SI: {len(body)} blocks == {len(idx)} index rows, contiguous SI-001..SI-{len(body):03d}")
-
-# 3) counts + dup ids
-fr  = re.findall(r"^\*\*(FR-\d+) —", texts["01-requirements.md"], re.M)
-nfr = re.findall(r"^\*\*(NFR-\d+) —", texts["01-requirements.md"], re.M)
-th  = re.findall(r"^### (T-\d+) —", texts["02-threat-model.md"], re.M)
-for label, got, claimpat in [("FR", len(fr), r"\*\*(\d+) FR"), ("SI", len(body), r"\*\*(\d+) absolute")]:
-    src = texts["00-overview.md"] if label == "FR" else texts["05-safety-invariants.md"]
-    c = re.search(claimpat, src)
-    if c and int(c.group(1)) != got:
-        problems.append(f"{label} count: doc claims {c.group(1)} but found {got}")
-for lab, ids in [("FR", fr), ("NFR", nfr), ("T", th), ("SI", body)]:
-    d = [x for x in set(ids) if ids.count(x) > 1]
-    if d:
-        problems.append(f"{lab} duplicate ids: {d}")
-notes.append(f"counts: {len(fr)} FR, {len(nfr)} NFR, {len(th)} threats, {len(body)} SI")
-
-# 4) links / backtick refs
-for bn, t in texts.items():
-    for m in re.finditer(r"\]\(([0-9][0-9A-Za-z\-]*\.md)(#[^)]*)?\)", t):
-        if m.group(1) not in allbn:
-            problems.append(f"{bn}: broken link -> {m.group(1)}")
-    for m in re.finditer(r"`(\d\d-[a-z0-9\-]+\.md)`", t):
-        if m.group(1) not in allbn:
-            problems.append(f"{bn}: broken backtick ref -> {m.group(1)}")
-
-# 5) cross-ref ids exist
-si_set, t_set = set(body), set(th)
-for bn, t in texts.items():
-    for r in re.findall(r"\bSI-(\d+)\b", t):
-        if f"SI-{int(r):03d}" not in si_set:
-            problems.append(f"{bn}: references missing SI-{r}")
-    for r in re.findall(r"\bT-(\d+)\b", t):
-        if f"T-{int(r):03d}" not in t_set:
-            problems.append(f"{bn}: references missing T-{r}")
-
-# 6) approval policy tables agree between 04 §10 and 09
-def approval_policy(t):
-    pol = {}
-    for m in re.finditer(r"\| `(authorization_attestation|scope_expansion|restricted_range_allow|mode_elevation|business_logic_test|intrusive_validation)`[^\n]*?\| (\d+) \| ([^|]+)\|", t):
-        rt, thr, roles = m.group(1), int(m.group(2)), m.group(3)
-        r = set()
-        for role in ("Engagement Manager", "Reviewer", "Administrator", "Tester", "Read-only Auditor"):
-            if role in roles:
-                r.add(role)
-        pol[rt] = (thr, frozenset(r))
-    return pol
-p04 = approval_policy(texts["04-authorization-and-scope-schema.md"])
-p09 = approval_policy(texts["09-rbac-matrix.md"])
-common = set(p04) & set(p09)
-if len(common) < 6:
-    problems.append(f"approval-policy: expected 6 request_types in both 04 and 09, found {len(common)} in common ({sorted(common)})")
-for rt in sorted(common):
-    if p04[rt] != p09[rt]:
-        problems.append(f"approval-policy mismatch for {rt}: 04={p04[rt]} vs 09={p09[rt]}")
-
-# 7) contradiction scans (LIVE assertions only — quoted phrasings and "removed/prevented/hypothetical"
-#    descriptions are not assertions and are excluded).
 DESC = ("removed", "earlier", "revised", "carve-out", "superseded", 'was "', "the earlier",
         "no longer", "phrasings", "stale", "forbid", "no stale", "contradiction", "prevented",
         "were a", "could expire", "if the queued", "removes the", "quoted", "description",
-        "not a grant", "never", "no grant", "just-in-time", "not at enqueue", "cannot sit")
-def live(ctx):
+        "not a grant", "never", "no grant", "just-in-time", "not at enqueue", "cannot sit",
+        "vacuous", "the bug", "fixes", "the old ", "void for", "previously", "would have")
+
+def _live(ctx):
     low = ctx.lower()
     return not any(w in low for w in DESC)
-def quoted(t, start):  # phrase opens with a double-quote just before the match → it's being quoted
-    return '"' in t[max(0, start-3):start]
-def scan(bn, t, pat, label, seg_ok=(), win=120):
+
+def _quoted(t, start):
+    return '"' in t[max(0, start-3):start] or '`' in t[max(0, start-3):start]
+
+def _scan(problems, bn, t, pat, label, seg_ok=(), win=120):
     for m in re.finditer(pat, t, re.I):
-        if quoted(t, m.start()):
+        if _quoted(t, m.start()):
             continue
         seg = m.group(0).lower()
         if any(w in seg for w in seg_ok):
             continue
-        ctx = t[max(0, m.start()-win):m.start()+90]
-        if live(ctx):
-            problems.append(f"{bn}: {label} -> {ctx.strip()[:90]}")
-for bn, t in texts.items():
-    scan(bn, t, r"unless that exact range", "LIVE 'unless that exact range'")
-    scan(bn, t, r"metadata[^.\n]{0,60}(exact-?/32|exact /32|reachable ONLY via)", "LIVE metadata-via-exact-/32", win=140)
-    scan(bn, t, r"(grant|token)\b[^.\n]{0,90}\bbind[a-z]*\b[^.\n]{0,50}resolved IP", "grant binds resolved IP",
-         seg_ok=("no resolved", "never a resolved", "never bind", "not bind", "does not bind", "cannot", "without a resolved"))
-    scan(bn, t, r"enqueues?[^.\n]{0,40}\bgrant\b|\bgrant\b[^.\n]{0,20}in (the|a) queue|queued[^.\n]{0,10}\bgrant\b",
-         "queued-grant contradiction", win=80)
-    scan(bn, t, r"budget[^.\n]{0,30}decrement[^.\n]{0,30}enqueue|enqueue[^.\n]{0,30}decrement", "budget-decremented-at-enqueue")
-    for m in re.finditer(r"max_scope_addresses|address_count[^.\n]*minus exclusions", t):
-        problems.append(f"{bn}: stale IPv6-broken address-sum breadth -> {m.group(0)[:60]}")
+        if _live(t[max(0, m.start()-win):m.start()+90]):
+            problems.append(f"{bn}: {label} -> {t[max(0,m.start()-win):m.start()+90].strip()[:90]}")
 
-# 8) round-3 model present where it must be
-if not has("04-authorization-and-scope-schema.md", "TABLE request_spec", "spec_sha256",
-           "reserved", "reconstruct", "kind='websocket'", "just-in-time"):
-    problems.append("04: missing part of the round-3 model (request_spec / spec_sha256 / reserved / reconstruct / websocket / JIT)")
-if not has("10-request-authorization-flow.md", "spec_sha256", "just-in-time", "reconstruct", "WebSocket"):
-    problems.append("10: missing round-3 model (spec_sha256 / JIT / reconstruct / WebSocket)")
-for sid in ("SI-060", "SI-061", "SI-062", "SI-063"):
-    if sid not in si:
-        problems.append(f"05: missing {sid}")
+def analyze(texts):
+    """Pure function: dict{basename->text} -> list[problem strings]. Used for the real run AND self-test."""
+    problems = []
+    allbn = set(texts) | {"README.md"}
 
-# 9) code-fence balance
-for bn, t in texts.items():
-    if t.count("```") % 2:
-        problems.append(f"{bn}: unbalanced code fences")
+    # 1) legacy names
+    for bn, t in texts.items():
+        for m in re.finditer(r"ScopeGuard", t):
+            ctx = t[max(0, m.start()-40):m.start()+14]
+            if 'was "ScopeGuard' in ctx or 'ScopeGuard" terminology' in ctx or '/ "ScopeGuard' in ctx:
+                continue
+            problems.append(f"{bn}: live 'ScopeGuard'")
+        for m in re.finditer(r"[Ss]cope-[Vv]alidation [Ss]ervice", t):
+            ctx = t[max(0, m.start()-32):m.start()+30]
+            if 'was "scope-validation service"' in ctx or 'earlier "scope-validation service"' in ctx:
+                continue
+            problems.append(f"{bn}: live 'scope-validation service'")
 
-print("=== NOTES ===")
-for n in notes:
-    print("  -", n)
-print("\n=== PROBLEMS ===")
-if problems:
-    for p in problems:
-        print("  x", p)
-    print(f"\n{len(problems)} problem(s).")
-    sys.exit(1)
-print("  none — all Phase 0 consistency checks passed")
+    # 2) SI parity
+    si = texts.get("05-safety-invariants.md", "")
+    body = re.findall(r"^### (SI-\d+)$", si, re.M)
+    idx  = re.findall(r"^\| (SI-\d+) \|", si, re.M)
+    if body and idx and body != idx:
+        problems.append(f"SI index/body mismatch: {len(idx)} vs {len(body)}")
+    if body:
+        nums = [int(x.split('-')[1]) for x in body]
+        if nums != list(range(1, len(nums)+1)):
+            problems.append("SI ids not contiguous")
+        if len(set(body)) != len(body):
+            problems.append("duplicate SI ids")
+
+    # 3) counts + dup ids
+    fr  = re.findall(r"^\*\*(FR-\d+) —", texts.get("01-requirements.md", ""), re.M)
+    nfr = re.findall(r"^\*\*(NFR-\d+) —", texts.get("01-requirements.md", ""), re.M)
+    th  = re.findall(r"^### (T-\d+) —", texts.get("02-threat-model.md", ""), re.M)
+    c = re.search(r"\*\*(\d+) FR", texts.get("00-overview.md", ""))
+    if c and fr and int(c.group(1)) != len(fr):
+        problems.append(f"FR count: doc claims {c.group(1)} but found {len(fr)}")
+    c = re.search(r"\*\*(\d+) absolute", si)
+    if c and body and int(c.group(1)) != len(body):
+        problems.append(f"SI count: doc claims {c.group(1)} but found {len(body)}")
+    for lab, ids in [("FR", fr), ("NFR", nfr), ("T", th), ("SI", body)]:
+        d = [x for x in set(ids) if ids.count(x) > 1]
+        if d:
+            problems.append(f"{lab} duplicate ids: {d}")
+
+    # 4) links / backtick refs
+    for bn, t in texts.items():
+        for m in re.finditer(r"\]\(([0-9][0-9A-Za-z\-]*\.md)(#[^)]*)?\)", t):
+            if m.group(1) not in allbn:
+                problems.append(f"{bn}: broken link -> {m.group(1)}")
+        for m in re.finditer(r"`(\d\d-[a-z0-9\-]+\.md)`", t):
+            if m.group(1) not in allbn:
+                problems.append(f"{bn}: broken backtick ref -> {m.group(1)}")
+
+    # 5) cross-ref ids
+    si_set, t_set = set(body), set(th)
+    for bn, t in texts.items():
+        for r in re.findall(r"\bSI-(\d+)\b", t):
+            if si_set and f"SI-{int(r):03d}" not in si_set:
+                problems.append(f"{bn}: references missing SI-{r}")
+        for r in re.findall(r"\bT-(\d+)\b", t):
+            if t_set and f"T-{int(r):03d}" not in t_set:
+                problems.append(f"{bn}: references missing T-{r}")
+
+    # 6) approval-policy agreement 04 vs 09
+    def pol(t):
+        out = {}
+        for m in re.finditer(r"\| `(authorization_attestation|scope_expansion|restricted_range_allow|mode_elevation|business_logic_test|intrusive_validation)`[^\n]*?\| (\d+) \| ([^|]+)\|", t):
+            roles = frozenset(r for r in ("Engagement Manager", "Reviewer", "Administrator") if r in m.group(3))
+            out[m.group(1)] = (int(m.group(2)), roles)
+        return out
+    p04, p09 = pol(texts.get("04-authorization-and-scope-schema.md", "")), pol(texts.get("09-rbac-matrix.md", ""))
+    common = set(p04) & set(p09)
+    if p04 and p09 and len(common) < 6:
+        problems.append(f"approval-policy: {len(common)} common request_types (expected 6)")
+    for rt in sorted(common):
+        if p04[rt] != p09[rt]:
+            problems.append(f"approval-policy mismatch {rt}: 04={p04[rt]} 09={p09[rt]}")
+
+    # 7) contradiction scans
+    for bn, t in texts.items():
+        _scan(problems, bn, t, r"unless that exact range", "LIVE 'unless that exact range'")
+        _scan(problems, bn, t, r"metadata[^.\n]{0,60}(exact-?/32|exact /32|reachable ONLY via)", "LIVE metadata-via-exact-/32", win=140)
+        _scan(problems, bn, t, r"(grant|token)\b[^.\n]{0,90}\bbind[a-z]*\b[^.\n]{0,50}resolved IP", "grant binds resolved IP",
+              seg_ok=("no resolved", "never a resolved", "never bind", "not bind", "does not bind", "cannot", "without a resolved"))
+        _scan(problems, bn, t, r"enqueues?[^.\n]{0,40}\bgrant\b|\bgrant\b[^.\n]{0,20}in (the|a) queue|queued[^.\n]{0,10}\bgrant\b", "queued-grant contradiction", win=80)
+        _scan(problems, bn, t, r"budget[^.\n]{0,30}decrement[^.\n]{0,30}enqueue|enqueue[^.\n]{0,30}decrement", "budget-decremented-at-enqueue")
+        for m in re.finditer(r"max_scope_addresses|address_count[^.\n]*minus exclusions", t):
+            if not _quoted(t, m.start()):
+                problems.append(f"{bn}: stale IPv6 address-sum breadth -> {m.group(0)[:50]}")
+
+    # 8) round-3/4 model presence
+    a = texts.get("04-authorization-and-scope-schema.md", "")
+    for needle in ("TABLE request_spec", "spec_sha256", "TABLE budget_reservation", "TABLE audit_chain",
+                   "TABLE approval_policy", "TABLE approval_manifest_entry", "TABLE catalog_template",
+                   "reconstruct", "kind='websocket'", "just-in-time", "ws_frame_set_digest", "chain_id"):
+        if needle not in a:
+            problems.append(f"04: missing round-3/4 model token: {needle}")
+    for sid in ("SI-060", "SI-061", "SI-062", "SI-063", "SI-064", "SI-065"):
+        if si and sid not in si:
+            problems.append(f"05: missing {sid}")
+
+    # 9) round-4 ANTI-PATTERN schema checks (these MUST NOT appear as live schema)
+    #    UNIQUE(tenant_id, spec_sha256) would block legitimate repeats across jobs/runs.
+    #    Skip SQL-comment lines (start with --) and explicit negations ("NO UNIQUE ...").
+    for m in re.finditer(r"UNIQUE\s*\(\s*tenant_id,\s*spec_sha256\s*\)", a):
+        line = a[a.rfind("\n", 0, m.start())+1 : a.find("\n", m.start())]
+        if line.lstrip().startswith("--") or "NO UNIQUE" in line:
+            continue
+        problems.append("04: anti-pattern UNIQUE(tenant_id, spec_sha256) blocks repeatable specs")
+    #    requester-supplied threshold/roles on approval_request (must live in approval_policy)
+    if re.search(r"required_approvals INT NOT NULL CHECK \(required_approvals BETWEEN 1 AND 5\),\s*--[^\n]*threshold; see policy", a):
+        problems.append("04: anti-pattern requester-supplied required_approvals on approval_request")
+    #    bare reserved-INT budget authority in the runtime counter (must be the ledger)
+    if re.search(r"reserved\s+INT NOT NULL DEFAULT 0,\s*--[^\n]*reserved at JIT", a):
+        problems.append("04: anti-pattern bare `reserved INT` budget authority (use budget_reservation ledger)")
+    #    audit uniqueness on nullable (stream,tenant,engagement,seq) without chain_id
+    if re.search(r"UNIQUE \(stream, tenant_id, engagement_id, seq\)", a):
+        problems.append("04: anti-pattern audit UNIQUE over nullable keys (use non-null chain_id)")
+    #    §7.1 ordering: request.intent must come BEFORE 'RESOLUTION'/'RESOLVE DNS' in the Stage-2 procedure
+    proc = re.search(r"STAGE 2 — GUARDED EGRESS BROKER.*?```", a, re.S)
+    if proc:
+        pt = proc.group(0)
+        i_intent = pt.find("AUDIT INTENT")
+        i_dns = pt.find("DNS RESOLUTION")
+        if i_intent == -1 or i_dns == -1 or i_intent > i_dns:
+            problems.append("04 §7.1: request.intent is NOT ordered before DNS resolution (intent must precede any egress)")
+    #    WebSocket must be catalog-controlled
+    if "ws_frame_set" not in a or "frame gate" not in a and "outside that set" not in a:
+        problems.append("04: WebSocket outbound frames not shown as catalog-controlled")
+
+    # 10) code-fence balance
+    for bn, t in texts.items():
+        if t.count("```") % 2:
+            problems.append(f"{bn}: unbalanced code fences")
+    return problems
+
+
+# Negative fixtures: (label, mutator). Each mutator injects a KNOWN-BAD pattern; analyze() MUST then
+# report at least one MORE problem than the clean corpus, proving the detector is not vacuous.
+NEG_FIXTURES = [
+    ("live ScopeGuard name",
+     lambda x: _sub(x, "03-architecture.md", x["03-architecture.md"] + "\nThe ScopeGuard client dials the target directly.\n")),
+    ("metadata via exact /32 (live)",
+     lambda x: _sub(x, "05-safety-invariants.md", x["05-safety-invariants.md"] + "\nCloud metadata is reachable via an exact /32 elevated allow entry.\n")),
+    ("grant binds resolved IP at mint (live)",
+     lambda x: _sub(x, "10-request-authorization-flow.md", x["10-request-authorization-flow.md"] + "\nThe Stage-1 grant binds the resolved IP at mint time.\n")),
+    ("grant enqueued (live)",
+     lambda x: _sub(x, "03-architecture.md", x["03-architecture.md"] + "\nThe API enqueues the job and grant together in one transaction.\n")),
+    ("budget decremented at enqueue (live)",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md", x["04-authorization-and-scope-schema.md"] + "\nBudget is decremented at enqueue time by the scheduler.\n")),
+    ("UNIQUE(tenant_id, spec_sha256) schema anti-pattern",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md", x["04-authorization-and-scope-schema.md"] + "\n  UNIQUE (tenant_id, spec_sha256),\n")),
+    ("audit uniqueness on nullable keys",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md", x["04-authorization-and-scope-schema.md"] + "\n  UNIQUE (stream, tenant_id, engagement_id, seq),\n")),
+    ("IPv6 address-sum breadth (max_scope_addresses)",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md", x["04-authorization-and-scope-schema.md"] + "\n  max_scope_addresses BIGINT NOT NULL,\n")),
+    ("SI count mismatch",
+     lambda x: _sub(x, "05-safety-invariants.md", x["05-safety-invariants.md"].replace("**65 absolute", "**64 absolute", 1))),
+    ("broken cross-reference SI-999",
+     lambda x: _sub(x, "06-acceptance-criteria.md", x["06-acceptance-criteria.md"] + "\nSee SI-999 for details.\n")),
+]
+
+def _sub(d, key, val):
+    d = dict(d); d[key] = val; return d
+
+def selftest(clean_texts, base_problems):
+    failures = []
+    for label, mut in NEG_FIXTURES:
+        got = analyze(mut(clean_texts))
+        if len(got) <= len(base_problems):
+            failures.append(f"NEGATIVE FIXTURE NOT DETECTED: {label} (checker produced no extra problem)")
+    return failures
+
+
+def main():
+    texts = {os.path.basename(f): open(f).read() for f in sorted(glob.glob(os.path.join(PHASE0, "*.md")))}
+    problems = analyze(texts)
+    si = texts.get("05-safety-invariants.md", "")
+    nb = len(re.findall(r"^### SI-\d+$", si, re.M))
+    nfr = len(re.findall(r"^\*\*FR-\d+ —", texts.get("01-requirements.md", ""), re.M))
+    nt = len(re.findall(r"^### T-\d+ —", texts.get("02-threat-model.md", ""), re.M))
+    print("=== NOTES ===")
+    print(f"  - counts: {nfr} FR, {nt} threats, {nb} SI (index rows: {texts.get('05-safety-invariants.md','').count(chr(10)+'| SI-')})")
+
+    self_failures = selftest(texts, problems)
+    print("=== NEGATIVE-FIXTURE SELF-TEST ===")
+    if self_failures:
+        for f in self_failures:
+            print("  x", f)
+    else:
+        print(f"  ok — all {len(NEG_FIXTURES)} bad fixtures produce a failing exit code")
+
+    print("=== PROBLEMS ===")
+    all_bad = problems + self_failures
+    if all_bad:
+        for p in problems:
+            print("  x", p)
+        print(f"\n{len(all_bad)} problem(s).")
+        sys.exit(1)
+    print("  none — all Phase 0 consistency checks passed")
+
+if __name__ == "__main__":
+    main()

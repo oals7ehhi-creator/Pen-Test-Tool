@@ -1,7 +1,7 @@
 # Phase 0 — Safety Invariants
 > **Phase 0 design artifact — no implementation code.** This document is part of the Phase 0 requirements & threat-model package for an *authorized, non-destructive* defensive web-application security assessment platform. It is subordinate to the safety model: every control described here is intended to be enforced **technically**, not by warning.
 
-**63 absolute, machine-checkable safety invariants (SI-###).** Each is a property that automated tests MUST enforce and that the release pipeline MUST fail on if violated (NFR + Phase 10 gate). SI-041–SI-052 were added during the first adversarial design review; SI-053–SI-059 during the second (blockers 1–10); SI-060–SI-063 during the third (immutable request-spec + JIT grants, broker reconstruction, budget/window semantics, WebSocket). See `08-design-review-and-critique-resolution.md`.
+**65 absolute, machine-checkable safety invariants (SI-###).** Each is a property that automated tests MUST enforce and that the release pipeline MUST fail on if violated (NFR + Phase 10 gate). SI-041–SI-052 were added during the first adversarial design review; SI-053–SI-059 during the second (blockers 1–10); SI-060–SI-063 during the third (immutable request-spec + JIT grants, broker reconstruction, budget/window, WebSocket); SI-064–SI-065 during the fourth (immutable approval policy + approved-spec manifest, content-addressed repeatable templates). See `08-design-review-and-critique-resolution.md`.
 
 > **Release rule:** if any SI-### test fails or is missing, the build fails and no release is cut. Safety invariants are not advisory.
 
@@ -25,7 +25,7 @@
 | SI-014 | Automatic circuit breakers MUST trip and halt an engagement (or a specific check/target) when tested thresholds are exceeded — tar… | queue abuse |
 | SI-015 | The number of concurrent in-flight outbound requests per engagement MUST never exceed the engagement's configured concurrency ceil… | queue abuse |
 | SI-016 | The outbound request rate per engagement MUST never exceed the configured requests-per-interval ceiling measured over any sliding… | queue abuse |
-| SI-017 | Each engagement and run has a finite total request budget enforced by a reserve-at-grant-mint / commit-on-send / release-on-denial… | queue abuse |
+| SI-017 | Each engagement and run has a finite total request budget enforced by an identifiable `budget_reservation` ledger: a just-in-time… | queue abuse |
 | SI-018 | No action classified as intrusive, active-injection, or destructive-class MAY execute unless a stored approval record exists that… | scope escape, command injection |
 | SI-019 | The system MUST be structurally incapable of emitting destructive payloads: request bodies/parameters are constructed only from a… | command injection, scope escape |
 | SI-020 | Approval records and their bound plan hashes are immutable once created; any modification to the plan (target, request, payload, s… | scope escape, cross-tenant access |
@@ -63,15 +63,17 @@
 | SI-052 | Offline vulnerability / SCA feeds MUST be ingested out-of-band via a checksum/signature-verified control-plane step (never worker… | supply-chain compromise, malicious scanner output |
 | SI-053 | The egress grant MUST be single-use (its `jti` consumed exactly once), short-lived (bounded TTL), and audience-bound to one Guarde… | scope escape, SSRF |
 | SI-054 | Tool and headless-browser sandboxes MUST have the Guarded Egress Broker as their ONLY reachable network next hop (no internal-serv… | scope escape, SSRF, unsafe plugin execution |
-| SI-055 | A durable `request.intent` audit event MUST be committed BEFORE the Guarded Egress Broker opens the socket, and a `request.complet… | scope escape, malicious scanner output |
+| SI-055 | A durable `request.intent` audit event MUST be committed BEFORE any outbound network action for the request — before any DNS query… | scope escape, malicious scanner output |
 | SI-056 | Events with no engagement (login/logout, user/role changes, tenant retention changes) and no tenant (global emergency stop, tool-i… | cross-tenant access, scope escape, report-data exposure |
 | SI-057 | Raw external-tool output and raw target response bodies MUST NOT be persisted by default; findings carry only minimized, allowlist… | secret leakage, report-data exposure |
 | SI-058 | Secure deletion of an engagement's data MUST be achieved by destroying its per-engagement Data Encryption Key (cryptographic erasu… | report-data exposure, cross-tenant access, secret leakage |
 | SI-059 | Broad or expanding scope MUST be limited technically and gated by elevated dual approval: CIDR entries broader than the engagement… | scope escape |
 | SI-060 | The object placed on the job queue MUST be an immutable, fully-hashed `request_spec` (`spec_sha256` over all request-determining f… | scope escape, queue abuse |
 | SI-061 | The Guarded Egress Broker MUST reconstruct and normalize the outbound request deterministically from the signed immutable spec (me… | scope escape, command injection |
-| SI-062 | Budget accounting MUST use reserve-at-grant-mint / commit-on-send / release-on-denial with no leaked reservation, and testing-wind… | queue abuse, scope escape |
+| SI-062 | Budget reservations MUST be identifiable (one `budget_reservation` per grant `jti`) with idempotent commit/release and crash-expir… | queue abuse, scope escape |
 | SI-063 | WebSocket (`ws`/`wss`) connections MUST be authorized, scoped, resolved, and IP-pinned at the handshake exactly like an HTTP reque… | scope escape, queue abuse |
+| SI-064 | Approval thresholds and eligible approver roles MUST be read from an immutable, Administrator-managed, versioned `approval_policy`… | scope escape, cross-tenant access |
+| SI-065 | Every security/request-context reference in a `request_spec` (check, tool template, header-set, payload, WebSocket frame-set) MUST… | scope escape, command injection, supply-chain compromise |
 
 ## Invariants
 
@@ -237,12 +239,12 @@
 
 ### SI-017
 
-**Each engagement and run has a finite total request budget enforced by a reserve-at-grant-mint / commit-on-send / release-on-denial protocol: a just-in-time grant is minted only if `request_budget_used + reserved < request_budget_total` (reserving one unit atomically); a sent request commits the unit (`reserved -= 1; used += 1`); any pre-send denial or failure releases it. The number of requests actually sent MUST never exceed `request_budget_total`, and no reserved unit may leak.**
+**Each engagement and run has a finite total request budget enforced by an identifiable `budget_reservation` ledger: a just-in-time grant-mint inserts exactly one reservation row keyed by the grant `jti` only if availability (`total − used − live reservations`) > 0; a sent request idempotently commits it (`used += 1`); a pre-send denial idempotently releases it; a crashed worker's reservation auto-expires. The number of committed (sent) requests MUST never exceed `request_budget_total`, and no reservation may strand.**
 
-- **Rationale.** A hard cap on total volume bounds worst-case impact even if rate/concurrency are individually within limits. Reserving at mint and committing only on send means the cap is never exceeded under concurrency and no budget is consumed by a request that is never sent.
-- **Enforcement point.** `engagement_runtime_counter.reserved` + `request_budget_used`; the Scope Authority reserves atomically at grant-mint; the Guarded Egress Broker commits on send / releases on any pre-send denial (see SI-062 for the JIT window/expiry re-checks bundled with reservation).
-- **Test approach.** Integration test asserting total *sent* requests never exceed the budget across concurrent workers; boundary at total-1/total/total+1; race test for atomic reserve/commit; fault-injection killing a worker after reserve but before send asserts the unit is released, not stranded.
-- **Violation impact.** Unbounded or under-counted scan volume; runaway crawls; excess target load and cost.
+- **Rationale.** A bare counter cannot be committed/released idempotently and strands budget when a worker crashes between reserve and send. An identifiable ledger with monotonic state gives idempotent commit/release and crash-expiry, so the cap holds exactly under concurrency, retries, and crashes.
+- **Enforcement point.** `budget_reservation` (one row per grant `jti`) with monotonic `reserved→committed`/`reserved→released` transitions and a crash-expiry sweeper (`04` §8.1); the Scope Authority reserves at mint, the Guarded Egress Broker commits on send / releases on denial.
+- **Test approach.** Total *committed* never exceeds the budget under concurrency (boundary total-1/total/total+1); a double commit and a double release are each no-ops (idempotent); killing a worker after reserve but before send leaves the unit reclaimed by expiry, not stranded; a race for the last unit admits exactly one.
+- **Violation impact.** Unbounded or under-counted scan volume; runaway crawls; stranded budget starving an engagement.
 - **Related threats.** queue abuse
 
 ### SI-018
@@ -327,12 +329,12 @@
 
 ### SI-026
 
-**The audit trail MUST be append-only and tamper-evident (hash-chained/sequence-linked so any insertion, deletion, or modification is detectable), and every safety-relevant action — scope decision, request issued/blocked, approval, e-stop, expiry halt, config change, login, data export — MUST produce exactly one corresponding immutable audit event.**
+**The audit trail MUST be append-only and tamper-evident (hash-chained/sequence-linked so any insertion, deletion, or modification is detectable), and every safety-relevant action — scope decision, request intent/completion, approval, e-stop, expiry halt, config change, login, data export — MUST produce exactly one corresponding immutable audit event. Every chain MUST have a NON-NULL identity (`audit_chain.chain_id`), and per-chain `seq`/`event_hash` uniqueness MUST be enforced on that non-null key.**
 
-- **Rationale.** Tamper-evidence and completeness are prerequisites for trusting that the other invariants held in production and for post-incident reconstruction.
-- **Enforcement point.** Audit service with hash-chained events (each event references the prior event's hash); write-once storage semantics; instrumentation hooks at every safety-relevant action site.
-- **Test approach.** Integration test asserting each safety-relevant action emits exactly one event with correct linkage. Tamper test: modify/delete/reorder a stored event and assert chain verification fails. Coverage test enumerating action types and asserting none is unlogged. Property-based test on chain verification.
-- **Violation impact.** Undetectable tampering and inability to prove authorized, in-scope operation — destroys accountability and the tamper-evidence guarantee.
+- **Rationale.** Tamper-evidence and completeness are prerequisites for trusting that the other invariants held. A per-chain uniqueness constraint over columns that are NULL for tenant/global streams is vacuous in SQL (NULLs compare distinct), so a non-null `chain_id` is required for the constraint to actually enforce one event per (chain, seq).
+- **Enforcement point.** `audit_chain` (non-null `chain_key`/`id`) + `audit_event.chain_id NOT NULL` with `UNIQUE(chain_id, seq)` and `UNIQUE(chain_id, event_hash)`; hash-chained per chain; write-once storage; instrumentation at every safety-relevant action site (`04` §9).
+- **Test approach.** Each safety-relevant action emits exactly one event with correct linkage; tamper/reorder/delete on any chain (including tenant and global) fails verification; a coverage test enumerates action types; a negative test proves two events with the same `seq` on a tenant/global chain are REJECTED (the bug the non-null `chain_id` fixes).
+- **Violation impact.** Undetectable tampering or duplicate/forked chains — destroys accountability, especially for platform/tenant governance events.
 - **Related threats.** scope escape, cross-tenant access, malicious scanner output
 
 ### SI-027
@@ -617,12 +619,12 @@
 
 ### SI-055
 
-**A durable `request.intent` audit event MUST be committed BEFORE the Guarded Egress Broker opens the socket, and a `request.completed`/`request.failed` event committed after; a request that cannot durably record its intent is not sent, and intent and completion are linked so a crash mid-request still leaves a provable "attempted" record.**
+**A durable `request.intent` audit event MUST be committed BEFORE any outbound network action for the request — before any DNS query, TCP connect, or TLS handshake — in the same transaction as the budget reservation; a request that cannot durably record its intent performs NO egress. It records `spec_sha256`, the grant `jti`, the reservation id, and the canonical target; the completion event references it (same chain) and idempotently commits or releases the reservation.**
 
-- **Rationale.** Write-then-act (extending SI-027) plus a two-part record means no request can outrun its audit trail and a crash between send and completion cannot erase the fact that a request was attempted — essential for non-repudiation of exactly what was contacted.
-- **Enforcement point.** Guarded Egress Broker audit ordering: `request.intent` durably committed pre-send; `request.completed`/`request.failed` post-send with `related_event_id` linkage (`04` §9).
-- **Test approach.** Fault-inject a crash after intent and before send → the intent event is durably present, no completion exists, and no socket write occurred. Make the audit sink fail → the send is blocked. Assert no send timestamp precedes its intent event's durable commit.
-- **Violation impact.** Silent or unprovable requests; a blind spot in the tamper-evident record.
+- **Rationale.** DNS resolution is itself egress that can leak the target or fail silently; committing intent before ANY packet leaves the box means nothing is ever contacted without a prior durable record, and the shared transaction means a crash can neither egress-without-record nor leak a reserved unit.
+- **Enforcement point.** Guarded Egress Broker ordering (`04` §7.1 step 10 before step 11): intent + reservation commit precedes the first resolver call; a failed audit write blocks all egress including DNS.
+- **Test approach.** Fault-inject a crash after intent and before DNS → the intent event is durably present and a packet-capture shows ZERO egress (no DNS, no SYN). Make the audit sink fail → no DNS query is issued. Assert no resolver call precedes the intent commit.
+- **Violation impact.** A target contacted (even via DNS) with no durable record — a blind spot in the tamper-evident trail.
 - **Related threats.** scope escape, malicious scanner output
 
 ### SI-056
@@ -687,20 +689,40 @@
 
 ### SI-062
 
-**Budget accounting MUST use reserve-at-grant-mint / commit-on-send / release-on-denial with no leaked reservation, and testing-window, authorization-expiry, and emergency-stop MUST be re-evaluated at just-in-time grant-mint AND again at Stage 2; a spec that waited in the queue past its window or expiry gets no grant, and a fired emergency-stop or expiry releases reservations and aborts in-flight work (including WebSocket connections).**
+**Budget reservations MUST be identifiable (one `budget_reservation` per grant `jti`) with idempotent commit/release and crash-expiry, so a crashed or retried worker can neither double-spend nor strand budget; and testing-window, authorization-expiry, and emergency-stop MUST be re-evaluated at just-in-time grant-mint AND again at Stage 2, with a fired interlock releasing reservations and aborting in-flight work (HTTP and WebSocket).**
 
-- **Rationale.** Because the queued object can wait arbitrarily long, the time-based interlocks must be checked at the last possible moment (JIT mint) and re-checked at the broker; and reservations must never strand or double-spend under crash/concurrency.
-- **Enforcement point.** Scope Authority JIT re-check (`04` §7.1 Stage-1 step 0) + `engagement_runtime_counter.reserved`; Guarded Egress Broker Stage-2 re-check + commit/release; interlock handlers abort in-flight HTTP and WS.
-- **Test approach.** A spec dwelling in the queue past window-close or expiry receives no grant. E-stop or expiry mid-scan releases all reservations and aborts in-flight requests and WebSocket connections within the bound. Fault-injection asserts no reservation is stranded after a crash.
+- **Rationale.** Because the queued spec can wait arbitrarily long, the time interlocks must be checked at the last possible moment (JIT mint) and again at the broker; and reservations must survive crashes without leaking or double-counting.
+- **Enforcement point.** `budget_reservation` idempotent transitions + sweeper (`04` §8.1); Scope Authority JIT re-check; Guarded Egress Broker Stage-2 re-check; interlock handlers release reservations and abort in-flight HTTP + WebSocket.
+- **Test approach.** A spec dwelling past window-close or expiry gets no grant; e-stop/expiry mid-scan releases reservations and aborts in-flight requests and WebSocket connections within the bound; a crash leaves no stranded reservation (expiry reclaims it); idempotent commit/release verified under retry.
 - **Violation impact.** Testing past the authorized time boundary, or budget corruption (leak/double-spend).
 - **Related threats.** queue abuse, scope escape
 
 ### SI-063
 
-**WebSocket (`ws`/`wss`) connections MUST be authorized, scoped, resolved, and IP-pinned at the handshake exactly like an HTTP request; the established connection MUST be bounded by per-connection duration, message-count, and message-size caps and a per-engagement connection cap, MUST NOT change target after the pinned handshake, and MUST be terminated (not merely blocked-for-new) on emergency stop, testing-window close, or authorization expiry.**
+**WebSocket (`ws`/`wss`) connections MUST be authorized, scoped, resolved, and IP-pinned at the handshake exactly like an HTTP request; the established connection MUST be bounded by per-connection duration, message-count, and message-size caps and a per-engagement connection cap, MUST NOT change target after the pinned handshake, and MUST be terminated on emergency stop, window close, or expiry. Outbound frames MUST be drawn ONLY from an approved, content-addressed inert frame set (a `ws_frame_set` `catalog_template` named by `spec.ws_frame_set_digest`); the broker CANNOT emit a frame outside that set, and any non-catalog frame requires an approval manifest.**
 
-- **Rationale.** A WebSocket is long-lived and bidirectional; without explicit handling it would escape the per-request scope/budget/time model and could run past interlocks.
-- **Enforcement point.** `kind='websocket'` `request_spec` (handshake authorized via the two-stage flow); Guarded Egress Broker handshake scoping + IP pin + connection caps (`04` §7.2, §8: `max_ws_connections`, `ws_max_duration_s`, `ws_max_messages`, `ws_max_message_bytes`); interlock handlers terminate active connections.
-- **Test approach.** An out-of-scope WS handshake is denied. An established WS exceeding the duration/message-count/message-size cap is closed. E-stop / window-close / expiry aborts active WS connections within the bound. Assert an established socket cannot be re-pointed at a different host/IP.
-- **Violation impact.** A long-lived channel escaping scope, budget, or the authorized time window.
+- **Rationale.** A WebSocket is long-lived and bidirectional; without an approved, content-addressed frame catalog the platform could send arbitrary (possibly destructive or high-volume) frames, and without connection bounds it could escape the per-request scope/budget/time model.
+- **Enforcement point.** `kind='websocket'` `request_spec` with `ws_frame_set_digest` into `catalog_template`; Guarded Egress Broker handshake scoping + IP pin + per-connection caps + a frame gate that admits only catalog frames (`04` §7.2, §8); interlock handlers terminate active connections.
+- **Test approach.** An out-of-scope handshake is denied; an established WS exceeding a duration/message-count/message-size cap is closed; e-stop/window/expiry aborts active connections; a frame NOT in the approved set is refused by the broker; a non-catalog frame is only sendable under an approval manifest; an established socket cannot be re-pointed.
+- **Violation impact.** A long-lived channel escaping scope/budget/time, or the platform emitting arbitrary/destructive frames.
 - **Related threats.** scope escape, queue abuse
+
+### SI-064
+
+**Approval thresholds and eligible approver roles MUST be read from an immutable, Administrator-managed, versioned `approval_policy` (referenced by `approval_policy_id`, pinned by `policy_digest`) — never from requester-supplied fields — and an approval MUST authorize only the explicit, content-addressed set of `request_spec` digests recorded in its `approval_manifest_entry` rows (hashed as `manifest_sha256`); Stage-1 mints a grant only if the spec's digest is in that manifest and the policy threshold is met.**
+
+- **Rationale.** If a requester could set the threshold or eligible roles, or approve a free-form plan, dual control is defeatable by the very insider it targets. Threshold/roles live in an immutable Admin-managed table, and the approval binds an explicit, content-addressed manifest of exact spec digests.
+- **Enforcement point.** `approval_policy` immutable (UPDATE/DELETE revoked; Administrator-only writes); `approval_request` has NO `required_approvals`/`approver_roles` columns and references the policy by id; `approval_manifest_entry` + `manifest_sha256`; §7 Stage-1 step (h) checks manifest membership (`04` §10).
+- **Test approach.** There is no request field to set threshold/roles (schema check); an intrusive grant is refused when `spec_sha256` is not a manifest entry; changing the manifest or the policy version voids prior decisions; a non-Administrator cannot create/version `approval_policy`.
+- **Violation impact.** Self-set approval policy or approval of an unpinned request — insider scope escape with a veneer of legitimacy.
+- **Related threats.** scope escape, cross-tenant access
+
+### SI-065
+
+**Every security/request-context reference in a `request_spec` (check, tool template, header-set, payload, WebSocket frame-set) MUST be an immutable content digest into `catalog_template`, and ALL such digests MUST be folded into `spec_sha256`; catalog templates are immutable and content-addressed. A `request_spec` MUST be repeatable across jobs/runs — `spec_sha256` is a reusable content digest that excludes `run_id`/`job_id`/`session_ref` and carries no uniqueness constraint — and a repeat is a distinct instance with its own single-use grant, not a replay.**
+
+- **Rationale.** Referencing templates by mutable ids would let a benign-looking id be silently repointed to a different payload/header/frame after authorization. Content digests make the whole request tamper-evident; excluding instance identity from the digest lets the same logical request legitimately recur without a false uniqueness collision.
+- **Enforcement point.** `catalog_template` (content-addressed, immutable); `request_spec` digest columns are FKs into it and are part of `spec_sha256`; NO `UNIQUE(tenant_id, spec_sha256)` (`04` §7.0).
+- **Test approach.** Changing a template's content changes its digest (so a changed template is a new spec, never a silent swap); a spec referencing an unknown digest is rejected; the same content digest recurs across two jobs/runs without a uniqueness violation and each gets its own single-use grant.
+- **Violation impact.** A silently repointed template sends a different request than was authorized; or a false uniqueness collision blocks a legitimate retest/repeat.
+- **Related threats.** scope escape, command injection, supply-chain compromise

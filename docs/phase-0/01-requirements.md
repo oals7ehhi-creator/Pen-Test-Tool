@@ -1,7 +1,7 @@
 # Phase 0 — Functional & Non-Functional Requirements
 > **Phase 0 design artifact — no implementation code.** This document is part of the Phase 0 requirements & threat-model package for an *authorized, non-destructive* defensive web-application security assessment platform. It is subordinate to the safety model: every control described here is intended to be enforced **technically**, not by warning.
 
-**67 functional requirements (FR-###)** and **37 non-functional requirements (NFR-###)**, each atomic, traceable, and verifiable. Functional requirements are grouped by their primary owning phase; non-functional requirements by category. Priority uses MoSCoW (must / should / could).
+**71 functional requirements (FR-###)** and **37 non-functional requirements (NFR-###)**, each atomic, traceable, and verifiable. Functional requirements are grouped by their primary owning phase; non-functional requirements by category. Priority uses MoSCoW (must / should / could).
 
 ## Functional Requirements
 
@@ -10,10 +10,10 @@
 | Phase | Requirement IDs |
 |---|---|
 | Phase 1 | FR-001, FR-002, FR-003, FR-004 |
-| Phase 2 | FR-005, FR-006, FR-007, FR-008, FR-009, FR-010, FR-011, FR-012, FR-013, FR-014, FR-015, FR-016, FR-017, FR-018, FR-019, FR-020, FR-021, FR-022, FR-023, FR-024, FR-025, FR-061, FR-062, FR-063, FR-064, FR-065 |
+| Phase 2 | FR-005, FR-006, FR-007, FR-008, FR-009, FR-010, FR-011, FR-012, FR-013, FR-014, FR-015, FR-016, FR-017, FR-018, FR-019, FR-020, FR-021, FR-022, FR-023, FR-024, FR-025, FR-061, FR-062, FR-063, FR-064, FR-065, FR-068, FR-069, FR-070 |
 | Phase 3 | FR-026, FR-027, FR-028, FR-029, FR-030, FR-031, FR-032 |
 | Phase 4 | FR-033, FR-034, FR-035, FR-036, FR-037, FR-038 |
-| Phase 5 | FR-039, FR-040, FR-041, FR-042, FR-043, FR-044, FR-045, FR-046, FR-066 |
+| Phase 5 | FR-039, FR-040, FR-041, FR-042, FR-043, FR-044, FR-045, FR-046, FR-066, FR-071 |
 | Phase 6 | FR-047, FR-048, FR-049, FR-050 |
 | Phase 7 | FR-051, FR-052, FR-053, FR-054 |
 | Phase 8 | FR-055, FR-056 |
@@ -104,9 +104,9 @@ The platform shall support importing and exporting scope configurations in a str
 
 **FR-014 — Pre-flight scope validation on every request**  ·  _priority: must_
 
-The platform shall authorize every outbound target request through a two-stage flow: the central Scope Authority evaluates scope/authorization/mode/window/budget and mints a signed, single-use, audience-bound Stage-1 egress grant binding the exact request line (method + canonical URL/path) with no resolved IP; the Guarded Egress Broker then verifies the grant, resolves DNS, validates and pins every resolved IP at broker time, and connects only to a pinned in-scope IP.
+The platform shall authorize every outbound target request through a two-stage flow over an immutable, content-addressed request_spec: the central Scope Authority, JUST-IN-TIME at dispatch, verifies the spec's content digest (spec_sha256), evaluates scope/authorization/mode/window/budget against current state, and mints a signed, single-use, audience-bound egress grant bound to spec_sha256 with no resolved IP; the Guarded Egress Broker then verifies the grant and spec hash, reconstructs the request from the spec, durably records intent before any egress, resolves DNS, validates and pins every resolved IP, and connects only to a pinned in-scope IP.
 
-> **Verification:** Instrumentation test asserting no outbound target socket opens without a valid grant; grant-claim, replay (single-use jti), and audience-binding tests; broker-time resolved-IP validation and pinning tests.
+> **Verification:** Instrumentation test asserting no outbound socket without a valid grant; spec-hash, JIT-mint, and intent-before-egress tests; broker-time resolved-IP validation and pinning tests.
 
 **FR-015 — DNS resolution with in-scope IP verification**  ·  _priority: must_
 
@@ -203,6 +203,24 @@ The platform shall bound scope breadth (minimum CIDR prefix with an absolute flo
 The platform shall record each outbound request as a durable pre-send intent event and a post-send completion/failure event, and shall maintain separate tamper-evident tenant and global audit streams for events without an engagement (login, global emergency stop, tool-inventory changes, role changes, retention/feed changes).
 
 > **Verification:** Intent-before-send ordering test (crash between intent and send leaves a provable attempt); per-stream chain tamper tests; coverage test that non-engagement actions are logged in the correct stream.
+
+**FR-068 — Immutable approval policy and approved-spec manifest**  ·  _priority: must_
+
+The platform shall read approval thresholds and eligible approver roles from an immutable, Administrator-managed, versioned approval policy (never from requester-supplied fields), and shall authorize intrusive/business-logic actions only against an explicit manifest of approved request_spec content digests; a grant is minted only if the spec's digest is in that manifest and the policy threshold is met.
+
+> **Verification:** Schema check that approval requests carry no threshold/role fields; manifest-membership test (a spec not in the manifest is refused); Administrator-only policy versioning; changing manifest/policy voids prior decisions.
+
+**FR-069 — Content-addressed templates and repeatable specs**  ·  _priority: must_
+
+The platform shall reference every request template (check, tool, header-set, payload, WebSocket frame-set) by an immutable content digest folded into spec_sha256, and shall permit the same content digest to recur across jobs and runs as distinct instances (no spec-uniqueness constraint), each with its own single-use grant.
+
+> **Verification:** Test that changing template content changes the digest (no silent repoint); that an unknown digest is rejected; and that the same content digest recurs across two jobs without a uniqueness violation.
+
+**FR-070 — Identifiable budget reservations**  ·  _priority: must_
+
+The platform shall account request budget with an identifiable reservation ledger keyed by grant jti, with idempotent commit/release and crash-expiry, so that committed (sent) requests never exceed the total and no reservation strands.
+
+> **Verification:** Idempotent double-commit/double-release no-op tests; crash-after-reserve auto-expiry; concurrency boundary at total-1/total/total+1.
 
 ### Phase 3
 
@@ -341,6 +359,12 @@ The platform shall capture evidence, compute a confidence value, perform any dec
 The platform shall not persist raw external-tool output or raw target response bodies by default, storing only minimized, allowlisted, redacted evidence; an optional per-engagement debug quarantine shall be encrypted under the per-engagement key, role-restricted, size-capped, short-TTL auto-purged, and redacted before any promotion to long-term storage.
 
 > **Verification:** Default-run test asserts no raw body/console text persisted; quarantine-enabled test asserts encryption, TTL purge, role gating, and redaction-before-promotion.
+
+**FR-071 — WebSocket frame catalog control**  ·  _priority: must_
+
+The platform shall send WebSocket outbound frames only from an approved, content-addressed inert frame catalog, bounded by count and size, with any non-catalog frame requiring an approval manifest; established connections are bounded by duration/message/size/count caps and terminated on emergency stop, window close, or expiry.
+
+> **Verification:** A frame outside the approved set is refused; caps close the connection; e-stop/window/expiry aborts active connections; non-catalog frame requires an approval manifest.
 
 ### Phase 6
 

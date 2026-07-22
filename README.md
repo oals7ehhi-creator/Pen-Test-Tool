@@ -38,7 +38,7 @@ This project follows a strict phased delivery process. Each phase stops for revi
 | 11 | Deployment & operations | ⏳ |
 | 12 | Final review & release | ⏳ |
 
-**Phase 0 deliverables** live in [`docs/phase-0/`](docs/phase-0/README.md): requirements, threat model, architecture, the authorization/scope schema, 63 safety invariants, phase-gate acceptance criteria for Phases 1–12, non-goals, the three-round adversarial design review, the definitive RBAC matrix, the request-authorization flow (immutable spec + just-in-time grants), the data-retention/deletion design, and a machine-checkable [consistency checker](docs/phase-0/consistency/check_phase0_docs.py). No implementation code exists yet — by design (the checker is design-doc tooling, not product code).
+**Phase 0 deliverables** live in [`docs/phase-0/`](docs/phase-0/README.md): requirements, threat model, architecture, the authorization/scope schema, 65 safety invariants, phase-gate acceptance criteria for Phases 1–12, non-goals, the four-round adversarial design review, the definitive RBAC matrix, the request-authorization flow (immutable spec + just-in-time grants), the data-retention/deletion design, and a machine-checkable [consistency checker](docs/phase-0/consistency/check_phase0_docs.py). No implementation code exists yet — by design (the checker is design-doc tooling, not product code).
 
 Start here: **[docs/phase-0/00-overview.md](docs/phase-0/00-overview.md)**.
 

@@ -44,7 +44,7 @@ A compact, signed token (e.g. a PASETO/JWS-style structure with an Ed25519 signa
 | **`spec_sha256`** | **Hash of the immutable `request_spec` this grant authorizes.** The broker requires `grant.spec_sha256 == sha256(presented spec)`; the method, canonical URL/host/port/scheme/path, header-set, and payload all live in the spec, so a grant cannot be replayed against any other request line or verb. |
 | `mode` | `passive` / `safe_active` / `approval_gated`. |
 | `request_class` | `native` / `tool_driven` / `browser`. Controls which egress-inspection mode applies (`08` §2). |
-| `approval_ref` | Required for intrusive/elevated class; the approval must be `approved`, unexpired, and its `plan_sha256` must cover this `spec_sha256`. Null otherwise. |
+| `approval_ref` | Required for intrusive/elevated class; the approval must be `approved`, unexpired, and its immutable **manifest must contain this `spec_sha256`** (its threshold/roles come from the immutable `approval_policy`, `04` §10). Null otherwise. |
 | `sig` | Signature over all claims (Ed25519). Broker verifies before anything else. |
 
 **Explicitly NOT in the grant:** any resolved IP (unknown at Stage 1); and no re-listed request line — the line is the hashed spec. Budget is not referenced by a claim: it is **reserved at grant-mint** and committed/released by the broker (`04` §8). Method and path are bound via `spec_sha256` (closing the earlier "IP-level token authorizes any path/verb" gap).
@@ -62,8 +62,8 @@ Check engine ── builds ──▶ immutable request_spec (hashed: spec_sha256
 Dispatcher ── spec_id ──▶ Scope Authority  (STAGE 1, JUST-IN-TIME)
                      load spec; recompute + verify spec_sha256 (else DENY spec_tampered)
                      re-run §7 checks 0–5 over the frozen scope_version, against CURRENT state
-                     PASS ─▶ RESERVE 1 budget unit; mint short-TTL grant bound to spec_sha256 (§2);
-                              emit scope.decision.allow
+                     PASS ─▶ create a budget_reservation (keyed by grant jti, §8.1); mint short-TTL grant
+                              bound to spec_sha256 (§2); emit scope.decision.allow
                      FAIL ─▶ DENY (audited); spec stays queued for later, or dropped on hard failure
         │
         ▼ grant + spec dispatched to a Worker (control plane → data plane; jobs pulled, no inbound to workers)
@@ -76,21 +76,21 @@ Guarded Egress Broker  (STAGE 2)
    3. RECONSTRUCT    — deterministically rebuild the wire request FROM THE SPEC (method, url, header-set,
                        inert payload, operator session from the secret lease); re-normalize; assert == spec  else DENY
    4. RE-CHECK STATE — authorization fresh, window open, e-stop clear, rate/concurrency slot
-                       (fail-closed per SI-046: any unknown ⇒ DENY and RELEASE the reservation)
-   5. RESOLVE DNS    — canonical_host → all A/AAAA
-   6. GUARD + SCOPE  — every resolved IP: network guard (§6) + must satisfy scope_hash's ip/cidr/domain rules
-   7. PIN + CONNECT  — dial ONLY a pinned validated IP; TLS cert host must match canonical_host
-   8. INTENT AUDIT   — durably commit request.intent (spec_sha256, jti, reserved unit) BEFORE the socket write,
-                       in ONE transaction with the reservation (SI-055)
+                       (fail-closed per SI-046: any unknown ⇒ DENY and idempotently RELEASE the reservation)
+   5. INTENT AUDIT   — BEFORE ANY EGRESS (no DNS/TCP/TLS yet): durably commit request.intent
+                       (spec_sha256, jti, reservation id, canonical target) in ONE txn with the reservation (SI-055)
+   6. RESOLVE DNS    — the FIRST egress: canonical_host → all A/AAAA
+   7. GUARD + SCOPE  — every resolved IP: network guard (§6) + must satisfy scope_hash's ip/cidr/domain rules
+   8. PIN + CONNECT  — dial ONLY a pinned validated IP; TCP + TLS; cert host must match canonical_host
    9. SEND           — issue exactly the reconstructed request
   10. REDIRECT?      — do NOT auto-follow; form a NEW spec for the Location and request a FRESH JIT grant; else STOP
   11. COMPLETE AUDIT — request.completed/failed with resolved+pinned IP, status, byte counts (redacted);
-                       COMMIT the reserved budget unit on send / RELEASE it on any pre-send denial
+                       idempotently COMMIT the reservation on send / RELEASE on any pre-send denial (§8.1)
         │
         ▼ response (in-scope only) ─▶ redaction ─▶ minimized evidence ─▶ finding
 ```
 
-If any Stage-2 step fails, **no socket is opened** (or an open socket is closed), the reserved budget unit is released, and a deny/failure event is recorded.
+Intent (step 5) precedes DNS (step 6): **no packet — not even a DNS query — leaves the box before the durable intent+reservation commit.** If any Stage-2 step fails, no socket is opened (or an open socket is closed), the reservation is idempotently released (or crash-expires), and a deny/failure event is recorded.
 
 ---
 
@@ -130,7 +130,7 @@ WebSockets do not fit the one-request/one-response model, so their handling is s
 - **Scope is fixed at the pinned handshake.** An established socket cannot change target host/IP; there is no per-message re-targeting, so post-upgrade frames need no per-message scope check — the connection is already pinned in-scope.
 - **Bounded connection.** Each connection counts against `engagement.max_ws_connections` (`ws_in_flight`) and is capped by `ws_max_duration_s`, `ws_max_messages`, and `ws_max_message_bytes` (`04` §8). Exceeding a cap closes the connection.
 - **Interlocks terminate connections.** Emergency stop, testing-window close, and authorization expiry **abort active WebSocket connections**, not just block new ones (SI-013 extended to long-lived sockets).
-- **Non-destructive frames only.** The platform sends only inert/observation frames per the check contract — never destructive or high-volume fuzzing.
+- **Catalog/approval-controlled outbound frames.** Outbound frames are drawn **only** from an approved, content-addressed inert frame set — a `ws_frame_set` `catalog_template` named by `spec.ws_frame_set_digest` (`04` §7.0). The broker's frame gate **cannot emit a frame outside that set**; frame count and size are bounded by the caps above; and any non-catalog frame requires an approval manifest (`04` §10). This makes "non-destructive frames only" a technical control, not a convention (SI-063).
 - **Handshake redirects** are re-authorized like any HTTP redirect (new spec + JIT grant); an established WS is never auto-followed anywhere.
 
 ---
@@ -143,7 +143,9 @@ WebSockets do not fit the one-request/one-response model, so their handling is s
 | Immutable hashed `request_spec` as queued object; JIT grant minting | **SI-060** |
 | Broker reconstructs/normalizes the request from the spec; no worker-serialized request | **SI-061** |
 | Two-stage flow, grant claim set, single-use/replay protection, broker-time binding, per-job ingress, no generic CONNECT | **SI-053** |
-| Budget reserve-at-mint / commit-on-send / release-on-denial | **SI-062** (with **SI-017**) |
+| Identifiable budget reservation (per grant jti), idempotent commit/release, crash-expiry | **SI-017**, **SI-062** |
+| Content-addressed template digests folded into spec_sha256; specs repeatable across jobs/runs | **SI-065** |
+| Immutable approval policy + approved-spec manifest membership | **SI-064** |
 | Tool/browser broker-only; client DNS off; broker-mediated JIT per request | **SI-041**, **SI-054** |
 | HTTPS inspection point (driven vs sandbox-CA termination) | **SI-042** |
 | Worker narrow internal allowlist + broker only; no direct target/internet | **SI-054** (refines **SI-033**) |

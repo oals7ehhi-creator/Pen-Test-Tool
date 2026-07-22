@@ -34,6 +34,7 @@ Legend: **✔** allowed · **—** denied · **A(n)** = valid approver, contribu
 | Manage users, roles, tenants | ✔ | — | — | — | — |
 | Manage tool inventory / version pinning | ✔ | — | — | — | — |
 | Configure retention & data-handling policy | ✔ | — | — | — | — |
+| Manage **approval policy** (immutable `approval_policy`, versioned) | ✔ | — | — | — | — |
 | Configure key management (not read audit-signing key) | ✔ | — | — | — | — |
 | Trigger **global** emergency stop | ✔ | — | — | — | — |
 | Clear **global** emergency stop | ✔ | — | — | — | — |
@@ -83,7 +84,7 @@ Legend: **✔** allowed · **—** denied · **A(n)** = valid approver, contribu
 | `business_logic_test` | 2 | Engagement Manager, Reviewer |
 | `intrusive_validation` | 1 | Engagement Manager, Reviewer |
 
-Thresholds are floors: a tenant/engagement may configure a *higher* `required_approvals`, never lower. `Tester` and `Read-only Auditor` are never eligible approvers. These values are the source for the `approval_request` policy table in `04` §10 and are enforced by SI-047 / SI-018 / SI-040.
+Thresholds are floors: a new policy version may set a *higher* `required_approvals`, never lower. `Tester` and `Read-only Auditor` are never eligible approvers. **This table is the content of the immutable, Administrator-managed `approval_policy` (`04` §10)** — the threshold and eligible roles are read from that table at decision time, never supplied by the requester; only an Administrator can create or version it. Enforced by SI-064 / SI-047 / SI-018 / SI-040.
 
 ## 5. Enforcement & verification
 
