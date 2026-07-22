@@ -34,8 +34,8 @@ export default tseslint.config(
         },
       ],
       // no-restricted-imports only covers STATIC imports. Close the DYNAMIC bypasses too, so the no-shell gate
-      // cannot be sidestepped with `await import('node:child_process')`, `require('child_process')`, or a
-      // `createRequire()` alias. These selectors are the AST-level complement to the static rule above.
+      // cannot be sidestepped with a dynamic import of the child_process module, a runtime require of it, or a
+      // create-require alias. These selectors are the AST-level complement to the static rule above.
       'no-restricted-syntax': [
         'error',
         {
@@ -50,7 +50,7 @@ export default tseslint.config(
         {
           selector: "CallExpression[callee.name='createRequire']",
           message:
-            'No createRequire() — it is an indirect-require escape hatch around the no-shell safety gate (Phase 1).',
+            'No createRequire — an indirect-require escape hatch around the no-shell safety gate (Phase 1).',
         },
       ],
       '@typescript-eslint/no-explicit-any': 'error',

@@ -6,18 +6,20 @@ rules:
     languages: [typescript, javascript]
     severity: ERROR
     message: >-
-      Subprocess/shell execution (child_process) is forbidden — it is the primary command-injection sink and the
-      platform must never shell out (defense in depth beyond the ESLint no-shell rules). This matches STATIC
-      imports (`from`), classic `require(...)`, and DYNAMIC `import(...)` of child_process.
+      Subprocess/shell execution via the child_process module is forbidden — it is the primary command-injection
+      sink and the platform must never shell out (defense in depth beyond the ESLint no-shell rules). Matches
+      static imports, dynamic imports, and require of that module.
     pattern-regex: "(require\\s*\\(|from\\s+|import\\s*\\()\\s*['\"](node:)?child_process['\"]"
 
+  # Structural (not regex) so it matches an ACTUAL createRequire(...) call and never a comment or a rule/message
+  # string that merely mentions the word — keeping the SAST gate free of self-inflicted false positives.
   - id: no-createrequire
     languages: [typescript, javascript]
     severity: ERROR
     message: >-
-      createRequire() is forbidden — in an ESM codebase it is an indirect-require escape hatch that can load
+      createRequire is forbidden — in an ESM codebase it is an indirect-require escape hatch that can load
       child_process (or any native module) around the no-shell gate.
-    pattern-regex: "createRequire\\s*\\("
+    pattern: createRequire(...)
 
   - id: no-eval
     languages: [typescript, javascript]
