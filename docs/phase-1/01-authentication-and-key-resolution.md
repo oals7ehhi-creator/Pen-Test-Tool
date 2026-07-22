@@ -35,27 +35,32 @@ logging/secret invariants of `docs/phase-0/05-safety-invariants.md` (SI-045).
 A token is accepted only if **all** of the following hold; any failure throws a typed, secret-free
 `SessionError` whose message is `session rejected: <reason>` and never contains the token, claims, or key.
 
-| Check                                                                           | Enforcement                                                                                    | Reject reason           |
-| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ----------------------- |
-| Algorithm is exactly HS256                                                      | `jwtVerify(..., { algorithms: ['HS256'] })` (defeats `alg:none` / `HS384` / `RS256` confusion) | `wrong_algorithm`       |
-| Signature valid under the resolved key                                          | jose HMAC verification                                                                         | `bad_signature`         |
-| Issuer is the pinned `iss`                                                      | `jwtVerify(..., { issuer })`                                                                   | `wrong_issuer`          |
-| Audience is the pinned `aud`                                                    | `jwtVerify(..., { audience })`                                                                 | `wrong_audience`        |
-| Not expired (`exp`)                                                             | jose, with a 5 s clock tolerance                                                               | `expired`               |
-| Not before (`nbf`)                                                              | jose                                                                                           | `not_yet_valid`         |
-| `iat` not in the future                                                         | explicit check vs `now`                                                                        | `future_issued`         |
-| **Idle lifetime** `exp - iat ≤ 30 min`                                          | `IDLE_MAX_SECONDS`                                                                             | `idle_exceeded`         |
-| **Absolute lifetime** `now - sat ≤ 12 h` (`sat` = session absolute-start claim) | `ABSOLUTE_MAX_SECONDS`                                                                         | `absolute_exceeded`     |
-| Subject present                                                                 | explicit                                                                                       | `no_subject`            |
-| Role is exactly one of the five                                                 | `isRole(...)` against the Phase 0 role set                                                     | `unknown_role`          |
-| Session id present                                                              | explicit                                                                                       | `malformed`             |
-| Token missing / not a JWT                                                       | —                                                                                              | `missing` / `malformed` |
+| Check                                                                                                  | Enforcement                                                                                    | Reject reason           |
+| ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- | ----------------------- |
+| Algorithm is exactly HS256                                                                             | `jwtVerify(..., { algorithms: ['HS256'] })` (defeats `alg:none` / `HS384` / `RS256` confusion) | `wrong_algorithm`       |
+| Signature valid under the resolved key                                                                 | jose HMAC verification                                                                         | `bad_signature`         |
+| Issuer is the pinned `iss`                                                                             | `jwtVerify(..., { issuer })`                                                                   | `wrong_issuer`          |
+| Audience is the pinned `aud`                                                                           | `jwtVerify(..., { audience })`                                                                 | `wrong_audience`        |
+| Not expired (`exp`)                                                                                    | jose, with a 5 s clock tolerance                                                               | `expired`               |
+| Not before (`nbf`)                                                                                     | jose                                                                                           | `not_yet_valid`         |
+| `iat` not in the future                                                                                | explicit check vs `now`                                                                        | `future_issued`         |
+| **Claim chronology** `sat ≤ iat` (session cannot start after its token was issued)                     | explicit check                                                                                 | `bad_chronology`        |
+| **Idle lifetime** `exp - iat ≤ 30 min`                                                                 | `IDLE_MAX_SECONDS`                                                                             | `idle_exceeded`         |
+| **Absolute lifetime** `now - sat ≤ 12 h` AND `exp ≤ sat + 12 h` (`sat` = session absolute-start claim) | `ABSOLUTE_MAX_SECONDS`                                                                         | `absolute_exceeded`     |
+| Subject present                                                                                        | explicit                                                                                       | `no_subject`            |
+| Role is exactly one of the five                                                                        | `isRole(...)` against the Phase 0 role set                                                     | `unknown_role`          |
+| Session id present                                                                                     | explicit                                                                                       | `malformed`             |
+| Token missing / not a JWT                                                                              | —                                                                                              | `missing` / `malformed` |
 
 The two lifetime bounds implement NFR-001 **statelessly**: `signSession` clamps the minted TTL to
-`IDLE_MAX_SECONDS` and stamps `sat` (absolute session start); the verifier independently re-derives both the
-idle window (`exp - iat`) and the absolute window (`now - sat`) and rejects anything beyond the Phase 0 limits
-(idle ≤ 30 min, absolute ≤ 12 h). Neither bound can be widened by a crafted token because both are checked
-against constants, not against attacker-supplied durations.
+`IDLE_MAX_SECONDS` and stamps `sat` (absolute session start); the verifier independently re-derives the idle
+window (`exp - iat`) and the absolute window and rejects anything beyond the Phase 0 limits (idle ≤ 30 min,
+absolute ≤ 12 h). The absolute cap is enforced by verification, not merely trusted from the signer: `sat` may not
+be after `iat` (`bad_chronology` — so a signer cannot advance `sat` toward "now" to shrink the measured age), and
+`exp` may not exceed `sat + 12 h` (so a fresh idle-valid token near the absolute deadline cannot run past it).
+None of these bounds can be widened by a crafted token — they are checked against constants, not attacker-supplied
+durations. The one thing statelessness cannot prevent — a signing-key holder minting a wholly new session with a
+fresh `sat` — requires server-side session state and is deferred (see `05-risk-and-debt-disposition.md`, D-1).
 
 Role is read **only** from the verified `role` claim and validated against the exactly-five-role set; an
 otherwise-valid token carrying `superuser` is rejected (`unknown_role`), never silently downgraded or trusted.
@@ -96,8 +101,12 @@ The optional dev helper (`POST /dev/token`, gated by `DEV_TOKEN_MINTER` and `nod
 role (via `signSession`, TTL = `IDLE_MAX_SECONDS`). It is:
 
 - **default off** (config default `false`), and
-- **structurally unavailable in production** — the route returns `404` exactly like any unknown route when
-  the minter is disabled, and the config forces it off whenever `NODE_ENV=production`.
+- **structurally unavailable in production**, enforced in depth at three layers so a hand-built config cannot
+  re-enable it: (1) `loadConfig` forces `devTokenMinterEnabled` off when `NODE_ENV=production`; (2)
+  `buildAuthContext` computes `devMinterEnabled = devTokenMinterEnabled && !isProduction`, so even a manually
+  constructed `AppConfig` passed to `start()` yields a disabled minter; and (3) the handler independently returns
+  `404` whenever `ctx.isProduction`. A real-socket test boots the server with `nodeEnv: 'production'` +
+  `devTokenMinterEnabled: true` and asserts `POST /dev/token` is `404` with no token minted.
 
 The `x-dev-mint-role` header is consulted **only** inside the minter to choose which signed token to issue; it
 is never an authorization input on a protected route.

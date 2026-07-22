@@ -55,4 +55,23 @@ describe('authentication boot / key resolution', () => {
     const ctx = buildAuthContext({ ...base, nodeEnv: 'development' }, {});
     expect(ctx.signingKey.ephemeral).toBe(true);
   });
+
+  it('FORCE-DISABLES the dev token minter in production even if a hand-built config enables it', () => {
+    // A manually-constructed AppConfig (bypassing loadConfig) that wrongly turns the minter on in production.
+    const ctx = buildAuthContext(
+      { ...base, nodeEnv: 'production', devTokenMinterEnabled: true },
+      { SESSION_SIGNING_KEY_MATERIAL: TEST_KEY_MATERIAL },
+    );
+    expect(ctx.isProduction).toBe(true);
+    expect(ctx.devMinterEnabled).toBe(false); // defense in depth: never enabled in production
+  });
+
+  it('keeps the minter enabled only in non-production when the config opts in', () => {
+    const dev = buildAuthContext(
+      { ...base, nodeEnv: 'development', devTokenMinterEnabled: true },
+      {},
+    );
+    expect(dev.isProduction).toBe(false);
+    expect(dev.devMinterEnabled).toBe(true);
+  });
 });

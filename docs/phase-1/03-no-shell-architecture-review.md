@@ -35,22 +35,29 @@ arrive in later phases and must preserve this baseline (Phase 0 non-goals; `docs
 
 ## 3. The technical gate (why it stays true)
 
-The no-shell property is enforced by ESLint, so a regression fails CI rather than merging silently:
+The no-shell property is enforced at two independent gates, so a regression fails CI rather than merging silently,
+and it covers **every** way a module can reach `child_process` — not just static imports:
 
-- **Rule** — `no-restricted-imports` forbids importing `child_process` / `node:child_process` anywhere in the
-  workspace, plus `no-eval` and `no-implied-eval` (`eslint.config.js`). `pnpm run lint` runs in the
-  `build-test` CI job and blocks merge on any violation.
-- **Adversarial proof the gate has teeth** — `ci/lint-noshell-negative-test.sh` (CI step _No-shell lint gate —
-  negative proof_) plants, at runtime, a TypeScript file that imports `node:child_process`, runs ESLint, and
-  asserts ESLint **fails specifically via `no-restricted-imports`**. The planted file is always removed and
-  the check is a hard gate (never `continue-on-error`), so it cannot weaken the normal lint.
+- **ESLint** (`eslint.config.js`):
+  - `no-restricted-imports` blocks STATIC `import … from 'child_process'` / `'node:child_process'`.
+  - `no-restricted-syntax` blocks the DYNAMIC bypasses: `import('node:child_process')` (ImportExpression),
+    `require('child_process')`, and `createRequire()` (the indirect-require escape hatch).
+  - `no-eval` / `no-implied-eval` block dynamic code execution.
+- **Semgrep** (`ci/semgrep-rules.yml`, digest-pinned container): `no-subprocess-execution` matches static import,
+  `require(`, and dynamic `import(` of child_process; `no-createrequire` blocks `createRequire`; plus `no-eval`
+  and `no-function-constructor`. Defense in depth beyond ESLint.
+- **Adversarial proof the gates have teeth** — `ci/lint-noshell-negative-test.sh` (CI step _No-shell lint gate —
+  negative proof_) plants, at runtime, four fixtures (static import, dynamic import, `require`, `createRequire`)
+  and asserts ESLint **fails via a no-shell rule** for each. Every planted file is always removed; the check is a
+  hard gate (never `continue-on-error`), so it cannot weaken the normal lint.
 
 ## 4. Residual risk & scope
 
-- The lint rule covers `child_process` imports; it does not, by itself, forbid a future indirect subprocess
-  (e.g. a dependency that shells out). That risk is mitigated by the dependency-audit and SAST gates
-  (`security-gates` job) and must be re-reviewed whenever a phase introduces a tool-integration dependency.
-- `eval`/`new Function` are covered by lint (`no-eval`, `no-implied-eval`) and confirmed absent by search.
+- The gates cover first-party code exhaustively (static + dynamic import, require, createRequire, eval, Function).
+  They do not, by themselves, forbid a future **third-party dependency** that shells out internally. That risk is
+  mitigated by the dependency-audit and SAST gates (`security-gates` job) and must be re-reviewed whenever a phase
+  introduces a tool-integration dependency (recorded in `docs/phase-1/05-risk-and-debt-disposition.md`, A-4).
+- `eval`/`new Function` are covered by both gates and confirmed absent by search.
 
 **Conclusion:** the Phase 1 command-injection baseline holds — no product path reaches an OS shell or a
 dynamic-code sink, and the property is technically enforced with an adversarial CI proof.

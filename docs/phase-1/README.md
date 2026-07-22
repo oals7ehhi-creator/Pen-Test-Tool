@@ -14,6 +14,7 @@ non-destructive, technically enforced.
 | [`02-secret-management.md`](02-secret-management.md)                                 | Production secret management: references vs material, fail-closed resolution, rotation, and the locations secrets must never appear (technically enforced).                    |
 | [`03-no-shell-architecture-review.md`](03-no-shell-architecture-review.md)           | Recorded architectural review confirming no API/worker/UI path reaches an OS shell or dynamic-code sink, and the lint gate + adversarial proof that keeps it so.               |
 | [`04-acceptance-matrix.md`](04-acceptance-matrix.md)                                 | The Phase 1 acceptance matrix: every criterion / exit test / safety gate → implementation files, tests, and CI evidence.                                                       |
+| [`05-risk-and-debt-disposition.md`](05-risk-and-debt-disposition.md)                 | Consolidated risk/technical-debt register: adversarial-review fixes, accepted risks with rationale, and work explicitly deferred to later phases.                              |
 
 ## What Phase 1 delivers
 

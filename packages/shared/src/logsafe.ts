@@ -45,6 +45,19 @@ const MAX_FIELDS = 64;
 // '&', '%', '@', whitespace and quotes, so a token can never carry a URL, path, query string, header or cookie.
 const SAFE_TOKEN = /^[A-Za-z0-9._-]{1,128}$/;
 
+/** Emitted in the `correlationId` position when a caller supplies an id that is not a safe identifier. */
+export const UNSAFE_CORRELATION_ID = 'unsafe_correlation_id';
+
+/**
+ * The correlation id is a RESERVED, authoritative record field. It should be internally generated (a UUID), but
+ * because `createLogger`/`childWithCorrelationId` accept a string, we constrain it to a safe identifier shape so a
+ * misused value (e.g. a token or secret smuggled in as the id) can never be emitted verbatim — an unsafe id is
+ * replaced by a fixed sentinel, never the raw value.
+ */
+export function safeCorrelationId(id: string): string {
+  return SAFE_TOKEN.test(id) ? id : UNSAFE_CORRELATION_ID;
+}
+
 const HTTP_METHODS: ReadonlySet<string> = new Set([
   'GET',
   'POST',

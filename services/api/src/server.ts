@@ -55,9 +55,10 @@ export async function handle(
   };
 
   // Dev-only token minter: structurally unavailable (404, same as any unknown route) unless explicitly enabled
-  // and non-production. It only ISSUES a signed token; it is not an authorization path.
+  // and non-production. It only ISSUES a signed token; it is not an authorization path. The production check is
+  // independent of `devMinterEnabled` (defense in depth): in production the route is a 404 no matter what.
   if (method === 'POST' && path === DEV_TOKEN_PATH) {
-    if (!ctx.devMinterEnabled) {
+    if (ctx.isProduction || !ctx.devMinterEnabled) {
       logReq(DEV_TOKEN_PATH, 404);
       send(res, 404, { error: 'not_found' });
       return;

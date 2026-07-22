@@ -7,8 +7,17 @@ rules:
     severity: ERROR
     message: >-
       Subprocess/shell execution (child_process) is forbidden — it is the primary command-injection sink and the
-      platform must never shell out (defense in depth beyond the ESLint no-restricted-imports rule).
-    pattern-regex: "(require\\s*\\(|from\\s+)['\"](node:)?child_process['\"]"
+      platform must never shell out (defense in depth beyond the ESLint no-shell rules). This matches STATIC
+      imports (`from`), classic `require(...)`, and DYNAMIC `import(...)` of child_process.
+    pattern-regex: "(require\\s*\\(|from\\s+|import\\s*\\()\\s*['\"](node:)?child_process['\"]"
+
+  - id: no-createrequire
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      createRequire() is forbidden — in an ESM codebase it is an indirect-require escape hatch that can load
+      child_process (or any native module) around the no-shell gate.
+    pattern-regex: "createRequire\\s*\\("
 
   - id: no-eval
     languages: [typescript, javascript]

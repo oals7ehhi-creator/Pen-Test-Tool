@@ -17,7 +17,7 @@ export default tseslint.config(
   },
   {
     rules: {
-      // Command-injection baseline (Phase 1 no-shell gate): forbid child_process at the lint layer.
+      // Command-injection baseline (Phase 1 no-shell gate): forbid STATIC imports of child_process.
       'no-restricted-imports': [
         'error',
         {
@@ -31,6 +31,26 @@ export default tseslint.config(
               message: 'No shell/subprocess execution (Phase 1 no-shell safety gate).',
             },
           ],
+        },
+      ],
+      // no-restricted-imports only covers STATIC imports. Close the DYNAMIC bypasses too, so the no-shell gate
+      // cannot be sidestepped with `await import('node:child_process')`, `require('child_process')`, or a
+      // `createRequire()` alias. These selectors are the AST-level complement to the static rule above.
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'ImportExpression[source.value=/^(node:)?child_process$/]',
+          message: 'No dynamic import of child_process (Phase 1 no-shell safety gate).',
+        },
+        {
+          selector:
+            "CallExpression[callee.name='require'][arguments.0.value=/^(node:)?child_process$/]",
+          message: 'No require() of child_process (Phase 1 no-shell safety gate).',
+        },
+        {
+          selector: "CallExpression[callee.name='createRequire']",
+          message:
+            'No createRequire() — it is an indirect-require escape hatch around the no-shell safety gate (Phase 1).',
         },
       ],
       '@typescript-eslint/no-explicit-any': 'error',

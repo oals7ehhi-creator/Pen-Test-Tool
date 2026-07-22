@@ -38,7 +38,7 @@ export function testSigningKey(): ResolvedSigningKey {
 }
 
 export function testAuthContext(
-  over: Partial<Pick<AuthContext, 'devMinterEnabled' | 'now'>> & {
+  over: Partial<Pick<AuthContext, 'devMinterEnabled' | 'isProduction' | 'now'>> & {
     signingKey?: ResolvedSigningKey;
   } = {},
 ): AuthContext {
@@ -46,6 +46,7 @@ export function testAuthContext(
     signingKey: over.signingKey ?? testSigningKey(),
     issuer: TEST_ISSUER,
     audience: TEST_AUDIENCE,
+    isProduction: over.isProduction ?? false,
     devMinterEnabled: over.devMinterEnabled ?? false,
     now: over.now ?? ((): number => FIXED_NOW),
   };

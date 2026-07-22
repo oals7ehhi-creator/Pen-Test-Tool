@@ -225,6 +225,41 @@ describe('verifySession — rejections (each returns a typed reason, never leaki
   });
 });
 
+describe('verifySession — absolute-lifetime cannot be reset by claim manipulation', () => {
+  // Craft tokens directly so we control iat/nbf/exp/sat independently of signSession.
+  const craft = (claims: { iat: number; nbf: number; exp: number; sat: number }): Promise<string> =>
+    new SignJWT({ role: 'tester', sid: 's', sat: claims.sat })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user:1')
+      .setIssuer(ISS)
+      .setAudience(AUD)
+      .setIssuedAt(claims.iat)
+      .setNotBefore(claims.nbf)
+      .setExpirationTime(claims.exp)
+      .sign(KEY);
+
+  it('rejects a session that claims to have STARTED AFTER it was issued (sat > iat)', async () => {
+    // iat in the past, sat = now (> iat): not future-dated, but chronologically impossible.
+    const tok = await craft({ iat: NOW - 100, nbf: NOW - 100, exp: NOW + 60, sat: NOW });
+    expect(await reasonOf(verify(tok))).toBe('bad_chronology');
+  });
+
+  it('rejects a fresh idle-valid token whose expiry would run PAST the 12 h absolute deadline', async () => {
+    // Session started 11h50m ago; a brand-new 30-min token is idle-valid and not yet absolutely expired, but its
+    // expiry (now+30m) lies beyond the absolute deadline (sat+12h = now+10m) → must be refused.
+    const sat = NOW - (ABSOLUTE_MAX_SECONDS - 600);
+    const tok = await craft({ iat: NOW, nbf: NOW, exp: NOW + 30 * 60, sat });
+    expect(await reasonOf(verify(tok))).toBe('absolute_exceeded');
+  });
+
+  it('still accepts a token that starts at issuance and expires within both windows', async () => {
+    const tok = await craft({ iat: NOW, nbf: NOW, exp: NOW + 15 * 60, sat: NOW });
+    await expect(
+      verifySession({ token: tok, key: KEY, issuer: ISS, audience: AUD, now: NOW }),
+    ).resolves.toBeDefined();
+  });
+});
+
 describe('signSession — clamps idle lifetime', () => {
   it('never mints a token whose lifetime exceeds the 30-minute cap', async () => {
     const tok = await good({ ttlSeconds: 10 * 60 * 60 }); // ask for 10h

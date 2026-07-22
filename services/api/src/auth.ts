@@ -26,7 +26,9 @@ export interface AuthContext {
   readonly signingKey: ResolvedSigningKey;
   readonly issuer: string;
   readonly audience: string;
-  /** True only when the dev token minter is enabled (never in production). */
+  /** True in a production environment. The dev token minter is structurally unavailable whenever this is true. */
+  readonly isProduction: boolean;
+  /** True only when the dev token minter is enabled AND the environment is non-production (never in production). */
   readonly devMinterEnabled: boolean;
   /** Current time in epoch seconds; injectable for deterministic tests. */
   readonly now: () => number;
@@ -35,6 +37,10 @@ export interface AuthContext {
 /**
  * Resolve the signing key and assemble the auth context. In production this FAILS CLOSED (throws) when the key
  * reference cannot be resolved to strong material; non-production falls back to a process-random ephemeral key.
+ *
+ * The dev token minter is force-disabled in production HERE (defense in depth): `loadConfig` already forces it off,
+ * but `start()`/`buildAuthContext` also accept a hand-constructed `AppConfig`, so a config that (incorrectly) sets
+ * `devTokenMinterEnabled: true` alongside `nodeEnv: 'production'` still yields a disabled minter.
  */
 export function buildAuthContext(
   config: AppConfig,
@@ -42,11 +48,13 @@ export function buildAuthContext(
   now: () => number = () => Math.floor(Date.now() / 1000),
 ): AuthContext {
   const signingKey = loadSigningKey(config.sessionSigningKeyRef, config.nodeEnv, env);
+  const isProduction = config.nodeEnv === 'production';
   return {
     signingKey,
     issuer: config.authIssuer,
     audience: config.authAudience,
-    devMinterEnabled: config.devTokenMinterEnabled,
+    isProduction,
+    devMinterEnabled: config.devTokenMinterEnabled && !isProduction,
     now,
   };
 }

@@ -29,6 +29,7 @@ export type SessionErrorReason =
   | 'expired'
   | 'not_yet_valid'
   | 'future_issued'
+  | 'bad_chronology'
   | 'idle_exceeded'
   | 'absolute_exceeded'
   | 'no_subject'
@@ -45,6 +46,7 @@ export const SESSION_ERROR_REASONS: readonly SessionErrorReason[] = [
   'expired',
   'not_yet_valid',
   'future_issued',
+  'bad_chronology',
   'idle_exceeded',
   'absolute_exceeded',
   'no_subject',
@@ -136,15 +138,26 @@ export async function verifySession(p: VerifyParams): Promise<VerifiedIdentity> 
 
   const exp = payload['exp'];
   if (typeof exp !== 'number') throw new SessionError('malformed');
-  if (exp - iat > IDLE_MAX_SECONDS + CLOCK_TOLERANCE_SECONDS)
-    throw new SessionError('idle_exceeded');
 
   const sat = payload['sat'];
   if (typeof sat !== 'number') throw new SessionError('malformed');
   if (sat > p.now + CLOCK_TOLERANCE_SECONDS) throw new SessionError('future_issued');
-  if (p.now - sat > ABSOLUTE_MAX_SECONDS + CLOCK_TOLERANCE_SECONDS) {
+
+  // Claim chronology: a session cannot start AFTER the token that carries it was issued. Enforcing sat <= iat
+  // stops a signer from advancing `sat` toward "now" to shrink the measured absolute age and evade the 12 h cap.
+  if (sat > iat + CLOCK_TOLERANCE_SECONDS) throw new SessionError('bad_chronology');
+
+  // Idle window: a single token may live at most IDLE_MAX from its own issuance.
+  if (exp - iat > IDLE_MAX_SECONDS + CLOCK_TOLERANCE_SECONDS)
+    throw new SessionError('idle_exceeded');
+
+  // Absolute window, enforced two ways so verification (not just the signer) upholds the 12 h cap:
+  //  (a) the session must not already be older than the absolute limit, and
+  //  (b) the token must not be permitted to LIVE past the absolute deadline measured from the session start.
+  if (p.now - sat > ABSOLUTE_MAX_SECONDS + CLOCK_TOLERANCE_SECONDS)
     throw new SessionError('absolute_exceeded');
-  }
+  if (exp > sat + ABSOLUTE_MAX_SECONDS + CLOCK_TOLERANCE_SECONDS)
+    throw new SessionError('absolute_exceeded');
 
   const sub = payload['sub'];
   if (typeof sub !== 'string' || sub === '') throw new SessionError('no_subject');

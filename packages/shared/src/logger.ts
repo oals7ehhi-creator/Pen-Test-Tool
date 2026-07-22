@@ -3,6 +3,7 @@ import {
   buildFields,
   BASE_EVENT_FIELDS,
   UNKNOWN_EVENT,
+  safeCorrelationId,
   type EventRegistry,
   type Scalar,
 } from './logsafe.js';
@@ -95,7 +96,10 @@ function build(base: Resolved, bindings: Record<string, unknown>): Logger {
     correlationId: base.correlationId,
     child: (childBindings) => build(base, { ...bindings, ...childBindings }),
     childWithCorrelationId: (correlationId, childBindings) =>
-      build({ ...base, correlationId }, { ...bindings, ...(childBindings ?? {}) }),
+      build(
+        { ...base, correlationId: safeCorrelationId(correlationId) },
+        { ...bindings, ...(childBindings ?? {}) },
+      ),
     trace: (e, f) => emit('trace', e, f),
     debug: (e, f) => emit('debug', e, f),
     info: (e, f) => emit('info', e, f),
@@ -107,7 +111,7 @@ function build(base: Resolved, bindings: Record<string, unknown>): Logger {
 export function createLogger(opts: LoggerOptions): Logger {
   const base: Resolved = {
     level: opts.level,
-    correlationId: opts.correlationId ?? 'root',
+    correlationId: safeCorrelationId(opts.correlationId ?? 'root'),
     sink: opts.sink ?? ((line: string) => process.stdout.write(line + '\n')),
     now: opts.now ?? (() => new Date()),
     events: opts.events,

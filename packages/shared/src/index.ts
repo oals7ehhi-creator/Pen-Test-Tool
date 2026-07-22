@@ -18,6 +18,8 @@ export {
   BASE_EVENT_FIELDS,
   RESERVED_FIELDS,
   UNKNOWN_EVENT,
+  UNSAFE_CORRELATION_ID,
+  safeCorrelationId,
   type Scalar,
   type FieldValidator,
   type EventSchema,
