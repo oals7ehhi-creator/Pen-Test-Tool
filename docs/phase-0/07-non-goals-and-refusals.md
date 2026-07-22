@@ -150,7 +150,7 @@ For each category of request that conflicts with the authorization/safety model,
 |---|---|---|
 | "Also scan this /24 (or subdomain) we just discovered." | No auto-scanning of discovered infrastructure. | **Surface the discovery as an inventory item** and prompt the operator to add it to scope **with a new authorization record**; until then it receives zero traffic. |
 | "Test the payment processor / SSO / CDN it talks to." | No third-party infrastructure testing. | Test **only client-owned, allowlisted assets**; recommend the operator obtain separate written authorization for any third party they actually control. |
-| "Keep testing — the window/authorization just expired." | No testing past expiry or outside the window. | **Auto-stop and emergency-stop** engage; the platform offers to **resume after the authorization/window is renewed** with an updated record. |
+| "Keep testing — the window/authorization just expired." | No testing past expiry or outside the window. | **Window close** only *pauses* execution (the engagement stays `active`, requests are denied at the gate until a window re-opens — it is **not** a terminal state). **Authorization expiry/revocation** is terminal: the platform stops and offers to resume only after a **fresh authorization** is recorded. |
 | "Just point it at the target; skip the scope setup." | No operation without an explicit scope + authorization. | **Guided setup**: create engagement → attach authorization → define scope → verify scope (DNS/redirect/rebinding checks) → then run. Deny-by-default until complete. |
 
 ### Autonomy / validation

@@ -580,9 +580,10 @@ TABLE request_spec (               -- the IMMUTABLE, CONTENT-ADDRESSED queued ob
   session_ref        UUID,                    -- FK to an immutable operator_session lease; the SECRET is injected by
                                               --   the broker and never stored; session_ref itself is EXCLUDED from spec_sha256
   session_digest     CHAR(64),                -- NON-SECRET binding = the referenced operator_session's IMMUTABLE,
-                                              --   GENERATED session_digest (sha256(account_id, session_version));
+                                              --   GENERATED session_digest (sha256(tenant_id, engagement_id, account_id,
+                                              --   session_version) — never collides across tenants/engagements);
                                               --   BOUND INTO spec_sha256 and FK-verified to equal the session's digest,
-                                              --   so a spec is tied to one account + session version (rotation invalidates)
+                                              --   so a spec is tied to one tenant+engagement+account+version (rotation invalidates)
   mode               TEXT NOT NULL CHECK (mode IN ('passive','safe_active','approval_gated')),  -- advisory display only
   approval_ref       UUID,                    -- present iff approval_required (below)
   approval_required  BOOLEAN NOT NULL,        -- DERIVED by trigger from referenced templates' safety_class and
@@ -1218,10 +1219,13 @@ BEGIN
   IF total > NEW.required_approvals THEN
     RAISE EXCEPTION 'role_quorum sum (%) exceeds required_approvals (%) — unsatisfiable', total, NEW.required_approvals;
   END IF;
-  -- NON-DECREASING strength vs the current (non-superseded) version of this request_type: threshold may only rise,
-  -- the eligible-role allowlist may only tighten (subset), and no existing per-role quorum minimum may fall.
+  -- NON-DECREASING strength vs the IMMEDIATELY-PRIOR version of this request_type: threshold may only rise, the
+  -- eligible-role allowlist may only tighten (subset), and no existing per-role quorum minimum may fall.
+  -- The predecessor is the HIGHEST existing version (regardless of superseded): a new version is inserted only AFTER
+  -- the old current row was flipped superseded=TRUE (one_current_policy allows just one non-superseded row), so a
+  -- `superseded = FALSE` filter here would find NOTHING at insert time and silently DISABLE the downgrade guard.
   SELECT * INTO prev FROM approval_policy
-    WHERE request_type = NEW.request_type AND superseded = FALSE AND id <> NEW.id
+    WHERE request_type = NEW.request_type AND id <> NEW.id
     ORDER BY version DESC LIMIT 1;
   IF FOUND THEN
     IF NEW.required_approvals < prev.required_approvals THEN

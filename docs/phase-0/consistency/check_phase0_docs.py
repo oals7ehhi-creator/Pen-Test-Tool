@@ -135,6 +135,12 @@ def analyze(texts):
             problems.append("duplicate SI ids")
 
     # 3) counts + dup ids
+    # FAIL CLOSED on a missing/empty core document — a checker that silently passes when a whole document
+    # (threat model, schema, invariants, requirements) is absent is worse than useless.
+    for core in ("01-requirements.md", "02-threat-model.md", "04-authorization-and-scope-schema.md",
+                 "05-safety-invariants.md", "00-overview.md"):
+        if len(texts.get(core, "").strip()) < 200:
+            problems.append(f"CORE DOCUMENT MISSING/EMPTY: {core} (checker fails closed)")
     fr  = re.findall(r"^\*\*(FR-\d+) —", texts.get("01-requirements.md", ""), re.M)
     nfr = re.findall(r"^\*\*(NFR-\d+) —", texts.get("01-requirements.md", ""), re.M)
     th  = re.findall(r"^### (T-\d+) —", texts.get("02-threat-model.md", ""), re.M)
@@ -144,6 +150,11 @@ def analyze(texts):
     c = re.search(r"\*\*(\d+) absolute", si)
     if c and body and int(c.group(1)) != len(body):
         problems.append(f"SI count: doc claims {c.group(1)} but found {len(body)}")
+    # THREAT-COUNT PARITY: doc-00's claimed threat count MUST match the T-ids in doc-02 (parity was previously
+    # only enforced for FR and SI, so a missing/renumbered threat model went undetected).
+    c = re.search(r"(\d+)\s+threats", texts.get("00-overview.md", ""))
+    if c and int(c.group(1)) != len(th):
+        problems.append(f"threat count: overview claims {c.group(1)} but doc-02 has {len(th)}")
     for lab, ids in [("FR", fr), ("NFR", nfr), ("T", th), ("SI", body)]:
         d = [x for x in set(ids) if ids.count(x) > 1]
         if d:
@@ -290,11 +301,13 @@ def _round6_schema_and_race(a, texts):
     # Conservative charge-before-send budget STATE MACHINE (not reserve/commit/release).
     need("state IN ('claimed','charged','released','expired')" in a,
          "04 §8.1: budget_reservation lacks the conservative state set claimed/charged/released/expired")
-    need(all(k in a for k in ("charged_has_time", "no_release_after_charge", "no_expire_after_charge")),
-         "04 §8.1: budget_reservation missing charge-before-send CHECKs (charged terminal: charged_has_time/no_release_after_charge/no_expire_after_charge)")
-    # Authoritative fence source + owned/fenced lease.
-    need("fence_seq" in a and re.search(r"fence_token\s+BIGINT", a),
-         "04: no authoritative monotonic fence_seq feeding an owned/fenced fence_token lease")
+    need(all(k in a for k in ("charged_has_time", "no_release_after_charge", "no_expire_after_charge"))
+         and "NOT (state='released' AND charged_at IS NOT NULL)" in a
+         and "state <> 'charged' OR charged_at IS NOT NULL" in a,
+         "04 §8.1: budget_reservation charge-before-send CHECK LOGIC missing/gutted (charged_has_time/no_release_after_charge/no_expire_after_charge)")
+    # Authoritative fence source + owned/fenced lease — the token is ALLOCATED from the locked runtime row (not just declared).
+    need(re.search(r"fence_token\s+BIGINT", a) is not None and "fence_seq = fence_seq + 1" in a,
+         "04: fence_token not allocated from the authoritative monotonic fence_seq under the FOR UPDATE lock")
     # The charge happens in the broker txn, BEFORE DNS, in the §7.1 Stage-2 procedure.
     proc = re.search(r"STAGE 2 — GUARDED EGRESS BROKER.*?```", a, re.S)
     if proc:
@@ -352,8 +365,14 @@ def _round6_schema_and_race(a, texts):
     # One current matching policy, role-quorum validity, immutable freeze semantics.
     need("current, non-superseded" in a or "pins the current" in a,
          "04 §10: approval policy not pinned to the current, non-superseded matching version")
-    need("role_quorum" in a, "04 §10: role quorum not enforced")
-    need("manifest_frozen" in a, "04 §10: manifest not frozen before decisions")
+    # Role-quorum VALIDITY logic must be present (not just the column): keys ∈ approver_roles, positive ints, satisfiable sum.
+    need("k = ANY(NEW.approver_roles)" in a
+         and re.search(r"total\s*>\s*NEW\.required_approvals", a) is not None
+         and re.search(r"v\s*<=\s*0", a) is not None,
+         "04 §10: role_quorum validity trigger logic missing (eligible-role / positive-int / satisfiable-sum checks)")
+    # Manifest freeze must VERIFY the digest against the recomputed entry set (not merely flip a flag).
+    need("manifest_frozen" in a and "computed <> NEW.manifest_sha256" in a,
+         "04 §10: manifest freeze does not verify manifest_sha256 against the recomputed entry-set digest")
 
     # Every audit event's tenant/engagement identity bound to its audit chain — via a NULL-SAFE trigger, because a
     # composite MATCH SIMPLE FK is SKIPPED when a component is NULL (tenant/global chains) and would validate nothing.
@@ -365,8 +384,10 @@ def _round6_schema_and_race(a, texts):
     # Authorization draft/active status-shape, exclusion non-elevation, absolute CIDR floors as enforceable CHECKs.
     need("authorization_status_shape" in a and "written_auth_attested = FALSE" in a,
          "04 §3.1: no complete draft/active status-shape CHECK (authorization_status_shape missing)")
-    need("exclusion_not_elevated" in a, "04 §4.2: exclusions can elevate (exclusion_not_elevated CHECK missing)")
-    need("cidr_absolute_floor" in a, "04 §4.2: no absolute CIDR floor CHECK (cidr_absolute_floor missing)")
+    need("exclusion_not_elevated" in a and "is_exclusion = FALSE OR elevated = FALSE" in a,
+         "04 §4.2: exclusion_not_elevated CHECK logic missing (exclusions could elevate)")
+    need("cidr_absolute_floor" in a and "prefix_len >= 16" in a and "prefix_len >= 32" in a,
+         "04 §4.2: cidr_absolute_floor CHECK does not enforce the /16 (v4) and /32 (v6) floors")
 
     # Recurring-window close is a pure function of the trusted clock, re-derived (not a cached flag).
     need("pure functions of the trusted clock" in a or "pure function of the trusted clock" in a,
@@ -464,6 +485,11 @@ def _round7_corrective(a):
     need("NEW.required_approvals < prev.required_approvals THEN" in a
          and "NOT (NEW.approver_roles <@ prev.approver_roles)" in a,
          "F17 04 §10: policy versioning permits a threshold/quorum/eligibility downgrade")
+    # 17b: the predecessor lookup must NOT filter superseded=FALSE — that filter is empty at INSERT time (old row is
+    #      already superseded by the one_current_policy index) and silently turns the downgrade guard into DEAD CODE.
+    need("WHERE request_type = NEW.request_type AND id <> NEW.id" in a
+         and "request_type = NEW.request_type AND superseded = FALSE AND id <> NEW.id" not in a,
+         "F17b 04 §10: downgrade guard is dead code — predecessor lookup filters superseded=FALSE (empty at insert)")
 
     # 19: the scope_entry DDL is well-formed (comma after cidr_absolute_floor).
     need(">= 32))," in a,
@@ -551,10 +577,12 @@ NEG_FIXTURES = [
     ("budget states reverted to reserved/committed/released",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md",
         "state IN ('claimed','charged','released','expired')", "state IN ('reserved','committed','released')")),
-    ("charge-terminal CHECKs removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "no_release_after_charge", "no_release_DISABLED")),
-    ("authoritative fence_seq removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "fence_seq", "fence_XXXX")),
+    ("charge-terminal CHECK gutted (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "CONSTRAINT no_release_after_charge CHECK (NOT (state='released' AND charged_at IS NOT NULL))",
+        "CONSTRAINT no_release_after_charge CHECK (TRUE)")),
+    ("fence allocation gutted (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "fence_seq = fence_seq + 1", "fence_seq = fence_seq + 0")),
     ("same-tenant/engagement session FK removed",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md",
         "(session_ref, tenant_id, engagement_id) REFERENCES operator_session", "(session_ref) REFERENCES operator_session_DISABLED")),
@@ -583,14 +611,23 @@ NEG_FIXTURES = [
     ("draft status-shape allows attested draft (name-preserving)",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md",
         "AND written_auth_attested = FALSE", "AND written_auth_attested = TRUE")),
-    ("exclusion non-elevation removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "exclusion_not_elevated", "exclusion_DISABLED")),
-    ("absolute CIDR floor removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "cidr_absolute_floor", "cidr_DISABLED")),
-    ("role quorum removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "role_quorum", "role_XXXX")),
-    ("manifest freeze removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "manifest_frozen", "manifest_XXXX")),
+    ("exclusion_not_elevated CHECK gutted (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "CONSTRAINT exclusion_not_elevated CHECK (is_exclusion = FALSE OR elevated = FALSE)",
+        "CONSTRAINT exclusion_not_elevated CHECK (TRUE)")),
+    ("cidr_absolute_floor loosened (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "OR (ip_version = 4 AND prefix_len >= 16)", "OR (ip_version = 4 AND prefix_len >= 0)")),
+    ("role_quorum satisfiability check gutted (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "IF total > NEW.required_approvals THEN", "IF total > 2147483647 THEN")),
+    ("manifest freeze digest verify gutted (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "IF computed <> NEW.manifest_sha256 THEN", "IF FALSE THEN")),
+    ("downgrade guard reverted to dead code (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "WHERE request_type = NEW.request_type AND id <> NEW.id",
+        "WHERE request_type = NEW.request_type AND superseded = FALSE AND id <> NEW.id")),
 
     # === ROUND 7 — the 19 MANDATORY corrective fixtures. Each PRESERVES the constraint/trigger NAME and important
     #     tokens but BREAKS the behavior; the matching _round7_corrective detector must still fire. ===
