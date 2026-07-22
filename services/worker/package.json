@@ -1,0 +1,13 @@
+{
+  "name": "@pentest/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "node --experimental-strip-types src/index.ts"
+  },
+  "dependencies": {
+    "@pentest/shared": "workspace:*"
+  }
+}

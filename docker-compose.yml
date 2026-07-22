@@ -1,0 +1,39 @@
+# Local dev stack (Phase 1). Brings up Postgres + API + worker with a single command:
+#   docker compose up --build
+# Bindings are loopback-only by default — the dev stack is NOT exposed on a public interface (safety gate).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pentest
+      POSTGRES_PASSWORD: pentest_dev_only
+      POSTGRES_DB: pentest
+    ports:
+      - '127.0.0.1:5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U pentest -d pentest']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      NODE_ENV: development
+      API_HOST: 0.0.0.0 # inside the container network only; host mapping below stays loopback
+      API_PORT: '8080'
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://pentest:pentest_dev_only@db:5432/pentest
+      SESSION_SIGNING_KEY_REF: dev-insecure-session-key-change-me-0123456789
+    ports:
+      - '127.0.0.1:8080:8080'
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:

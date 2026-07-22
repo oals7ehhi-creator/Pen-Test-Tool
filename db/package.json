@@ -1,0 +1,19 @@
+{
+  "name": "@pentest/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "migrate": "node --experimental-strip-types src/migrate.ts up",
+    "migrate:down": "node --experimental-strip-types src/migrate.ts down",
+    "migrate:ci": "node --experimental-strip-types src/migrate.ts ci"
+  },
+  "dependencies": {
+    "@pentest/shared": "workspace:*",
+    "pg": "8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.11.10"
+  }
+}

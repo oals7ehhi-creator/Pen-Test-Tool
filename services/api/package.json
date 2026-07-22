@@ -1,0 +1,14 @@
+{
+  "name": "@pentest/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "node --experimental-strip-types src/server.ts"
+  },
+  "dependencies": {
+    "@pentest/shared": "workspace:*"
+  }
+}

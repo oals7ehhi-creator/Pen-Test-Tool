@@ -1,0 +1,32 @@
+{
+  "name": "pen-test-tool",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Authorized, non-destructive web-application security assessment platform (Phase 1 foundation)",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "phase0:check": "python3 docs/phase-0/consistency/check_phase0_docs.py",
+    "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run phase0:check"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.17.0",
+    "@types/node": "22.10.2",
+    "@vitest/coverage-v8": "2.1.8",
+    "eslint": "9.17.0",
+    "globals": "15.14.0",
+    "prettier": "3.4.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.19.0",
+    "vitest": "2.1.8"
+  }
+}
