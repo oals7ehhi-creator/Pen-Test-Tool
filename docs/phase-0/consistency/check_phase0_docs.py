@@ -42,6 +42,9 @@ PHASE0 = os.path.dirname(DIR)
 # read as live design claims. Doc 08 is the adversarial-review log in full.
 HISTORY_DOCS = {"08-design-review-and-critique-resolution.md"}
 
+# The canonical empty-manifest digest = sha256('') — what the freeze trigger computes for a zero-row manifest.
+EMPTY_MANIFEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 # Context words marking a passage as history / self-referential commentary rather than a live claim.
 DESC = ("removed", "earlier", "revised", "carve-out", "superseded", 'was "', "the earlier",
         "no longer", "phrasings", "stale", "forbid", "no stale", "contradiction", "prevented",
@@ -222,6 +225,7 @@ def analyze(texts):
     # ==================================================================================
     problems += _round6_live_statements(texts)
     problems += _round6_schema_and_race(a, texts)
+    problems += _round7_corrective(a)
 
     # 10) code-fence balance
     for bn, t in texts.items():
@@ -317,14 +321,17 @@ def _round6_schema_and_race(a, texts):
     need(re.search(r"session_digest\s+CHAR\(64\)\s+GENERATED ALWAYS AS", a) is not None,
          "04: operator_session.session_digest is not an immutable GENERATED column")
 
-    # Protected immutable query-value reference / keyed digest binding the actual injected values.
+    # Protected query-value reference / keyed digest — SECRET values live in an engagement-scoped secret ref, NOT
+    # the global content-addressed catalog (content-addressing a secret makes the digest an offline oracle).
     need("query_value_ref" in a and "query_value_digest" in a,
          "04: request_spec lacks a protected query-value reference + keyed digest")
-    need("(query_value_ref, query_value_kind) REFERENCES catalog_template(digest, kind)" in a,
-         "04: query_value_ref not bound to an immutable content-addressed catalog_template(digest, kind)")
+    need("REFERENCES operator_query_value(id, tenant_id, engagement_id)" in a,
+         "04: secret query values not bound to the engagement-scoped operator_query_value reference")
+    need("(query_value_ref, query_value_kind) REFERENCES catalog_template(digest, kind)" not in a,
+         "04: secret query values still content-addressed in the global catalog (query_value_ref -> catalog_template)")
 
     # Approval requirement DERIVED from every relevant semantic input (method/action class AND all template safety classes).
-    need("HTTP method / action class" in a and "MAX safety_class over ALL referenced templates" in a,
+    need("HTTP method / action class" in a and "MAX safety_class over ALL referenced" in a,
          "04: approval_required not derived from BOTH method/action class AND the MAX safety_class over ALL referenced templates")
     need("gated_needs_ref CHECK (mode <> 'approval_gated'" not in a,
          "04: approval requirement trusts the self-declared mode (must be derived, never trusted)")
@@ -337,10 +344,10 @@ def _round6_schema_and_race(a, texts):
     need(re.search(r"scope_check_result[^\n]*SCOPE-ONLY", a) is not None,
          "04 §10: approval_request.scope_check_result not pinned to the scope-only pre-verdict (would be circular)")
 
-    # Manifest verification conditional by request type OR a canonical empty manifest for every type.
-    need("CANONICAL EMPTY" in a or
-         "request_type NOT IN ('intrusive_validation','business_logic_test') OR manifest_sha256 IS NOT NULL" in a,
-         "04 §10: manifest verification not made conditional by request type (nor a canonical empty manifest defined)")
+    # Manifest verification: manifest-bearing types carry a non-null manifest; every other type carries the CANONICAL
+    # EMPTY manifest digest (a fixed constant) and may hold NO entries.
+    need("manifest_shape" in a and EMPTY_MANIFEST in a,
+         "04 §10: no single manifest rule (manifest_shape pinning the canonical empty digest for non-manifest types)")
 
     # One current matching policy, role-quorum validity, immutable freeze semantics.
     need("current, non-superseded" in a or "pins the current" in a,
@@ -348,20 +355,119 @@ def _round6_schema_and_race(a, texts):
     need("role_quorum" in a, "04 §10: role quorum not enforced")
     need("manifest_frozen" in a, "04 §10: manifest not frozen before decisions")
 
-    # Every audit event's tenant/engagement identity bound to its audit chain.
-    need("(chain_id, tenant_id, engagement_id) REFERENCES audit_chain(id, tenant_id, engagement_id)" in a,
-         "04 §9: audit_event tenant/engagement identity not bound to its audit_chain (composite FK missing)")
+    # Every audit event's tenant/engagement identity bound to its audit chain — via a NULL-SAFE trigger, because a
+    # composite MATCH SIMPLE FK is SKIPPED when a component is NULL (tenant/global chains) and would validate nothing.
+    need("IS DISTINCT FROM ch.tenant_id" in a and "IS DISTINCT FROM ch.engagement_id" in a,
+         "04 §9: audit identity not enforced NULL-safely (IS DISTINCT FROM against the chain missing)")
     need("audit_event(id, chain_id)" in a,
          "04 §9: related_event_id not constrained to the same chain (audit_event(id, chain_id) FK missing)")
 
-    # Authorization drafts, exclusion non-elevation, absolute CIDR floors as enforceable CHECKs.
-    need("draft_not_attested" in a, "04 §3.1: draft authorization not constrained to carry no attestation approval")
+    # Authorization draft/active status-shape, exclusion non-elevation, absolute CIDR floors as enforceable CHECKs.
+    need("authorization_status_shape" in a and "written_auth_attested = FALSE" in a,
+         "04 §3.1: no complete draft/active status-shape CHECK (authorization_status_shape missing)")
     need("exclusion_not_elevated" in a, "04 §4.2: exclusions can elevate (exclusion_not_elevated CHECK missing)")
     need("cidr_absolute_floor" in a, "04 §4.2: no absolute CIDR floor CHECK (cidr_absolute_floor missing)")
 
     # Recurring-window close is a pure function of the trusted clock, re-derived (not a cached flag).
     need("pure functions of the trusted clock" in a or "pure function of the trusted clock" in a,
          "04 §8: window/expiry close not defined as a pure function of the trusted clock")
+    return p
+
+
+# ===================================================================================================
+# ROUND 7 — corrective-pass SEMANTIC detectors. Each asserts the presence of a SPECIFIC corrected
+# construct (composite FK, trigger condition, CHECK expression, status-shape branch). Because every
+# detector targets the behavioral SUBSTANCE — not a bare token — a name-preserving mutation that keeps
+# the constraint/trigger NAME but guts its logic still fails (see ROUND7_FIXTURES). Each of the 19
+# mandatory corrective fixtures maps 1:1 to a detector here, and every detector ALSO fires against the
+# untouched 4f996f9 corpus (which lacks the corrected construct) — the mandatory before/after proof.
+# ===================================================================================================
+def _round7_corrective(a):
+    p = []
+    def need(cond, msg):
+        if not cond: p.append(msg)
+
+    # 1-3, 18: security-authority references bind (id, tenant_id, engagement_id), never tenant only.
+    need("(authorization_id, tenant_id, engagement_id) REFERENCES authorization(id, tenant_id, engagement_id)" in a,
+         "A1 04: request_spec.authorization_id FK not engagement-scoped (cross-engagement authorization possible)")
+    need("(approval_ref, tenant_id, engagement_id)" in a and "REFERENCES approval_request(id, tenant_id, engagement_id)" in a,
+         "A2 04: request_spec.approval_ref FK not engagement-scoped (cross-engagement approval possible)")
+    need("FOREIGN KEY (spec_id, tenant_id, engagement_id) REFERENCES request_spec(id, tenant_id, engagement_id)" in a,
+         "A3 04: budget_reservation.spec_id FK not engagement-scoped (cross-engagement budget/spec possible)")
+    need("FOREIGN KEY (linked_scope_version_id, tenant_id, engagement_id)" in a
+         and "FOREIGN KEY (linked_audit_event_id, tenant_id, engagement_id)" in a,
+         "A18 04: approval_request.linked_* FKs not engagement-scoped (cross-engagement linkage possible)")
+    # Stage-1 engagement-identity equality precondition.
+    need("ENGAGEMENT-IDENTITY EQUALITY" in a and "spec.engagement_id = E.id" in a,
+         "A 04 §7.1: Stage-1 does not verify engagement-identity equality at dispatch")
+
+    # 4: secret query values live in the engagement-scoped secret ref, NOT the global content-addressed catalog.
+    need("REFERENCES operator_query_value(id, tenant_id, engagement_id)" in a,
+         "B4 04: secret query values not bound to engagement-scoped operator_query_value")
+    need("(query_value_ref, query_value_kind) REFERENCES catalog_template" not in a,
+         "B4 04: secret query values still content-addressed in the global catalog")
+
+    # 5: session rotation is INSERT-only (never in-place); the digest binds tenant+engagement+account+version.
+    need("Rotation is INSERT-only" in a,
+         "B5 04: operator_session rotation not INSERT-only (in-place version bump mutates an FK-referenced key)")
+    need("tenant_id::text || ':' || engagement_id::text ||" in a,
+         "B5 04: session_digest does not bind tenant+engagement (cross-tenant digest collision)")
+
+    # 6: budget charged/released/expired are terminal (rejects charged->claimed).
+    need("OLD.state IN ('charged','released','expired')" in a,
+         "C6 04 §8.1: budget trigger does not treat charged/released/expired as terminal (charged->claimed possible)")
+    # 7: charge sets charged_at write-once.
+    need("IF NEW.charged_at IS NULL THEN RAISE EXCEPTION 'charge must set charged_at" in a,
+         "C7 04 §8.1: charge does not require charged_at be set (write-once) — charged_at could be cleared/omitted")
+    # 8: any lease transition requires the CURRENT fence_token (stale fence rejected).
+    need("NEW.owner <> OLD.owner OR NEW.fence_token <> OLD.fence_token THEN" in a,
+         "C8 04 §8.1: charge/release do not require the current fence_token (stale fence token accepted)")
+    # Single increment bound to the one charge transition (terminal => fires once => no double increment).
+    need("request_budget_used = request_budget_used + 1" in a and "used cannot be double-incremented" in a,
+         "C 04 §8.1: request_budget_used increment not bound to the single charge transition")
+
+    # 9: audit identity enforced NULL-safely (IS DISTINCT FROM), not via a skipped MATCH SIMPLE FK.
+    need("IS DISTINCT FROM ch.tenant_id" in a and "IS DISTINCT FROM ch.engagement_id" in a,
+         "D9 04 §9: audit identity not NULL-safe (tenant/global mismatch slips past skipped MATCH SIMPLE FK)")
+
+    # 10-11: authorization draft is genuinely incomplete (attested=FALSE; all attestation fields NULL).
+    need(re.search(r"status = 'draft'\s+AND written_auth_attested = FALSE", a) is not None,
+         "E10 04 §3.1: draft status-shape does not force written_auth_attested = FALSE")
+    need(re.search(r"status = 'draft'.{0,400}attested_by_user_id\s+IS NULL.{0,200}attestation_approval_id IS NULL\)",
+                   a, re.S) is not None,
+         "E11 04 §3.1: draft status-shape does not force the attestation fields (attester/timestamp/statement/doc/approval) NULL")
+
+    # 12: window close only blocks execution; it never expires the engagement.
+    need("Closing a testing window is NOT an engagement state transition" in a
+         and "ONLY on authorization expiry" in a,
+         "E12 04 §2.2: window close can cause terminal engagement expiry (only authorization expiry may)")
+
+    # 13: attestation requires a document hash.
+    need("request_type <> 'authorization_attestation' OR document_sha256 IS NOT NULL" in a,
+         "F13 04 §10: authorization_attestation does not require document_sha256")
+
+    # 14: approval creation uses the scope-only pre-verdict, NEVER the circular full Stage-1.
+    need("cannot be created unless its target already passes" not in a,
+         "F14 04 §10: intrusive approval creation still requires full Stage-1 (circular)")
+
+    # 15: non-manifest types pin the canonical empty digest; decisions pin a NON-NULL equal manifest (no NULL bypass).
+    need("manifest_shape" in a and EMPTY_MANIFEST in a,
+         "F15 04 §10: non-manifest types not pinned to the canonical empty manifest digest")
+    need("approved_manifest_sha256 IS NULL OR NEW.approved_manifest_sha256 <> m" in a,
+         "F15 04 §10: manifest decision allows a NULL approved_manifest_sha256 to bypass comparison")
+
+    # 16: approval_policy is supersede-only + exactly one current per type (resolves the immutability contradiction).
+    need("only superseded FALSE->TRUE is permitted" in a and "CREATE UNIQUE INDEX one_current_policy" in a,
+         "F16 04 §10: policy cannot supersede the old current row (blanket immutability vs one-current-policy)")
+
+    # 17: a new policy version may not weaken threshold/quorum/eligibility (the monotonic conditions must be present).
+    need("NEW.required_approvals < prev.required_approvals THEN" in a
+         and "NOT (NEW.approver_roles <@ prev.approver_roles)" in a,
+         "F17 04 §10: policy versioning permits a threshold/quorum/eligibility downgrade")
+
+    # 19: the scope_entry DDL is well-formed (comma after cidr_absolute_floor).
+    need(">= 32))," in a,
+         "E19 04 §4.2: malformed scope_entry DDL (missing comma after cidr_absolute_floor)")
     return p
 
 
@@ -457,28 +563,26 @@ NEG_FIXTURES = [
         "REFERENCES operator_session(id, session_digest)", "REFERENCES operator_session(id_DISABLED)")),
     ("query-value reference removed",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "query_value_ref", "query_value_XXXX")),
-    ("query-value catalog FK removed",
+    ("secret query values repointed at the global catalog (name-preserving)",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md",
-        "(query_value_ref, query_value_kind) REFERENCES catalog_template(digest, kind)", "(query_value_ref) REFERENCES nothing_DISABLED")),
+        "FOREIGN KEY (query_value_ref, tenant_id, engagement_id) REFERENCES operator_query_value(id, tenant_id, engagement_id)",
+        "FOREIGN KEY (query_value_ref, query_value_kind) REFERENCES catalog_template(digest, kind)")),
     ("derived approval loses method/action class",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "HTTP method / action class", "self-declared mode")),
     ("scope-only pre-verdict removed (circular bootstrap)",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "scope-only pre-verdict", "full Stage-1 verdict")),
     ("scope_check_result reverts to full Stage-1 (circular)",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "SCOPE-ONLY pre-verdict", "full Stage-1 decision")),
-    ("canonical-empty / conditional manifest removed",
-     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
-        x["04-authorization-and-scope-schema.md"]
-          .replace("CANONICAL EMPTY", "always-required")
-          .replace("request_type NOT IN ('intrusive_validation','business_logic_test') OR manifest_sha256 IS NOT NULL",
-                   "manifest_sha256 IS ALWAYS REQUIRED"))),
-    ("audit tenant/engagement->chain FK removed",
+    ("canonical empty-manifest digest replaced (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md", EMPTY_MANIFEST, "deadbeef" * 8)),
+    ("audit identity comparison made NULL-unsafe (name-preserving)",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md",
-        "(chain_id, tenant_id, engagement_id) REFERENCES audit_chain(id, tenant_id, engagement_id)", "(chain_id) REFERENCES audit_chain(id_DISABLED)")),
+        "IS DISTINCT FROM ch.tenant_id", "= ch.tenant_id")),
     ("related-event same-chain FK removed",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "audit_event(id, chain_id)", "audit_event(id_DISABLED)")),
-    ("draft attestation constraint removed",
-     lambda x: _replace(x, "04-authorization-and-scope-schema.md", "draft_not_attested", "draft_DISABLED")),
+    ("draft status-shape allows attested draft (name-preserving)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "AND written_auth_attested = FALSE", "AND written_auth_attested = TRUE")),
     ("exclusion non-elevation removed",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "exclusion_not_elevated", "exclusion_DISABLED")),
     ("absolute CIDR floor removed",
@@ -487,6 +591,74 @@ NEG_FIXTURES = [
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "role_quorum", "role_XXXX")),
     ("manifest freeze removed",
      lambda x: _replace(x, "04-authorization-and-scope-schema.md", "manifest_frozen", "manifest_XXXX")),
+
+    # === ROUND 7 — the 19 MANDATORY corrective fixtures. Each PRESERVES the constraint/trigger NAME and important
+    #     tokens but BREAKS the behavior; the matching _round7_corrective detector must still fire. ===
+    ("R7#1 cross-engagement authorization reference (drop engagement from the FK)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "(authorization_id, tenant_id, engagement_id) REFERENCES authorization(id, tenant_id, engagement_id)",
+        "(authorization_id, tenant_id) REFERENCES authorization(id, tenant_id)")),
+    ("R7#2 cross-engagement approval reference (drop engagement from the FK)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "(approval_ref, tenant_id, engagement_id)", "(approval_ref, tenant_id)")),
+    ("R7#3 cross-engagement budget/spec reference (drop engagement from the FK)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "FOREIGN KEY (spec_id, tenant_id, engagement_id) REFERENCES request_spec(id, tenant_id, engagement_id)",
+        "FOREIGN KEY (spec_id, tenant_id) REFERENCES request_spec(id, tenant_id)")),
+    ("R7#4 secret query values stored in catalog JSONB (repoint FK to catalog)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "FOREIGN KEY (query_value_ref, tenant_id, engagement_id) REFERENCES operator_query_value(id, tenant_id, engagement_id)",
+        "FOREIGN KEY (query_value_ref, query_value_kind) REFERENCES catalog_template(digest, kind)")),
+    ("R7#5 session version updated in place (rotation no longer INSERT-only)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "Rotation is INSERT-only", "Rotation bumps session_version in place")),
+    ("R7#6 charged -> claimed (drop 'charged' from the terminal set)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "OLD.state IN ('charged','released','expired')", "OLD.state IN ('released','expired')")),
+    ("R7#7 charged_at cleared (invert the write-once guard)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "IF NEW.charged_at IS NULL THEN RAISE EXCEPTION 'charge must set charged_at",
+        "IF NEW.charged_at IS NOT NULL THEN RAISE EXCEPTION 'charge must set charged_at")),
+    ("R7#8 stale fence token accepted (drop fence_token from the transition condition)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "NEW.owner <> OLD.owner OR NEW.fence_token <> OLD.fence_token THEN", "NEW.owner <> OLD.owner THEN")),
+    ("R7#9 tenant/global audit mismatch via NULL FK (make the comparison NULL-unsafe)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "IS DISTINCT FROM ch.engagement_id", "= ch.engagement_id")),
+    ("R7#10 draft with written_auth_attested=TRUE (flip the draft-branch requirement)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "AND written_auth_attested = FALSE", "AND written_auth_attested = TRUE")),
+    ("R7#11 draft carrying mandatory attestation fields (flip the draft-branch NULL)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "attestation_approval_id IS NULL)", "attestation_approval_id IS NOT NULL)")),
+    ("R7#12 window close causes terminal expiry",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "Closing a testing window is NOT an engagement state transition",
+        "Closing a testing window transitions the engagement to expired")),
+    ("R7#13 attestation approval with NULL document_sha256 (weaken the CHECK)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "request_type <> 'authorization_attestation' OR document_sha256 IS NOT NULL",
+        "request_type <> 'authorization_attestation' OR document_sha256 IS NULL")),
+    ("R7#14 full-Stage-1 circular approval precondition (reintroduce the circular prose)",
+     lambda x: _append(x, "04-authorization-and-scope-schema.md",
+        "\nAn intrusive_validation approval cannot be created unless its target already passes §7 Stage-1.\n")),
+    ("R7#15 non-manifest NULL equality bypass (drop the NULL rejection in the decision trigger)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "NEW.approved_manifest_sha256 IS NULL OR NEW.approved_manifest_sha256 <> m",
+        "NEW.approved_manifest_sha256 <> m")),
+    ("R7#16 policy version cannot supersede old current (revert to blanket immutability)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "only superseded FALSE->TRUE is permitted", "approval_policy is fully immutable; all UPDATE revoked")),
+    ("R7#17 policy threshold/quorum downgrade (gut the monotonic condition)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "NEW.required_approvals < prev.required_approvals THEN", "NEW.required_approvals < 0 THEN")),
+    ("R7#18 cross-engagement linked scope/audit event (drop engagement from the FK)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "FOREIGN KEY (linked_scope_version_id, tenant_id, engagement_id)",
+        "FOREIGN KEY (linked_scope_version_id, tenant_id)")),
+    ("R7#19 malformed scope_entry DDL (remove the comma after cidr_absolute_floor)",
+     lambda x: _replace(x, "04-authorization-and-scope-schema.md",
+        "OR (ip_version = 6 AND prefix_len >= 32)),", "OR (ip_version = 6 AND prefix_len >= 32))")),
 ]
 
 def selftest(clean_texts, base_problems):
@@ -503,26 +675,32 @@ def _load(dirpath):
     return {os.path.basename(f): open(f).read() for f in sorted(glob.glob(os.path.join(dirpath, "*.md")))}
 
 
+_R7_PREFIXES = ("A1","A2","A3","A18","A 04","B4","B5","C6","C7","C8","C 04","D9",
+                "E10","E11","E12","F13","F14","F15","F16","F17","E19")
+
 def round5_crosscheck(dirpath, current_problem_count):
-    """Optional: assert the unchanged Round-5 corpus FAILS the Round-6 detectors while the working tree passes."""
-    r5 = _load(dirpath)
-    if not r5:
+    """Assert a prior BASELINE corpus (Round-5 or commit 4f996f9) FAILS the Round-6/7 detectors while the
+    working tree passes — the mandatory before/after proof, reproducible from the committed checker."""
+    base = _load(dirpath)
+    if not base:
         return [f"--round5: no *.md found in {dirpath}"]
-    r5_problems = analyze(r5)
-    # The Round-6 detectors specifically:
-    r6 = [pp for pp in r5_problems if pp.startswith(("02: Reviewer", "07 F3", "05 SI-030", "09 §4", "06 Phase 11"))
+    bp = analyze(base)
+    r6 = [pp for pp in bp if pp.startswith(("02: Reviewer", "07 F3", "05 SI-030", "09 §4", "06 Phase 11"))
           or "R6 " in pp or "§8.1" in pp or "§7.1" in pp or "§10" in pp or "§9" in pp or "§4.2" in pp
           or "§3.1" in pp or "fence" in pp or "session FK" in pp or "session_digest" in pp
           or "query-value" in pp or "query_value" in pp or "derived from" in pp]
+    r7 = [pp for pp in bp if any(pp.startswith(x) for x in _R7_PREFIXES)]
+    r7_items = sorted({pp.split(" ")[0] for pp in r7})
     out = []
-    if not r6:
-        out.append("--round5: Round-6 detectors did NOT fire on the unchanged Round-5 corpus (checker is vacuous)")
-    print("=== ROUND-5 CROSS-CHECK ===")
-    print(f"  Round-5 corpus -> {len(r5_problems)} total problems; {len(r6)} are Round-6 detectors")
-    for pp in r6[:40]:
-        print("   R5-FAIL:", pp)
-    if current_problem_count == 0 and r6:
-        print(f"  OK — unchanged Round-5 corpus FAILS ({len(r6)} Round-6 detectors); corrected corpus PASSES.")
+    if not r6 and not r7:
+        out.append("--round5: detectors did NOT fire on the baseline corpus (checker is vacuous)")
+    print("=== BASELINE CROSS-CHECK ===")
+    print(f"  baseline corpus -> {len(bp)} total problems; {len(r6)} Round-6 detectors; {len(r7)} Round-7 corrective detectors")
+    print(f"  Round-7 corrective items firing on baseline: {r7_items}")
+    for pp in sorted(r7):
+        print("   BASELINE-FAIL:", pp)
+    if current_problem_count == 0 and (r6 or r7):
+        print(f"  OK — baseline corpus FAILS ({len(r6)+len(r7)} detectors); corrected corpus PASSES.")
     return out
 
 
