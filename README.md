@@ -39,7 +39,7 @@ See [`docs/PHASE-STATUS.md`](docs/PHASE-STATUS.md).
 | 11    | Deployment & operations                   | ⏳                          |
 | 12    | Final review & release                    | ⏳                          |
 
-**Phase 0 deliverables** live in [`docs/phase-0/`](docs/phase-0/README.md): requirements, threat model, architecture, the authorization/scope schema, 65 safety invariants, phase-gate acceptance criteria for Phases 1–12, non-goals, the four-round adversarial design review, the definitive RBAC matrix, the request-authorization flow (immutable spec + just-in-time grants), the data-retention/deletion design, and a machine-checkable [consistency checker](docs/phase-0/consistency/check_phase0_docs.py). No implementation code exists yet — by design (the checker is design-doc tooling, not product code).
+**Phase 0 deliverables** live in [`docs/phase-0/`](docs/phase-0/README.md): requirements, threat model, architecture, the authorization/scope schema, 65 safety invariants, phase-gate acceptance criteria for Phases 1–12, non-goals, the four-round adversarial design review, the definitive RBAC matrix, the request-authorization flow (immutable spec + just-in-time grants), the data-retention/deletion design, and a machine-checkable [consistency checker](docs/phase-0/consistency/check_phase0_docs.py) (design-doc tooling, not product code). Phase 1 then adds the first product code — the secure project foundation described below — subordinate to this approved design.
 
 Start here: **[docs/phase-0/00-overview.md](docs/phase-0/00-overview.md)**.
 
@@ -50,12 +50,12 @@ Start here: **[docs/phase-0/00-overview.md](docs/phase-0/00-overview.md)**.
 ├── package.json / pnpm-workspace.yaml     # pnpm monorepo root
 ├── tsconfig.base.json                     # strict shared TS config
 ├── .env.example                           # secure defaults, no real secrets
-├── docker-compose.yml                     # local dev stack (loopback-only)
-├── .github/workflows/ci.yml               # lint · format · typecheck · test · SAST · secret-scan · dep-audit · Phase-0 check
+├── docker-compose.yml                     # local dev stack: db + api + worker + web (loopback-only, digest-pinned)
+├── .github/workflows/ci.yml               # lint · format · typecheck · test · SAST · secret-scan · dep-audit · Phase-0 check · docker stack
 ├── packages/
-│   └── shared/          # safety core: fail-closed config, redaction logger, default-deny RBAC (+ tests)
+│   └── shared/          # safety core: fail-closed config, minimized allowlist logger, default-deny RBAC (+ tests)
 ├── services/
-│   ├── api/             # backend API (default-deny route authorization, redacted logging)
+│   ├── api/             # backend API (default-deny route authorization, minimized structured logging)
 │   └── worker/          # data-plane worker skeleton
 ├── apps/
 │   └── web/             # operator console (placeholder)
@@ -74,11 +74,13 @@ pnpm install --frozen-lockfile  # deterministic install from the committed lockf
 # verify everything the CI gates check
 pnpm run verify                 # format · lint · typecheck · test · Phase-0 consistency check
 
-# bring up the full local stack (Postgres + API + worker), loopback-only
-docker compose up --build
+# bring up the full local stack (Postgres + API + worker + web), loopback-only, waiting for health
+docker compose up --build --wait
 ```
 
 The **safety foundations** every later phase plugs into live in `packages/shared`: configuration is validated at
 startup and the app **refuses to boot** on missing/invalid values (fail-closed); all structured logs pass through a
-**redaction** layer that masks `Authorization`/cookies/tokens before any sink; and authorization is **default-deny**
-across exactly the five roles (Administrator, Engagement Manager, Tester, Reviewer, Read-only Auditor).
+**minimized allowlist** layer (SI-045) that serializes only explicit scalar fields — never whole headers, URLs,
+bodies, cookies, or arbitrary objects — and masks sensitive keys, so callers cannot log sensitive material even by
+accident; and authorization is **default-deny** across exactly the five roles (Administrator, Engagement Manager,
+Tester, Reviewer, Read-only Auditor).

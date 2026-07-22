@@ -1,10 +1,11 @@
 import { type LogLevel } from './config.js';
-import { redact } from './redact.js';
+import { sanitizeContext, type Scalar } from './sanitize.js';
 
 /**
- * Minimal structured JSON logger. Every record is a single JSON line with a correlation id, level, timestamp,
- * message, and redacted context. All context passes through `redact()` so secrets never reach the sink. Kept
- * dependency-free on purpose: it is on the safety-critical path and must be trivially auditable.
+ * Minimal structured JSON logger. Each record is one JSON line with reserved fields — time, level, correlationId,
+ * msg — plus a `ctx` object holding the ALLOWLISTED, minimized, scalar-only context (see sanitizeContext). Reserved
+ * fields are written last and context is namespaced under `ctx`, so caller context can never override them. Kept
+ * dependency-free: it is on the safety-critical path and must be trivially auditable.
  */
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
@@ -20,7 +21,7 @@ export interface LogRecord {
   level: LogLevel;
   correlationId: string;
   msg: string;
-  [key: string]: unknown;
+  ctx: Record<string, Scalar>;
 }
 
 export interface LoggerOptions {
@@ -53,13 +54,14 @@ function build(base: Resolved, bindings: Record<string, unknown>): Logger {
   function emit(level: LogLevel, msg: string, ctx?: Record<string, unknown>): void {
     if (LEVEL_ORDER[level] < LEVEL_ORDER[base.level]) return;
     const merged = { ...bindings, ...(ctx ?? {}) };
+    // Reserved fields are literal and come first; `ctx` carries only sanitized scalars. Because sanitizeContext
+    // strips reserved keys and everything is namespaced under `ctx`, context can never override a reserved field.
     const record: LogRecord = {
       time: base.now().toISOString(),
       level,
       correlationId: base.correlationId,
       msg,
-      // Redact the entire context payload before serialization — the last line of defense before the sink.
-      ...redact(merged),
+      ctx: sanitizeContext(merged),
     };
     base.sink(JSON.stringify(record));
   }

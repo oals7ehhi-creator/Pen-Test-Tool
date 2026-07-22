@@ -27,9 +27,28 @@ export interface AppConfig {
   readonly databaseUrl: string;
   /** Reference/handle to the session signing key. NOT the raw key material in production. */
   readonly sessionSigningKeyRef: string;
+  /**
+   * When true, the API honors the `x-dev-role` request header as an INSECURE development-only role injection
+   * (NOT authentication). It is force-disabled in production regardless of env, and defaults off.
+   */
+  readonly devAuthEnabled: boolean;
+}
+
+/** DB-only configuration — everything the migration CLI needs and nothing it does not (no session key, no API host). */
+export interface DbConfig {
+  readonly databaseUrl: string;
+  readonly logLevel: LogLevel;
 }
 
 type Env = Record<string, string | undefined>;
+
+function validateDatabaseUrl(raw: string | undefined, issues: string[]): string {
+  const url = requiredString('DATABASE_URL', raw, 1, issues);
+  if (url !== '' && !/^postgres(ql)?:\/\//.test(url)) {
+    issues.push('DATABASE_URL must be a postgresql:// connection string');
+  }
+  return url;
+}
 
 function oneOf<T extends string>(
   name: string,
@@ -83,10 +102,7 @@ export function loadConfig(env: Env = process.env): AppConfig {
     }
   }
 
-  const databaseUrl = requiredString('DATABASE_URL', env.DATABASE_URL, 1, issues);
-  if (databaseUrl !== '' && !/^postgres(ql)?:\/\//.test(databaseUrl)) {
-    issues.push('DATABASE_URL must be a postgresql:// connection string');
-  }
+  const databaseUrl = validateDatabaseUrl(env.DATABASE_URL, issues);
 
   // Required and long enough that a blank/placeholder value fails closed.
   const sessionSigningKeyRef = requiredString(
@@ -96,9 +112,27 @@ export function loadConfig(env: Env = process.env): AppConfig {
     issues,
   );
 
+  // Dev-role injection is opt-in AND never available in production.
+  const devAuthEnabled = env.DEV_AUTH_ENABLED === 'true' && nodeEnv !== 'production';
+
   if (issues.length > 0) {
     throw new ConfigError(issues);
   }
 
-  return { nodeEnv, apiHost, apiPort, logLevel, databaseUrl, sessionSigningKeyRef };
+  return { nodeEnv, apiHost, apiPort, logLevel, databaseUrl, sessionSigningKeyRef, devAuthEnabled };
+}
+
+/**
+ * Validate ONLY the configuration the migration CLI needs (DATABASE_URL + LOG_LEVEL). It deliberately does NOT
+ * require the API host/port or the session signing key, so migrations can run in contexts (CI, one-off jobs) that
+ * have database access but none of the API's secrets. Fails closed on a missing/invalid DATABASE_URL.
+ */
+export function loadDbConfig(env: Env = process.env): DbConfig {
+  const issues: string[] = [];
+  const logLevel = oneOf('LOG_LEVEL', env.LOG_LEVEL, LOG_LEVELS, 'info', issues);
+  const databaseUrl = validateDatabaseUrl(env.DATABASE_URL, issues);
+  if (issues.length > 0) {
+    throw new ConfigError(issues);
+  }
+  return { databaseUrl, logLevel };
 }

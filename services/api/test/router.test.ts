@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { authorizeRequest, ROUTES } from '../src/router.js';
+import { authorizeRequest, listRoutes } from '../src/router.js';
 import { ROLES } from '@pentest/shared';
 
 /**
@@ -20,7 +20,7 @@ describe('route authorization', () => {
   });
 
   it('unknown role is denied on every protected route', () => {
-    for (const r of ROUTES) {
+    for (const r of listRoutes()) {
       if (r.permission === null) continue;
       expect(authorizeRequest(r.method, r.path, 'superuser').status).toBe(403);
     }
@@ -35,7 +35,7 @@ describe('route authorization', () => {
       'POST /intrusive/validation/approve': ['engagement_manager', 'reviewer'],
       'GET /audit': ['administrator', 'engagement_manager', 'reviewer', 'read_only_auditor'],
     };
-    for (const r of ROUTES) {
+    for (const r of listRoutes()) {
       if (r.permission === null) continue;
       const key = `${r.method} ${r.path}`;
       const allowed = new Set(permittedRoles[key]);
@@ -44,5 +44,22 @@ describe('route authorization', () => {
         expect(authorizeRequest(r.method, r.path, role).status).toBe(expected);
       }
     }
+  });
+});
+
+describe('route registry is tamper-proof (Phase 1 item 7)', () => {
+  it('listRoutes returns a copy — mutating it does not affect authorization', () => {
+    const copy = listRoutes();
+    // @ts-expect-error deliberately attempting to mutate a route to widen access
+    copy[1].permission = null;
+    copy.push({ method: 'GET', path: '/pwned', permission: null });
+    // The live decision is unchanged: /engagements still requires its permission, /pwned is unknown.
+    expect(authorizeRequest('GET', '/engagements', undefined).status).toBe(401);
+    expect(authorizeRequest('GET', '/pwned', 'administrator').status).toBe(404);
+  });
+
+  it('two calls return independent arrays', () => {
+    expect(listRoutes()).not.toBe(listRoutes());
+    expect(listRoutes()[0]).not.toBe(listRoutes()[0]);
   });
 });

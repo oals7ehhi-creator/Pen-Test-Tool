@@ -1,15 +1,20 @@
-# Local dev stack (Phase 1). Brings up Postgres + API + worker with a single command:
-#   docker compose up --build
-# Bindings are loopback-only by default — the dev stack is NOT exposed on a public interface (safety gate).
+# Local dev stack (Phase 1). One command brings up the full stack — db + api + worker + web:
+#   docker compose up --build --wait
+# `--wait` blocks until every service reports healthy (each has a health check below / in its Dockerfile).
+# All host port bindings are loopback-only (127.0.0.1) — the dev stack is NOT exposed on any public interface
+# (Phase 1 safety gate). Container images are digest-pinned (supply-chain gate).
+#
+# To apply DB migrations against this stack's database:
+#   DATABASE_URL=postgresql://pentest:pentest_dev_only@127.0.0.1:5432/pentest pnpm --filter @pentest/db run migrate
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
     environment:
       POSTGRES_USER: pentest
       POSTGRES_PASSWORD: pentest_dev_only
       POSTGRES_DB: pentest
     ports:
-      - '127.0.0.1:5432:5432'
+      - '127.0.0.1:5432:5432' # loopback-only
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U pentest -d pentest']
       interval: 5s
@@ -24,16 +29,43 @@ services:
       dockerfile: services/api/Dockerfile
     environment:
       NODE_ENV: development
-      API_HOST: 0.0.0.0 # inside the container network only; host mapping below stays loopback
+      API_HOST: 0.0.0.0 # inside the container network only; the host mapping below stays loopback
       API_PORT: '8080'
       LOG_LEVEL: info
       DATABASE_URL: postgresql://pentest:pentest_dev_only@db:5432/pentest
       SESSION_SIGNING_KEY_REF: dev-insecure-session-key-change-me-0123456789
     ports:
-      - '127.0.0.1:8080:8080'
+      - '127.0.0.1:8080:8080' # loopback-only
     depends_on:
       db:
         condition: service_healthy
+    # Health check is defined in services/api/Dockerfile (HTTP GET /healthz).
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      NODE_ENV: development
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://pentest:pentest_dev_only@db:5432/pentest
+      SESSION_SIGNING_KEY_REF: dev-insecure-session-key-change-me-0123456789
+      WORKER_READINESS_FILE: /tmp/worker-ready
+    depends_on:
+      db:
+        condition: service_healthy
+    # No inbound port. Health check is defined in services/worker/Dockerfile (liveness heartbeat freshness).
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      WEB_HOST: 0.0.0.0 # inside the container network only; the host mapping below stays loopback
+      WEB_PORT: '8080'
+    ports:
+      - '127.0.0.1:8081:8080' # loopback-only
+    # Health check is defined in apps/web/Dockerfile (HTTP GET /healthz).
 
 volumes:
   db-data:

@@ -54,7 +54,10 @@ export function can(role: unknown, permission: unknown): boolean {
   return grants.has(permission as Permission);
 }
 
-/** All permissions explicitly granted to a known role (empty for unknown roles). For introspection/tests. */
-export function grantsFor(role: unknown): ReadonlySet<Permission> {
-  return isRole(role) ? roleGrants[role] : new Set<Permission>();
+/**
+ * All permissions explicitly granted to a known role (empty for unknown roles), returned as a fresh COPY so a
+ * caller cannot mutate the internal authorization grants. `roleGrants` itself is module-private and never exposed.
+ */
+export function grantsFor(role: unknown): Set<Permission> {
+  return isRole(role) ? new Set(roleGrants[role]) : new Set<Permission>();
 }

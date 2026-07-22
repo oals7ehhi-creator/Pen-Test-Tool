@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "dev": "node --experimental-strip-types src/index.ts"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@pentest/shared": "workspace:*"

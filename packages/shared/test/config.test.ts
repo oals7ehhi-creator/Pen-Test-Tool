@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { loadConfig, ConfigError } from '../src/index.js';
+import { loadConfig, loadDbConfig, ConfigError } from '../src/index.js';
 
 /**
  * Phase 1 exit test — boot-fail on missing/invalid config, with a clear SECRET-FREE message.
@@ -51,6 +51,14 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...VALID, SESSION_SIGNING_KEY_REF: 'short' })).toThrow(ConfigError);
   });
 
+  it('devAuthEnabled is opt-in and force-disabled in production', () => {
+    expect(loadConfig({ ...VALID, DEV_AUTH_ENABLED: 'true' }).devAuthEnabled).toBe(true); // NODE_ENV=test
+    expect(loadConfig({ ...VALID }).devAuthEnabled).toBe(false); // default off
+    expect(
+      loadConfig({ ...VALID, NODE_ENV: 'production', DEV_AUTH_ENABLED: 'true' }).devAuthEnabled,
+    ).toBe(false);
+  });
+
   it('the error message never contains the offending secret VALUE', () => {
     const leaky = 'super-secret-value-should-not-appear-in-error';
     let msg = '';
@@ -63,5 +71,27 @@ describe('loadConfig', () => {
     expect(msg).toContain('DATABASE_URL');
     expect(msg).not.toContain(leaky);
     expect(msg).not.toContain('not-a-db-url'); // values are never echoed, only key + reason
+  });
+});
+
+describe('loadDbConfig (DB-only, item 2)', () => {
+  it('validates DATABASE_URL alone — no session key or API host required', () => {
+    const cfg = loadDbConfig({
+      DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/db',
+      LOG_LEVEL: 'warn',
+    });
+    expect(cfg.databaseUrl).toContain('postgresql://');
+    expect(cfg.logLevel).toBe('warn');
+  });
+
+  it('fails closed on a missing/invalid DATABASE_URL', () => {
+    expect(() => loadDbConfig({})).toThrow(ConfigError);
+    expect(() => loadDbConfig({ DATABASE_URL: 'mysql://x' })).toThrow(ConfigError);
+  });
+
+  it('does NOT require SESSION_SIGNING_KEY_REF (unlike the full app config)', () => {
+    // Absent session key would make loadConfig throw, but loadDbConfig must succeed.
+    expect(() => loadConfig({ DATABASE_URL: 'postgresql://u:p@h:5432/db' })).toThrow(ConfigError);
+    expect(() => loadDbConfig({ DATABASE_URL: 'postgresql://u:p@h:5432/db' })).not.toThrow();
   });
 });

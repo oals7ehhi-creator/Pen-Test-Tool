@@ -2,7 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import pg from 'pg';
-import { loadConfig, createLogger } from '@pentest/shared';
+import { loadDbConfig, createLogger } from '@pentest/shared';
 
 /**
  * Minimal forward+rollback migration runner. Each migration is a pair `NNNN_name.up.sql` / `NNNN_name.down.sql`.
@@ -107,25 +107,44 @@ async function down(client: pg.Client, log: ReturnType<typeof createLogger>): Pr
   log.info('migration rolled back', { version: last.version, name: last.name });
 }
 
+/** Snapshot of the public-schema shape (user tables + their columns), excluding the runner's own tracking table. */
+async function schemaSnapshot(client: pg.Client): Promise<string> {
+  const { rows } = await client.query<{ sig: string }>(
+    `SELECT string_agg(table_name || '.' || column_name || ':' || data_type, ',' ORDER BY table_name, ordinal_position) AS sig
+       FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name <> 'schema_migrations'`,
+  );
+  return rows[0]?.sig ?? '';
+}
+
 async function ci(client: pg.Client, log: ReturnType<typeof createLogger>): Promise<void> {
   const migrations = await loadMigrations();
+  await ensureTracking(client);
+  const before = await schemaSnapshot(client); // the DEFINED prior schema (empty on a clean DB)
   await up(client, log);
+  const afterUp = await schemaSnapshot(client);
+  if (afterUp === before) throw new Error('up applied no schema change (nothing to verify)');
   for (let i = 0; i < migrations.length; i++) await down(client, log); // roll all the way back
-  const afterDown = await appliedVersions(client);
-  if (afterDown.size !== 0)
-    throw new Error(`rollback incomplete: ${[...afterDown].join(',')} still applied`);
-  // The tenant table created by 0001 must be gone after full rollback.
-  const { rows } = await client.query<{ exists: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'tenant') AS exists`,
+  const applied = await appliedVersions(client);
+  if (applied.size !== 0)
+    throw new Error(`rollback incomplete: ${[...applied].join(',')} still applied`);
+  const afterDown = await schemaSnapshot(client);
+  if (afterDown !== before) {
+    throw new Error(
+      `rollback did not restore the prior schema.\n  before: ${before}\n  after:  ${afterDown}`,
+    );
+  }
+  await up(client, log); // re-apply to prove up→down→up is deterministic
+  const afterUp2 = await schemaSnapshot(client);
+  if (afterUp2 !== afterUp)
+    throw new Error('re-applied schema differs from the first up (non-deterministic)');
+  log.info(
+    'migrate:ci ok — up/down/up round-trip verified; rollback restored the exact prior schema',
   );
-  if (rows[0]?.exists)
-    throw new Error('rollback did not restore prior schema (tenant table still present)');
-  await up(client, log);
-  log.info('migrate:ci ok — up/down/up round-trip verified');
 }
 
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const config = loadDbConfig();
   const log = createLogger({ level: config.logLevel }).child({ component: 'db-migrate' });
   const cmd = process.argv[2] ?? 'up';
   const client = new pg.Client({ connectionString: config.databaseUrl });

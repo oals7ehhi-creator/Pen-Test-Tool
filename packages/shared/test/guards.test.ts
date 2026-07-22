@@ -28,9 +28,9 @@ describe('logger emits at every level and supports child bindings', () => {
     for (const lvl of levels) child[lvl](`msg-${lvl}`, { seq: 1 });
     expect(lines).toHaveLength(5);
     for (const line of lines) {
-      const rec = JSON.parse(line) as Record<string, unknown>;
-      expect(rec.component).toBe('api');
-      expect(rec.seq).toBe(1);
+      const rec = JSON.parse(line) as { ctx: Record<string, unknown> };
+      expect(rec.ctx.component).toBe('api');
+      expect(rec.ctx.seq).toBe(1);
     }
   });
 });

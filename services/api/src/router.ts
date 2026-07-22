@@ -12,43 +12,54 @@ export interface RouteDef {
   readonly permission: Permission | null; // null = explicitly public
 }
 
-export const ROUTES: readonly RouteDef[] = [
-  { method: 'GET', path: '/healthz', permission: null },
-  { method: 'GET', path: '/engagements', permission: 'engagement.read' },
-  { method: 'POST', path: '/engagements', permission: 'engagement.create' },
-  { method: 'POST', path: '/engagements/scope', permission: 'engagement.scope.define' },
-  {
-    method: 'POST',
-    path: '/intrusive/validation/request',
-    permission: 'intrusive.validation.request',
-  },
-  {
-    method: 'POST',
-    path: '/intrusive/validation/approve',
-    permission: 'intrusive.validation.approve',
-  },
-  { method: 'GET', path: '/audit', permission: 'audit.read' },
-];
+// The registry is DEEP-FROZEN so it cannot be mutated at runtime (a mutated route table is an authorization bypass).
+const ROUTES_INTERNAL: readonly RouteDef[] = Object.freeze(
+  (
+    [
+      { method: 'GET', path: '/healthz', permission: null },
+      { method: 'GET', path: '/engagements', permission: 'engagement.read' },
+      { method: 'POST', path: '/engagements', permission: 'engagement.create' },
+      { method: 'POST', path: '/engagements/scope', permission: 'engagement.scope.define' },
+      {
+        method: 'POST',
+        path: '/intrusive/validation/request',
+        permission: 'intrusive.validation.request',
+      },
+      {
+        method: 'POST',
+        path: '/intrusive/validation/approve',
+        permission: 'intrusive.validation.approve',
+      },
+      { method: 'GET', path: '/audit', permission: 'audit.read' },
+    ] satisfies RouteDef[]
+  ).map((r) => Object.freeze(r)),
+);
+
+/** Return a shallow COPY of the route registry so callers cannot mutate the authoritative table. */
+export function listRoutes(): RouteDef[] {
+  return ROUTES_INTERNAL.map((r) => ({ ...r }));
+}
 
 export type AuthzOutcome =
-  | { readonly status: 200; readonly permission: Permission | null }
-  | { readonly status: 401 } // no authenticated identity for a protected route
-  | { readonly status: 403; readonly permission: Permission } // authenticated but not permitted
+  | { readonly status: 200; readonly route: string; readonly permission: Permission | null }
+  | { readonly status: 401; readonly route: string } // no authenticated identity for a protected route
+  | { readonly status: 403; readonly route: string; readonly permission: Permission } // authenticated, not permitted
   | { readonly status: 404 }; // unknown route
 
 /**
- * Pure authorization decision for a request. `role` is the caller's role (or undefined if unauthenticated).
- * No side effects; used directly by the server handler and by tests.
+ * Pure authorization decision for a request. `role` is the caller's role (or undefined if unauthenticated). No side
+ * effects. The returned `route` is the MATCHED route template (a known-safe string) — safe to log, unlike the raw URL.
  */
 export function authorizeRequest(
   method: string,
   path: string,
   role: string | undefined,
 ): AuthzOutcome {
-  const route = ROUTES.find((r) => r.method === method && r.path === path);
+  const route = ROUTES_INTERNAL.find((r) => r.method === method && r.path === path);
   if (!route) return { status: 404 }; // unknown route → deny by default
-  if (route.permission === null) return { status: 200, permission: null }; // explicitly public
-  if (role === undefined) return { status: 401 }; // protected route needs an identity
-  if (!can(role, route.permission)) return { status: 403, permission: route.permission }; // default-deny
-  return { status: 200, permission: route.permission };
+  if (route.permission === null) return { status: 200, route: route.path, permission: null }; // explicitly public
+  if (role === undefined) return { status: 401, route: route.path }; // protected route needs an identity
+  if (!can(role, route.permission))
+    return { status: 403, route: route.path, permission: route.permission };
+  return { status: 200, route: route.path, permission: route.permission };
 }

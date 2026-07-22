@@ -1,0 +1,16 @@
+# Keep the build context minimal and reproducible: the image builds deps from the lockfile inside the builder
+# stage, so host-side installed/built artifacts must never be copied in (their symlinks are host-absolute).
+node_modules
+**/node_modules
+dist
+**/dist
+build
+**/build
+coverage
+**/coverage
+.git
+**/*.log
+.env
+.env.*
+!.env.example
+.DS_Store
