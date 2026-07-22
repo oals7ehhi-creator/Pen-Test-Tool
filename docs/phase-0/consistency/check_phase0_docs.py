@@ -169,13 +169,52 @@ def analyze(texts):
     proc = re.search(r"STAGE 2 — GUARDED EGRESS BROKER.*?```", a, re.S)
     if proc:
         pt = proc.group(0)
-        i_intent = pt.find("AUDIT INTENT")
+        i_intent = pt.find("request.intent")
         i_dns = pt.find("DNS RESOLUTION")
         if i_intent == -1 or i_dns == -1 or i_intent > i_dns:
             problems.append("04 §7.1: request.intent is NOT ordered before DNS resolution (intent must precede any egress)")
     #    WebSocket must be catalog-controlled
     if "ws_frame_set" not in a or "frame gate" not in a and "outside that set" not in a:
         problems.append("04: WebSocket outbound frames not shown as catalog-controlled")
+
+    # --- round 5: exact stale statements MUST be fixed (each is a negative-fixture-backed detector) ---
+    # Reservation must be created in the broker (Stage 2) transaction, NOT at Stage-1 mint.
+    s1 = re.search(r"STAGE 1 — SCOPE AUTHORITY.*?(?=STAGE 2 —)", a, re.S)
+    if s1 and re.search(r"create a budget_reservation|RESERVE .{0,20}budget unit", s1.group(0)):
+        problems.append("04 §7.1: reservation created at Stage-1/mint (must be created in the broker txn before DNS)")
+    # Required round-5 tokens in 04 (their absence is the stale state)
+    for tok, why in [
+        ("session_digest", "non-secret session/account/version digest not bound into spec"),
+        ("query_value_digest", "protected query-value representation not bound into spec"),
+        ("kind_scheme", "bidirectional kind<->scheme constraint missing"),
+        ("catalog_template(digest, kind)", "catalog kind not enforced on digest FKs"),
+        ("audit_event(id, chain_id)", "related_event_id not constrained to same chain"),
+        ("GENERATED ALWAYS AS", "audit chain_key not generated per scope"),
+        ("fence_token", "reservation lease not owned/fenced"),
+        ("FOR UPDATE", "atomic budget lock missing"),
+        ("manifest_frozen", "manifest not frozen before decisions"),
+        ("role_quorum", "role quorum not enforced"),
+        ("start_at < end_at", "window ordering constraint missing"),
+        ("status <> 'draft'", "draft active-pointer constraint missing"),
+        ("approval_required", "approval requirement not derived (trusts mode)"),
+    ]:
+        if tok not in a:
+            problems.append(f"04: round-5 token missing: {tok} ({why})")
+    # Anti-patterns that must be GONE from 04
+    if "gated_needs_ref CHECK (mode <> 'approval_gated'" in a:
+        problems.append("04: approval requirement trusts self-declared mode (derive from catalog safety_class)")
+    if "ws_is_get       CHECK (kind <> 'websocket' OR (method = 'GET' AND scheme IN ('ws','wss')))" in a:
+        problems.append("04: one-directional ws_is_get (need bidirectional kind<->scheme)")
+    if re.search(r"REFERENCES catalog_template\(digest\)", a):  # (digest,kind) form has no literal "(digest)"
+        problems.append("04: catalog FK without kind enforcement (REFERENCES catalog_template(digest))")
+    if "session_ref, run_id, job_id are EXCLUDED" in a and "session_digest" not in a:
+        problems.append("04: session identity excluded without a bound non-secret session_digest")
+    # pause/approve/resume for dynamic (broker-mediated) requests
+    if not ("pause" in a.lower() and "resume" in a.lower()):
+        problems.append("04 §7.2: pause/approve/resume for dynamic requests not defined")
+    # approval policy pinned to the current matching version
+    if "current, non-superseded" not in a and "pins the current" not in a:
+        problems.append("04 §10: approval policy not pinned to current matching (non-superseded) version")
 
     # 10) code-fence balance
     for bn, t in texts.items():
@@ -207,6 +246,35 @@ NEG_FIXTURES = [
      lambda x: _sub(x, "05-safety-invariants.md", x["05-safety-invariants.md"].replace("**65 absolute", "**64 absolute", 1))),
     ("broken cross-reference SI-999",
      lambda x: _sub(x, "06-acceptance-criteria.md", x["06-acceptance-criteria.md"] + "\nSee SI-999 for details.\n")),
+    # round-5 stale patterns (injected into the FIXED corpus; each must be detected)
+    ("reservation created at Stage-1 mint",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace(
+                        "STAGE 2 — GUARDED EGRESS BROKER", " → ON PASS: create a budget_reservation at mint.\n\nSTAGE 2 — GUARDED EGRESS BROKER", 1))),
+    ("approval trusts self-declared mode",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"] + "\n  CONSTRAINT gated_needs_ref CHECK (mode <> 'approval_gated' OR approval_ref IS NOT NULL)\n")),
+    ("catalog FK without kind",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"] + "\n  FOREIGN KEY (payload_digest) REFERENCES catalog_template(digest),\n")),
+    ("session_digest token removed",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace("session_digest", "session_XXXXX"))),
+    ("fence_token token removed",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace("fence_token", "fence_XXXXX"))),
+    ("audit related-event same-chain FK removed",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace("audit_event(id, chain_id)", "audit_event(id)"))),
+    ("manifest_frozen removed",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace("manifest_frozen", "manifest_XXXXX"))),
+    ("role_quorum removed",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace("role_quorum", "role_XXXXX"))),
+    ("window ordering removed",
+     lambda x: _sub(x, "04-authorization-and-scope-schema.md",
+                    x["04-authorization-and-scope-schema.md"].replace("start_at < end_at", "start_at <= end_at_DISABLED"))),
 ]
 
 def _sub(d, key, val):

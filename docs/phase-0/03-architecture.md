@@ -186,8 +186,8 @@ Check engine builds an IMMUTABLE, fully-hashed request_spec (spec_sha256 over th
 STAGE 1 — Scope Authority (JUST-IN-TIME): load spec; recompute+verify spec_sha256
         │                        │
         │      DENY ◄────────────┘  (reason recorded; spec stays queued or is dropped)
-        ▼ ALLOW  → re-check scope/auth/window/e-stop over CURRENT state; create a budget_reservation
-        │          (keyed by grant jti); mint SIGNED, ≤30s, single-use GRANT bound to spec_sha256 (NO IP)
+        ▼ ALLOW  → re-check scope/auth/window/e-stop over CURRENT state; mint SIGNED, ≤30s, single-use
+        │          GRANT bound to spec_sha256 (NO IP). Reservation is created by the broker (below), not here.
         ▼
 Worker presents (per-job identity + grant + spec) to the broker's authenticated ingress
    (the worker does NOT serialize the HTTP request itself)
@@ -196,8 +196,9 @@ Worker presents (per-job identity + grant + spec) to the broker's authenticated 
 STAGE 2 — Guarded Egress Broker:
    auth per-job ingress ─► verify grant (sig/aud/exp/jti single-use) AND grant.spec_sha256==sha256(spec)
    ─► RECONSTRUCT+normalize the request FROM THE SPEC (assert == spec) ─► re-check live state
-   (auth/window/e-stop/rate, fail-closed) ─► commit request.intent (spec_sha256, jti, reservation id)
-   BEFORE ANY EGRESS ─► resolve DNS (first egress) ─► check ALL resolved IPs (Tier A/B) ─► PIN validated IP
+   (auth/window/e-stop/rate, fail-closed) ─► ATOMIC (budget FOR UPDATE; fenced reservation lease;
+   commit request.intent spec_sha256/jti/reservation-id) BEFORE ANY EGRESS ─► resolve DNS (first egress)
+   ─► check ALL resolved IPs (Tier A/B) ─► PIN validated IP
    ─► connect to PINNED IP (TCP+TLS, SNI=orig host) ─► send ─► redirect? new spec + FRESH grant, stop if off-scope
    ─► request.completed/failed (resolved+pinned IP, redacted); idempotently COMMIT/RELEASE the reservation
         │

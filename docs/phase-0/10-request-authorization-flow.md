@@ -62,8 +62,8 @@ Check engine ── builds ──▶ immutable request_spec (hashed: spec_sha256
 Dispatcher ── spec_id ──▶ Scope Authority  (STAGE 1, JUST-IN-TIME)
                      load spec; recompute + verify spec_sha256 (else DENY spec_tampered)
                      re-run §7 checks 0–5 over the frozen scope_version, against CURRENT state
-                     PASS ─▶ create a budget_reservation (keyed by grant jti, §8.1); mint short-TTL grant
-                              bound to spec_sha256 (§2); emit scope.decision.allow
+                     PASS ─▶ mint short-TTL grant bound to spec_sha256 (§2); emit scope.decision.allow
+                              (the reservation is created by the BROKER, atomically with intent, before DNS — §8.1)
                      FAIL ─▶ DENY (audited); spec stays queued for later, or dropped on hard failure
         │
         ▼ grant + spec dispatched to a Worker (control plane → data plane; jobs pulled, no inbound to workers)
@@ -77,8 +77,9 @@ Guarded Egress Broker  (STAGE 2)
                        inert payload, operator session from the secret lease); re-normalize; assert == spec  else DENY
    4. RE-CHECK STATE — authorization fresh, window open, e-stop clear, rate/concurrency slot
                        (fail-closed per SI-046: any unknown ⇒ DENY and idempotently RELEASE the reservation)
-   5. INTENT AUDIT   — BEFORE ANY EGRESS (no DNS/TCP/TLS yet): durably commit request.intent
-                       (spec_sha256, jti, reservation id, canonical target) in ONE txn with the reservation (SI-055)
+   5. ATOMIC RESERVE + INTENT — one txn, BEFORE ANY EGRESS: SELECT budget FOR UPDATE; verify availability;
+                       INSERT a fenced budget_reservation lease (owner + monotonic fence_token, grant jti);
+                       durably commit request.intent (spec_sha256, jti, reservation id, canonical target) (SI-055)
    6. RESOLVE DNS    — the FIRST egress: canonical_host → all A/AAAA
    7. GUARD + SCOPE  — every resolved IP: network guard (§6) + must satisfy scope_hash's ip/cidr/domain rules
    8. PIN + CONNECT  — dial ONLY a pinned validated IP; TCP + TLS; cert host must match canonical_host
