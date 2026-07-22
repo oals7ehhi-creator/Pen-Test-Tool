@@ -18,5 +18,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run --coverage"
+  },
+  "dependencies": {
+    "jose": "6.2.4"
   }
 }

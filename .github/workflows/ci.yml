@@ -54,11 +54,22 @@ jobs:
         run: pnpm run format:check
       - name: Lint (incl. no-shell rule)
         run: pnpm run lint
+      # Negative proof (hard gate, self-cleaning): a runtime-seeded file importing node:child_process MUST fail the
+      # no-shell lint rule. Proves the gate has teeth; it never weakens the real lint above.
+      - name: No-shell lint gate — negative proof
+        run: bash ci/lint-noshell-negative-test.sh
       - name: Typecheck
         run: pnpm -r run typecheck
       # DATABASE_URL is set (Postgres service), so the db suite's real up/down snapshot tests run here too.
-      - name: Unit tests + coverage
+      # `test` runs vitest with --coverage in @pentest/shared and @pentest/api; both enforce explicit coverage
+      # thresholds over their safety-critical source (auth, sessions, key resolution, RBAC, logging) with no broad
+      # exclusions — a coverage regression fails this step.
+      - name: Unit tests + coverage (thresholds enforced)
         run: pnpm -r run test
+      # Reproducible-build proof (hard gate, self-cleaning): two independent clean frozen-lockfile installs must
+      # materialize identical normalized dependency trees. Runs against an isolated copy — never mutates the tree.
+      - name: Reproducible install — two frozen installs produce identical trees
+        run: bash ci/deterministic-install-test.sh
       - name: DB migrations up/down/up round-trip on a clean database
         run: pnpm --filter @pentest/db run migrate:ci
 
@@ -82,6 +93,11 @@ jobs:
       # Dependency vulnerability audit (supply-chain gate): fail on known high+ severity advisories.
       - name: Dependency audit
         run: pnpm audit --audit-level=high
+      # Negative proof (hard gate, self-cleaning): the SAME audit command must FAIL on a throwaway project pinned to
+      # a known-critical advisory (minimist <0.2.4). The vulnerable dependency is never added to this repository.
+      - name: Dependency audit gate — negative proof
+        if: always()
+        run: bash ci/dependency-audit-negative-test.sh
       # SAST via a DIGEST-PINNED Semgrep container running this repo's OWN, reviewed ruleset (ci/semgrep-rules.yml).
       # No mutable remote pack and no version drift; `--metrics=off --disable-version-check` keep it hermetic. It
       # runs with `if: always()` so a failing gitleaks/audit step never skips the SAST scan.

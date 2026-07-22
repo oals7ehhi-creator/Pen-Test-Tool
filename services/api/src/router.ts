@@ -40,15 +40,25 @@ export function listRoutes(): RouteDef[] {
   return ROUTES_INTERNAL.map((r) => ({ ...r }));
 }
 
+/** Return a COPY of the route matching (method, path), or undefined. Never exposes the frozen internal object. */
+export function matchRoute(method: string, path: string): RouteDef | undefined {
+  const route = ROUTES_INTERNAL.find((r) => r.method === method && r.path === path);
+  return route ? { ...route } : undefined;
+}
+
 /** Safe placeholder logged in place of a route when the request matched no known route. */
 export const UNMATCHED_ROUTE = '(unmatched)';
+/** Dev-only minter path — loggable (a fixed safe string) but never in the authorization table. */
+export const DEV_TOKEN_PATH = '/dev/token';
 
 /**
- * The ALLOWLIST of route strings that may appear in a log's `route` field: every known route template plus the
- * `UNMATCHED_ROUTE` sentinel. A raw URL, path, or query string is not in this set, so it can never be logged.
+ * The ALLOWLIST of route strings that may appear in a log's `route` field: every known route template, the
+ * dev-token path, plus the `UNMATCHED_ROUTE` sentinel. A raw URL, path, or query string is not in this set, so it
+ * can never be logged.
  */
 export const ROUTE_TEMPLATES: readonly string[] = Object.freeze([
   ...ROUTES_INTERNAL.map((r) => r.path),
+  DEV_TOKEN_PATH,
   UNMATCHED_ROUTE,
 ]);
 
