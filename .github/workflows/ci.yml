@@ -5,9 +5,11 @@ on:
     branches: ['**']
   pull_request:
 
-# Least-privilege default token.
+# Least-privilege default token. `pull-requests: read` lets the secret scanner enumerate a PR's commits on
+# pull_request events (gitleaks-action requires the token to scan PRs); nothing here is granted write.
 permissions:
   contents: read
+  pull-requests: read
 
 # Supply-chain gate: every third-party action is pinned to a full commit SHA (tag in a trailing comment) and every
 # container image is pinned by digest. All actions are on Node 24 runtimes (no Node 20 deprecation warnings).
@@ -79,10 +81,13 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
-      # Secret scanning: blocks merges on any committed secret.
+      # Secret scanning: blocks merges on any committed secret. On pull_request events gitleaks-action REQUIRES
+      # GITHUB_TOKEN (it enumerates the PR's commits via the API); on push it does not. Providing the
+      # auto-created token makes the gate work identically on both event types.
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -95,8 +100,10 @@ jobs:
         run: pnpm audit --audit-level=high
       # Negative proof (hard gate, self-cleaning): the SAME audit command must FAIL on a throwaway project pinned to
       # a known-critical advisory (minimist <0.2.4). The vulnerable dependency is never added to this repository.
+      # This step depends on the pnpm/node setup above, so it runs in normal sequence (NOT `if: always()`) — it is
+      # still a hard gate (no continue-on-error); forcing it to run after an earlier setup failure would only make
+      # it fail spuriously on a missing pnpm rather than surface the real failure.
       - name: Dependency audit gate — negative proof
-        if: always()
         run: bash ci/dependency-audit-negative-test.sh
       # SAST via a DIGEST-PINNED Semgrep container running this repo's OWN, reviewed ruleset (ci/semgrep-rules.yml).
       # No mutable remote pack and no version drift; `--metrics=off --disable-version-check` keep it hermetic. It
