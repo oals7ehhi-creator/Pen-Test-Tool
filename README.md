@@ -18,7 +18,7 @@ An **authorized, non-destructive** platform that automates as much of an authori
 
 There is **no one-click "attack everything"** and **no automatic intrusive validation**.
 
-## Project status — Phase 0 approved; Phase 1 in progress
+## Project status — Phase 0 approved; Phase 1 ready for review
 
 This project follows a strict phased delivery process. Each phase stops for review before the next begins.
 See [`docs/PHASE-STATUS.md`](docs/PHASE-STATUS.md).
@@ -26,7 +26,7 @@ See [`docs/PHASE-STATUS.md`](docs/PHASE-STATUS.md).
 | Phase | Title                                     | Status                      |
 | ----- | ----------------------------------------- | --------------------------- |
 | **0** | **Requirements & threat model**           | ✅ **Approved** (`73cfbbb`) |
-| 1     | Secure project foundation                 | 🔨 **In progress**          |
+| 1     | Secure project foundation                 | 🔎 **Ready for review**     |
 | 2     | Engagement, authorization & scope engine  | ⏳                          |
 | 3     | Target intake & passive analysis          | ⏳                          |
 | 4     | Safe crawler & attack-surface inventory   | ⏳                          |
@@ -55,13 +55,14 @@ Start here: **[docs/phase-0/00-overview.md](docs/phase-0/00-overview.md)**.
 ├── packages/
 │   └── shared/          # safety core: fail-closed config, minimized allowlist logger, default-deny RBAC (+ tests)
 ├── services/
-│   ├── api/             # backend API (default-deny route authorization, minimized structured logging)
+│   ├── api/             # backend API (verified-session authN, default-deny route authorization, minimized logging)
 │   └── worker/          # data-plane worker skeleton
 ├── apps/
 │   └── web/             # operator console (placeholder)
 ├── db/                  # forward+rollback migration runner + migrations
 └── docs/
-    └── phase-0/         # approved Phase 0 design package + consistency checker
+    ├── phase-0/         # approved Phase 0 design package + consistency checker
+    └── phase-1/         # Phase 1 evidence package (authN, secrets, no-shell review, acceptance matrix)
 ```
 
 ## Getting started (Phase 1)
@@ -81,6 +82,14 @@ docker compose up --build --wait
 The **safety foundations** every later phase plugs into live in `packages/shared`: configuration is validated at
 startup and the app **refuses to boot** on missing/invalid values (fail-closed); all structured logs pass through a
 **minimized allowlist** layer (SI-045) that serializes only explicit scalar fields — never whole headers, URLs,
-bodies, cookies, or arbitrary objects — and masks sensitive keys, so callers cannot log sensitive material even by
-accident; and authorization is **default-deny** across exactly the five roles (Administrator, Engagement Manager,
-Tester, Reviewer, Read-only Auditor).
+bodies, cookies, tokens, or arbitrary objects — so callers cannot log sensitive material even by accident; and
+authorization is **default-deny** across exactly the five roles (Administrator, Engagement Manager, Tester,
+Reviewer, Read-only Auditor).
+
+Protected routes accept identity **only** from a cryptographically verified session token (HS256, pinned
+algorithm/issuer/audience, full signature + claim + idle ≤ 30 min / absolute ≤ 12 h lifetime checks); the role
+comes exclusively from verified claims — no header, query, or body can set it — and `/healthz` is the only public
+route. The signing key is referenced, never embedded: production **fails closed** if the reference cannot be
+resolved to strong material, while development uses an ephemeral key so the one-command stack stays usable. The
+Phase 1 evidence package (authentication trust boundary, secret management, the recorded no-shell review, and the
+criterion → test → CI acceptance matrix) is in **[`docs/phase-1/`](docs/phase-1/README.md)**.

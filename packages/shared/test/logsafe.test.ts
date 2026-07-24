@@ -5,6 +5,8 @@ import {
   field,
   RESERVED_FIELDS,
   UNKNOWN_EVENT,
+  UNSAFE_CORRELATION_ID,
+  safeCorrelationId,
   type EventRegistry,
   type EventSchema,
 } from '../src/index.js';
@@ -194,5 +196,43 @@ describe('authoritative correlation id (item 1)', () => {
     log.childWithCorrelationId('id-2').info('op', { name: 'b' });
     expect(JSON.parse(lines[0]!).correlationId).toBe('id-1');
     expect(JSON.parse(lines[1]!).correlationId).toBe('id-2');
+  });
+});
+
+describe('correlation id is a validated safe identifier — an unsafe id cannot be logged verbatim', () => {
+  const SECRET = 'S3CR3T-must-never-be-logged';
+
+  it('safeCorrelationId passes a UUID/safe token and replaces anything unsafe with a fixed sentinel', () => {
+    expect(safeCorrelationId('7106574c-2c95-4fd1-9669-064461c7d4d9')).toBe(
+      '7106574c-2c95-4fd1-9669-064461c7d4d9',
+    );
+    expect(safeCorrelationId('root')).toBe('root');
+    // Anything carrying URL/path/query/space/quote characters (a place a secret could hide) → sentinel.
+    expect(safeCorrelationId(`Bearer ${SECRET}`)).toBe(UNSAFE_CORRELATION_ID);
+    expect(safeCorrelationId(`https://h/p?token=${SECRET}`)).toBe(UNSAFE_CORRELATION_ID);
+    expect(safeCorrelationId(`token=${SECRET}; path=/`)).toBe(UNSAFE_CORRELATION_ID);
+  });
+
+  it('childWithCorrelationId emits the sentinel (never the raw value) for an unsafe id', () => {
+    const { lines, log } = capture();
+    log.childWithCorrelationId(`authorization: Bearer ${SECRET}`).info('op', { name: 'a' });
+    const rec = JSON.parse(lines[0]!);
+    expect(rec.correlationId).toBe(UNSAFE_CORRELATION_ID);
+    expect(lines.join('\n')).not.toContain(SECRET);
+    expect(lines.join('\n')).not.toContain('Bearer');
+  });
+
+  it('createLogger also validates its correlation id', () => {
+    const lines: string[] = [];
+    const log = createLogger({
+      level: 'trace',
+      events: EVENTS,
+      correlationId: `cookie: session=${SECRET}`,
+      sink: (l) => lines.push(l),
+      now: () => new Date(0),
+    });
+    log.info('op', { name: 'a' });
+    expect(JSON.parse(lines[0]!).correlationId).toBe(UNSAFE_CORRELATION_ID);
+    expect(lines.join('\n')).not.toContain(SECRET);
   });
 });

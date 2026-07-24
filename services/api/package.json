@@ -6,10 +6,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --coverage",
     "start": "node dist/server.js"
   },
   "dependencies": {
     "@pentest/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "jose": "6.2.4"
   }
 }

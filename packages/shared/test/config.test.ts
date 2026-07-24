@@ -51,12 +51,23 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...VALID, SESSION_SIGNING_KEY_REF: 'short' })).toThrow(ConfigError);
   });
 
-  it('devAuthEnabled is opt-in and force-disabled in production', () => {
-    expect(loadConfig({ ...VALID, DEV_AUTH_ENABLED: 'true' }).devAuthEnabled).toBe(true); // NODE_ENV=test
-    expect(loadConfig({ ...VALID }).devAuthEnabled).toBe(false); // default off
+  it('devTokenMinterEnabled is opt-in and force-disabled in production', () => {
+    expect(loadConfig({ ...VALID, DEV_TOKEN_MINTER: 'true' }).devTokenMinterEnabled).toBe(true); // NODE_ENV=test
+    expect(loadConfig({ ...VALID }).devTokenMinterEnabled).toBe(false); // default off
     expect(
-      loadConfig({ ...VALID, NODE_ENV: 'production', DEV_AUTH_ENABLED: 'true' }).devAuthEnabled,
+      loadConfig({ ...VALID, NODE_ENV: 'production', DEV_TOKEN_MINTER: 'true' })
+        .devTokenMinterEnabled,
     ).toBe(false);
+  });
+
+  it('pins issuer/audience with safe defaults and rejects malformed values', () => {
+    const def = loadConfig({ ...VALID });
+    expect(def.authIssuer).toBe('pentest-tool');
+    expect(def.authAudience).toBe('pentest-api');
+    const custom = loadConfig({ ...VALID, AUTH_ISSUER: 'my-issuer', AUTH_AUDIENCE: 'my-aud' });
+    expect(custom.authIssuer).toBe('my-issuer');
+    expect(custom.authAudience).toBe('my-aud');
+    expect(() => loadConfig({ ...VALID, AUTH_ISSUER: 'has space' })).toThrow(ConfigError);
   });
 
   it('the error message never contains the offending secret VALUE', () => {

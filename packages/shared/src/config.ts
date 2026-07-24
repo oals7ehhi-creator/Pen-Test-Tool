@@ -25,13 +25,18 @@ export interface AppConfig {
   readonly apiPort: number;
   readonly logLevel: LogLevel;
   readonly databaseUrl: string;
-  /** Reference/handle to the session signing key. NOT the raw key material in production. */
+  /** Reference/handle to the session signing key. NOT the raw key material (see keyprovider.ts). */
   readonly sessionSigningKeyRef: string;
+  /** Pinned token issuer (`iss`): a verified session must carry exactly this value. */
+  readonly authIssuer: string;
+  /** Pinned token audience (`aud`): a verified session must carry exactly this value. */
+  readonly authAudience: string;
   /**
-   * When true, the API honors the `x-dev-role` request header as an INSECURE development-only role injection
-   * (NOT authentication). It is force-disabled in production regardless of env, and defaults off.
+   * When true (and NEVER in production), a development-only helper endpoint may MINT a properly signed, short-lived
+   * session token. It is NOT a role-injection header and is not an authorization path: protected routes still trust
+   * only verified session claims. Defaults off and is structurally unavailable in production.
    */
-  readonly devAuthEnabled: boolean;
+  readonly devTokenMinterEnabled: boolean;
 }
 
 /** DB-only configuration — everything the migration CLI needs and nothing it does not (no session key, no API host). */
@@ -79,6 +84,21 @@ function requiredString(
   return raw;
 }
 
+/** A safe, pinned label (issuer/audience): printable ASCII, no spaces or control chars, 1–256 chars. */
+function safeLabel(
+  name: string,
+  raw: string | undefined,
+  fallback: string,
+  issues: string[],
+): string {
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^[\x21-\x7e]{1,256}$/.test(raw)) {
+    issues.push(`${name} must be 1–256 printable, non-space ASCII characters`);
+    return fallback;
+  }
+  return raw;
+}
+
 /**
  * Parse + validate config from an environment record (defaults to `process.env`). THROWS `ConfigError` — with a
  * secret-free message — if any required value is missing or invalid. Callers should let this propagate at boot so
@@ -104,7 +124,8 @@ export function loadConfig(env: Env = process.env): AppConfig {
 
   const databaseUrl = validateDatabaseUrl(env.DATABASE_URL, issues);
 
-  // Required and long enough that a blank/placeholder value fails closed.
+  // A reference (a name), long enough that a blank/placeholder value fails closed. Key MATERIAL is resolved
+  // separately by the key provider; this value is never used as the key itself.
   const sessionSigningKeyRef = requiredString(
     'SESSION_SIGNING_KEY_REF',
     env.SESSION_SIGNING_KEY_REF,
@@ -112,14 +133,28 @@ export function loadConfig(env: Env = process.env): AppConfig {
     issues,
   );
 
-  // Dev-role injection is opt-in AND never available in production.
-  const devAuthEnabled = env.DEV_AUTH_ENABLED === 'true' && nodeEnv !== 'production';
+  // Pinned token issuer/audience: a verified session must match these exactly.
+  const authIssuer = safeLabel('AUTH_ISSUER', env.AUTH_ISSUER, 'pentest-tool', issues);
+  const authAudience = safeLabel('AUTH_AUDIENCE', env.AUTH_AUDIENCE, 'pentest-api', issues);
+
+  // The dev token minter is opt-in AND never available in production.
+  const devTokenMinterEnabled = env.DEV_TOKEN_MINTER === 'true' && nodeEnv !== 'production';
 
   if (issues.length > 0) {
     throw new ConfigError(issues);
   }
 
-  return { nodeEnv, apiHost, apiPort, logLevel, databaseUrl, sessionSigningKeyRef, devAuthEnabled };
+  return {
+    nodeEnv,
+    apiHost,
+    apiPort,
+    logLevel,
+    databaseUrl,
+    sessionSigningKeyRef,
+    authIssuer,
+    authAudience,
+    devTokenMinterEnabled,
+  };
 }
 
 /**
