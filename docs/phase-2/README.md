@@ -102,3 +102,19 @@ operator-query-value tables and the JIT-grant two-stage flow (§7), the Guarded 
 re-guard redirects), and the budget-reservation ledger / window / e-stop / rate-limit interlocks (§8). Those are slices
 4–5. DNS-rebinding defense is a Broker (slice 4) property — the guard classifies literals now, and the
 resolve-validate-**pin** step lands with the Broker.
+
+## Dependency-advisory disposition
+
+- **CVE-2026-14257 / GHSA-mh99-v99m-4gvg — `brace-expansion` ReDoS/DoS (high).** Published upstream after Phase 2
+  slice 3 was first pushed; unrelated to any application change here. **Fixed where fixable:** a `pnpm.overrides`
+  entry (`brace-expansion@5` → `>=5.0.8`) forces the current 5.x line to the patched **5.0.8**. **Recorded (accepted)
+  for the residual:** two _transitive_ copies remain — `brace-expansion@1.1.16` (via `minimatch@3`, pulled by
+  ESLint 9 / typescript-eslint) and `2.1.2` (via `minimatch@9`, pulled by `@vitest/coverage-v8`'s `glob@10`). Upstream
+  shipped the DoS fix **only** on the 5.x line (no 1.x/2.x backport exists — the `maintenance-v1`/`maintenance-v2`
+  releases predate 5.0.8), and `minimatch@3`/`@9` cannot consume brace-expansion 5.x (its module export shape changed,
+  breaking `minimatch`), so no compatible fix reaches those chains without breaking the build toolchain. The exposure
+  is **build-time only** (a DoS triggered by a maliciously-crafted glob pattern fed to ESLint/Vitest config) with **no
+  runtime or untrusted-input path** — none of these packages ship in the API/worker runtime. It is therefore suppressed
+  narrowly via `pnpm.auditConfig.ignoreGhsas` (this one advisory only; every other advisory and severity still hard-fails
+  the `pnpm audit --audit-level=high` gate, proven by `ci/dependency-audit-negative-test.sh`). Revisit when ESLint /
+  Vitest bump their transitive `minimatch` to a 5.x-compatible line, then drop the suppression.
