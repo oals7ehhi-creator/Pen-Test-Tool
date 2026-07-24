@@ -34,3 +34,37 @@ export {
   canonicalizeUrl,
   guardUrl,
 } from './canonicalize.js';
+
+export {
+  type EntryClass,
+  type DomainEntry,
+  type IpEntry,
+  type CidrEntry,
+  type PortEntry,
+  type ProtocolEntry,
+  type PathPrefixEntry,
+  type ApiResourceEntry,
+  type ScopeEntry,
+  type ScopeVersion,
+  DEFAULT_ALLOWED_SCHEME,
+} from './model.js';
+
+export {
+  type Candidate,
+  type EvalContext,
+  type ScopeDecision,
+  candidateFromUrl,
+  evaluateScope,
+  evaluateUrl,
+} from './evaluate.js';
+
+export {
+  type ScopeBreadth,
+  type BreadthCeilings,
+  type BreadthViolation,
+  type BreadthReport,
+  ABSOLUTE_MIN_IPV4_PREFIX,
+  ABSOLUTE_MIN_IPV6_PREFIX,
+  computeScopeBreadth,
+  evaluateBreadth,
+} from './breadth.js';

@@ -13,7 +13,7 @@ what is implemented versus what is still to come — nothing here claims a contr
 | Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                     |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
 | **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`) |
-| 2 — Scope-entry matching          | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ⏳ next                                    |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`) |
 | 3 — Schema & persistence          | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ⏳                                         |
 | 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | ⏳                                         |
 | 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | ⏳                                         |
@@ -40,7 +40,35 @@ Tests (`packages/scope/test`, coverage-thresholded 90/85/90/90): the SSRF-denial
 classification, transition-form decoding, and canonicalization fuzz (mixed case, trailing dot, IDN homoglyphs,
 `@`-embedded userinfo, encoded path traversal) proving alternate encodings cannot smuggle a different host/path.
 
-**Not yet implemented (do not assume present):** scope-entry allow/exclude matching, the DB schema, the
-request_spec / JIT-grant flow, the Guarded Egress Broker, budget/window/e-stop interlocks, and approval/dual-control.
-Those are slices 2–5. DNS-rebinding defense is a Broker (slice 4) property — the guard classifies literals now, and
-the resolve-validate-**pin** step lands with the Broker.
+## Slice 2 — what it proves (this commit)
+
+The scope-matching decision engine (`packages/scope/src/model.ts`, `evaluate.ts`, `breadth.ts`) turns the pure
+canonicalization/guard core into the authoritative **deny-by-default** decision, matching Phase 0 §4 + §7.1 steps 1–5:
+
+- **The runtime scope model (§4.2).** A `ScopeVersion` is an immutable set of typed entries — `domain`, `ip`,
+  `cidr`, `port`, `protocol`, `path_prefix`, `api_resource` — each optionally an exclusion and/or `elevated`.
+- **The ordered decision (§7.1 steps 1–5), deny-by-default.** `evaluateScope(candidate, scope, ctx)` /
+  `evaluateUrl(url, scope, …)` decide in the spec's precedence: **(1)** scheme (`https` default-allowed, others need
+  a `protocol` entry) → **(2)** IP-literal network guard (Tier A is an absolute hard-deny that no allowlist entry or
+  elevation can override) → **(3)** exclusions-first (any exclusion match denies, even over an allow or a wildcard
+  apex) → **(4)** host allowlist (domain wildcard/subdomain/apex per §4.3–4.4; ip/cidr containment) with **Tier B
+  gated** on a matching `elevated` entry **and** an elevation-granted context → **(5)** port (explicit entries define
+  the set; otherwise only the scheme-default port) + host-bound path (`path_prefix` segment-boundary / `api_resource`
+  `METHOD path`). No matching allow ⇒ DENY. An empty scope denies everything.
+- **Breadth accounting (§4.6, §4.2 absolute floors).** `computeScopeBreadth` / `evaluateBreadth` compute host count,
+  IPv4-equivalent addresses (Σ 2^(32−prefix)), CIDR-entry count, and the IPv6 prefix floor, and split violations into
+  **hard rejects** (broader than the absolute `/16`/`/32` floors — no approval lifts them) and **elevation-required**
+  (over a ceiling, a broader-than-floor CIDR, or a wildcard domain).
+
+Tests (`packages/scope/test/evaluate.test.ts`, `breadth.test.ts`; coverage-thresholded 90/85/90/90): deny-by-default
+over an empty scope; wildcard/subdomain/apex matching and label-boundary confusion (`example.com` ≠ `notexample.com`);
+exclusions winning over allows/wildcards/apex; ip/cidr (v4+v6) containment; Tier A hard-deny even when allowlisted +
+elevated; Tier B gating with/without an elevated entry and with/without granted elevation; scheme default vs explicit
+`protocol`; port default vs explicit set; host-bound path segment boundaries and encoded-traversal escape attempts;
+SSRF through a candidate URL (incl. userinfo-smuggled metadata) denied regardless of scope; and the breadth floors/ceilings.
+
+**Not yet implemented (do not assume present):** the DB schema (`scope_version`/`scope_entry` persistence, the
+canonical `scope_hash`, RLS + immutability triggers), the `request_spec` / JIT-grant flow, the Guarded Egress Broker,
+budget/window/e-stop interlocks, and approval/dual-control (the context that actually **grants** Tier B elevation and
+breadth expansion — the evaluator only consumes the decision). Those are slices 3–5. DNS-rebinding defense is a Broker
+(slice 4) property — the guard classifies literals now, and the resolve-validate-**pin** step lands with the Broker.
