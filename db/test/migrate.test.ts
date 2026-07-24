@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 import { createLogger, type Logger } from '@pentest/shared';
-import { up, down, schemaSnapshot } from '../src/migrate.js';
+import { up, down, schemaSnapshot, loadMigrations } from '../src/migrate.js';
 import { DB_EVENTS } from '../src/logevents.js';
 
 /**
@@ -17,18 +17,11 @@ const url = process.env.DATABASE_URL;
 const silent: Logger = createLogger({ level: 'error', events: DB_EVENTS, sink: () => {} });
 
 async function reset(client: pg.Client): Promise<void> {
-  // Start from a genuinely empty database so the baseline snapshot is the true prior state.
-  await client.query('DROP TRIGGER IF EXISTS probe_trg ON probe_t');
-  await client.query('DROP MATERIALIZED VIEW IF EXISTS probe_mv');
-  await client.query('DROP VIEW IF EXISTS probe_v');
+  // Start from a genuinely empty database so the baseline snapshot is the true prior state. A full schema reset
+  // clears every migration's objects (and any probe left behind), independent of how many migrations exist.
   await client.query('DROP SCHEMA IF EXISTS probe_s CASCADE');
-  await client.query(
-    'DROP TABLE IF EXISTS probe_t, probe_idx_t, probe_con_t, probe_rls_t, probe_cmt_t, probe_attr_t CASCADE',
-  );
-  await client.query('DROP FUNCTION IF EXISTS probe_fn() CASCADE');
-  await client.query('DROP EXTENSION IF EXISTS pgcrypto');
-  await client.query('DROP TABLE IF EXISTS tenant');
-  await client.query('DROP TABLE IF EXISTS schema_migrations');
+  await client.query('DROP SCHEMA public CASCADE');
+  await client.query('CREATE SCHEMA public');
 }
 
 describe.skipIf(!url)('migration up/down is an EXACT inverse (full-catalog snapshot)', () => {
@@ -45,21 +38,23 @@ describe.skipIf(!url)('migration up/down is an EXACT inverse (full-catalog snaps
     await reset(client);
   });
 
-  it('up changes the schema and down restores the EXACT prior schema', async () => {
+  it('up changes the schema and a full rollback restores the EXACT prior schema', async () => {
     const before = await schemaSnapshot(client);
     await up(client, silent);
     const afterUp = await schemaSnapshot(client);
     expect(afterUp).not.toBe(before); // up genuinely changed the schema
-    expect(afterUp).toContain('rel:public.tenant:r'); // ...and the change is the tenant table
-    await down(client, silent);
-    expect(await schemaSnapshot(client)).toBe(before); // exact restoration
+    expect(afterUp).toContain('rel:public.tenant:r'); // ...the Phase 1 tenant table
+    expect(afterUp).toContain('rel:public.engagement:r'); // ...and the Phase 2 authority tables
+    // Roll every applied migration back (down rolls back one at a time).
+    for (let i = 0; i < (await loadMigrations()).length; i++) await down(client, silent);
+    expect(await schemaSnapshot(client)).toBe(before); // exact restoration to empty
   });
 
-  it('up -> down -> up is deterministic', async () => {
+  it('rolling back the LATEST migration and re-applying it is deterministic', async () => {
     await up(client, silent);
     const firstUp = await schemaSnapshot(client);
-    await down(client, silent);
-    await up(client, silent);
+    await down(client, silent); // roll back only the latest migration
+    await up(client, silent); // re-apply it
     expect(await schemaSnapshot(client)).toBe(firstUp);
   });
 
