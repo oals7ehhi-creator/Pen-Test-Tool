@@ -86,7 +86,7 @@ CREATE TABLE engagement (
   CONSTRAINT conc_host_le_global  CHECK (per_host_concurrency <= max_concurrency),
   CONSTRAINT budget_used_le_total CHECK (request_budget_used <= request_budget_total),
   CONSTRAINT engagement_allowed_modes_ok CHECK (
-     allowed_modes <@ ARRAY['passive','safe_active','approval_gated'] AND array_length(allowed_modes,1) >= 1)
+     allowed_modes <@ ARRAY['passive','safe_active','approval_gated'] AND cardinality(allowed_modes) >= 1)
 );
 
 -- =============================================================================================================
@@ -193,7 +193,8 @@ CREATE TABLE scope_entry (
      AND port_low IS NULL AND port_high IS NULL AND scheme IS NULL
      AND bound_host_ascii IS NULL AND path_prefix IS NULL AND api_doc_sha256 IS NULL)),
   CONSTRAINT shape_ip CHECK (entry_class <> 'ip' OR (
-     ip_version IS NOT NULL AND ip_start IS NOT NULL AND ip_end = ip_start AND prefix_len IS NULL
+     ip_version IS NOT NULL AND ip_start IS NOT NULL AND ip_end IS NOT NULL AND ip_end = ip_start
+     AND prefix_len IS NULL
      AND host_ascii IS NULL AND port_low IS NULL AND scheme IS NULL
      AND bound_host_ascii IS NULL AND path_prefix IS NULL)),
   CONSTRAINT shape_cidr CHECK (entry_class <> 'cidr' OR (
@@ -235,7 +236,7 @@ CREATE TABLE approval_policy (
   UNIQUE (policy_digest),
   UNIQUE (request_type, version),
   CONSTRAINT approver_roles_allowlisted CHECK (
-     array_length(approver_roles, 1) >= 1
+     cardinality(approver_roles) >= 1
      AND approver_roles <@ ARRAY['Engagement Manager','Reviewer','Administrator']),
   CONSTRAINT threshold_floor CHECK (
      (request_type = 'intrusive_validation' AND required_approvals >= 1)
@@ -274,7 +275,7 @@ CREATE TABLE "authorization" (
 
   allowed_modes            TEXT[] NOT NULL
                            CHECK (allowed_modes <@ ARRAY['passive','safe_active','approval_gated']
-                                  AND array_length(allowed_modes,1) >= 1),
+                                  AND cardinality(allowed_modes) >= 1),
 
   internal_testing_granted BOOLEAN NOT NULL DEFAULT FALSE,
 
@@ -422,9 +423,10 @@ CREATE TABLE approval_request (
      request_type IN ('scope_expansion','restricted_range_allow','authorization_attestation')
      OR (scope_check_result->>'decision') = 'pass'),
   CONSTRAINT manifest_shape CHECK (
-     (request_type IN ('intrusive_validation','business_logic_test') AND manifest_sha256 IS NOT NULL)
-     OR (request_type NOT IN ('intrusive_validation','business_logic_test')
-         AND manifest_sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')),
+     manifest_sha256 IS NOT NULL AND (
+       (request_type IN ('intrusive_validation','business_logic_test'))
+       OR (request_type NOT IN ('intrusive_validation','business_logic_test')
+           AND manifest_sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'))),
   CONSTRAINT attestation_needs_document CHECK (
      request_type <> 'authorization_attestation' OR document_sha256 IS NOT NULL),
   CONSTRAINT document_only_for_attestation CHECK (
@@ -644,6 +646,14 @@ BEGIN
   IF pol.superseded THEN
     RAISE EXCEPTION 'approval_request must pin the CURRENT (non-superseded) policy for its type';
   END IF;
+  -- A request is CREATED unfrozen and pending; freezing must go through the UPDATE freeze_guard so the manifest
+  -- digest is actually verified. Otherwise a row INSERTed with manifest_frozen=TRUE would skip freeze verification.
+  IF NEW.manifest_frozen THEN
+    RAISE EXCEPTION 'approval_request must be created unfrozen (freeze via UPDATE so the manifest digest is verified)';
+  END IF;
+  IF NEW.status <> 'pending' THEN
+    RAISE EXCEPTION 'approval_request must be created with status pending';
+  END IF;
   RETURN NEW;
 END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER approval_request_policy_match_t BEFORE INSERT ON approval_request
@@ -695,6 +705,48 @@ BEGIN
 END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER approval_request_freeze_guard_t BEFORE UPDATE ON approval_request
   FOR EACH ROW EXECUTE FUNCTION approval_request_freeze_guard();
+
+-- approval_request: the security ANCHORS are immutable after creation, and a resolved status is terminal. The
+-- authorization-activation gate and the whole dual-control model trust these fields, so a post-approval repoint of
+-- the attested document / manifest / policy / engagement / expiry is forbidden (§10, SI-020/SI-047). Legitimate
+-- lifecycle transitions (status pending->resolved, the manifest freeze governed by freeze_guard, resolved_at)
+-- remain permitted. (Fires after freeze_guard by name order, so the freeze UPDATE it allows is still verified.)
+CREATE FUNCTION approval_request_immutable_guard() RETURNS trigger AS $$
+BEGIN
+  IF NEW.tenant_id <> OLD.tenant_id OR NEW.engagement_id <> OLD.engagement_id
+     OR NEW.request_type <> OLD.request_type OR NEW.approval_policy_id <> OLD.approval_policy_id
+     OR NEW.requested_by <> OLD.requested_by
+     OR NEW.manifest_sha256 IS DISTINCT FROM OLD.manifest_sha256
+     OR NEW.document_sha256 IS DISTINCT FROM OLD.document_sha256
+     OR NEW.linked_scope_version_id IS DISTINCT FROM OLD.linked_scope_version_id
+     OR NEW.linked_audit_event_id IS DISTINCT FROM OLD.linked_audit_event_id
+     OR NEW.expires_at <> OLD.expires_at THEN
+    RAISE EXCEPTION 'approval_request anchors are immutable after creation (document/manifest/policy/type/engagement/expiry)';
+  END IF;
+  IF OLD.status <> 'pending' AND NEW.status IS DISTINCT FROM OLD.status THEN
+    RAISE EXCEPTION 'approval_request status % is terminal', OLD.status;
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER approval_request_immutable_guard_t BEFORE UPDATE ON approval_request
+  FOR EACH ROW EXECUTE FUNCTION approval_request_immutable_guard();
+
+-- engagement.allowed_modes must be a SUBSET of the ACTIVE authorization's allowed_modes (§2.1). Enforced whenever
+-- the engagement names an active authorization; the application also checks this. (An engagement with no active
+-- authorization is unconstrained here — draft_no_active already forbids naming one while in 'draft'.)
+CREATE FUNCTION engagement_modes_subset_guard() RETURNS trigger AS $$
+DECLARE auth_modes TEXT[];
+BEGIN
+  IF NEW.active_authorization_id IS NOT NULL THEN
+    SELECT allowed_modes INTO auth_modes FROM "authorization" WHERE id = NEW.active_authorization_id;
+    IF auth_modes IS NOT NULL AND NOT (NEW.allowed_modes <@ auth_modes) THEN
+      RAISE EXCEPTION 'engagement.allowed_modes must be a subset of the active authorization allowed_modes';
+    END IF;
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER engagement_modes_subset_guard_t BEFORE INSERT OR UPDATE ON engagement
+  FOR EACH ROW EXECUTE FUNCTION engagement_modes_subset_guard();
 
 -- approval_decision: every APPROVE pins the required digests with a NON-NULL EQUAL value (NULL never bypasses),
 -- and no decision may be recorded before the manifest is frozen; append-only (§10).

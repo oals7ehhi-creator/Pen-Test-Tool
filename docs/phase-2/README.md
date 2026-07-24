@@ -14,7 +14,7 @@ what is implemented versus what is still to come — nothing here claims a contr
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
 | **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`) |
 | **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`) |
-| 3 — Schema & persistence          | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ⏳                                         |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)            |
 | 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | ⏳                                         |
 | 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | ⏳                                         |
 
@@ -67,8 +67,38 @@ elevated; Tier B gating with/without an elevated entry and with/without granted 
 `protocol`; port default vs explicit set; host-bound path segment boundaries and encoded-traversal escape attempts;
 SSRF through a candidate URL (incl. userinfo-smuggled metadata) denied regardless of scope; and the breadth floors/ceilings.
 
-**Not yet implemented (do not assume present):** the DB schema (`scope_version`/`scope_entry` persistence, the
-canonical `scope_hash`, RLS + immutability triggers), the `request_spec` / JIT-grant flow, the Guarded Egress Broker,
-budget/window/e-stop interlocks, and approval/dual-control (the context that actually **grants** Tier B elevation and
-breadth expansion — the evaluator only consumes the decision). Those are slices 3–5. DNS-rebinding defense is a Broker
-(slice 4) property — the guard classifies literals now, and the resolve-validate-**pin** step lands with the Broker.
+## Slice 3 — what it proves (this commit)
+
+Migration `db/migrations/0002_authorization_scope_schema.{up,down}.sql` persists the core authority model (doc 04
+§2/§3/§4/§9/§10) and enforces its safety invariants **at the storage layer**, not in prose:
+
+- **Tables.** `engagement`, `testing_window`, `scope_version`, `scope_entry`, `"authorization"`, `approval_policy`,
+  `approval_request`, `approval_manifest_entry`, `approval_decision`, `audit_chain`, `audit_event` — with the full
+  per-class CHECK shapes (§4.2), status machines (§2.2/§3), and breadth trailer columns (§4.6).
+- **Authority isolation (§0.8/§1).** Every security-authority reference is a composite `(id, tenant_id, engagement_id)`
+  FK, so an authorization/approval/scope_version from another engagement — even in the same tenant with an identical
+  `scope_hash` — is a hard constraint violation. The engagement ⇄ authorization ⇄ scope_version and authorization ⇄
+  attestation-approval cycles use DEFERRABLE composite FKs verified at COMMIT.
+- **Row-Level Security (doc 03).** Every tenant-scoped table is `ENABLE` + `FORCE ROW LEVEL SECURITY` with a
+  `current_setting('app.tenant_id')` policy; an unset/empty GUC fails closed (no rows).
+- **Immutability & dual control.** append-only audit/decision/manifest tables; scope-version freeze + entry-freeze
+  guards; approval-policy content immutability with a non-decreasing-strength guard; manifest-freeze digest recompute;
+  approve-decision NON-NULL hash pins; NULL-safe audit chain identity; and the authorization-activation trigger that
+  requires an approved, matching attestation approval + scope binding.
+- **pgcrypto** is provisioned by this migration (first use of `digest()`) and dropped by its down, so up/down stays an
+  exact inverse — verified by `migrate:ci`'s full-catalog snapshot round-trip.
+
+Tests (`db/test/schema.test.ts`, 35 DB-gated cases + the migrate round-trip): RLS isolation under a **non-superuser
+role** across engagement/scope_version/authorization/audit_event; same-tenant cross-engagement FK rejection; append-only
+rejects; scope-freeze (insert/update/delete); approval-policy strength guards (weaken/broaden/quorum) + a positive
+non-weakening version; decision hash-pin enforcement + "no decision before freeze"; the null-safe audit identity on a
+tenant chain; the authorization-activation trigger (positive activation + not-approved/wrong-document/scope-mismatch
+rejections); §4.2 scope-entry constraints; the status-shape CHECK; and the engagement⊆authorization allowed-modes guard.
+An adversarial 4-lens review of this migration surfaced a dual-control-bypass **blocker** (approval anchors were mutable
+post-approval) plus four constraint-vacuity defects; all were fixed and now have regression tests.
+
+**Not yet implemented (do not assume present):** the `request_spec` / catalog-template / operator-session /
+operator-query-value tables and the JIT-grant two-stage flow (§7), the Guarded Egress Broker (resolve→validate→**pin**→
+re-guard redirects), and the budget-reservation ledger / window / e-stop / rate-limit interlocks (§8). Those are slices
+4–5. DNS-rebinding defense is a Broker (slice 4) property — the guard classifies literals now, and the
+resolve-validate-**pin** step lands with the Broker.

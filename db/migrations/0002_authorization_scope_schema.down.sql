@@ -24,7 +24,9 @@ DROP TABLE IF EXISTS testing_window CASCADE;
 DROP TABLE IF EXISTS engagement CASCADE;
 
 -- Drop the standalone trigger functions (their triggers went with the tables above).
+DROP FUNCTION IF EXISTS engagement_modes_subset_guard();
 DROP FUNCTION IF EXISTS approval_decision_shape();
+DROP FUNCTION IF EXISTS approval_request_immutable_guard();
 DROP FUNCTION IF EXISTS approval_request_freeze_guard();
 DROP FUNCTION IF EXISTS approval_manifest_entry_guard();
 DROP FUNCTION IF EXISTS approval_request_policy_match();
