@@ -49,7 +49,9 @@ async function mkTemplate(
 ): Promise<string> {
   const d = await q(
     c,
-    `SELECT encode(digest($1 || E'\\x1f' || $2 || E'\\x1f' || $3 || E'\\x1f' || ($4::jsonb)::text || E'\\x1f' || $5, 'sha256'), 'hex') AS h`,
+    `SELECT encode(digest(convert_to(
+       jsonb_build_object('kind',$1::text,'name',$2::text,'version',$3::text,'content',$4::jsonb,'safety_class',$5::text)::text,
+       'utf8'), 'sha256'), 'hex') AS h`,
     [kind, name, version, content, safety],
   );
   const digest = d.rows[0].h as string;
@@ -313,6 +315,255 @@ describe.skipIf(!url)('slice 4b — request_spec / catalog / operator secrets (�
       expect(some.rows[0].n).toBe(1);
       await client.query('RESET ROLE');
       await client.query('RESET app.tenant_id');
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------------------
+  // Adversarial-review hardening (slice 4b): the session-binding regression + the positive paths and coverage
+  // the first pass was missing.
+  // ---------------------------------------------------------------------------------------------------------
+  describe('review hardening', () => {
+    const EB = 'bbbbbbbb-0000-0000-0000-000000000002';
+
+    /** A pending approval_request in EA for a non-manifest request_type (mode_elevation); returns its id. */
+    async function mkApproval(): Promise<string> {
+      const pol = await q(
+        client,
+        `SELECT id FROM approval_policy WHERE request_type='mode_elevation'`,
+      );
+      const r = await q(
+        client,
+        `INSERT INTO approval_request (tenant_id, engagement_id, request_type, approval_policy_id, requested_by,
+           justification, proposed_action, manifest_sha256, potential_impact, target_summary, scope_check_result,
+           evidence_plan, stop_conditions, expires_at)
+         VALUES ($1,$2,'mode_elevation',$3,$4,'j','{}'::jsonb,
+                 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','imp','t',
+                 '{"decision":"pass"}'::jsonb,'ev','stop', now()+interval '1 day') RETURNING id`,
+        [T_A, EA, pol.rows[0].id, U],
+      );
+      return r.rows[0].id as string;
+    }
+
+    // [session-binding regression] the shape CHECK makes a half-specified session binding unrepresentable.
+    it('rejects a session_ref with a NULL session_digest, and a session_digest with no session_ref', async () => {
+      const h = await mkTemplate(client, 'header_set', 'h', 'v1', '{"a":1}', 'inert');
+      const s = await q(
+        client,
+        `INSERT INTO operator_session (tenant_id, engagement_id, account_id, secret_ref, designated_hosts)
+         VALUES ($1,$2,'acct','lease://s', ARRAY['example.com']) RETURNING id`,
+        [T_A, EA],
+      );
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, session_ref, session_digest, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','http',$6,'GET','https://example.com/api','example.com',443,'https',
+                 '/api',$7,NULL,'passive',$8)`,
+        [T_A, EA, U, SCOPE_HASH, authId, h, s.rows[0].id, 'f'.repeat(64)],
+        /session_binding_shape/,
+      );
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, session_ref, session_digest, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','http',$6,'GET','https://example.com/api','example.com',443,'https',
+                 '/api',NULL,$7,'passive',$8)`,
+        [T_A, EA, U, SCOPE_HASH, authId, h, 'c'.repeat(64), 'f'.repeat(64)],
+        /session_binding_shape/,
+      );
+    });
+
+    // [1] a valid approval-gated spec is ACCEPTED and stores approval_required=TRUE.
+    it('accepts an approval-gated spec with an approval_ref and stores approval_required=TRUE', async () => {
+      const h = await mkTemplate(client, 'header_set', 'h', 'v1', '{"a":1}', 'inert');
+      const apprId = await mkApproval();
+      const r = await q(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, mode, approval_ref, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','http',$6,'POST','https://example.com/api','example.com',443,'https',
+                 '/api','approval_gated',$7,$8) RETURNING approval_required`,
+        [T_A, EA, U, SCOPE_HASH, authId, h, apprId, 'f'.repeat(64)],
+      );
+      expect(r.rows[0].approval_required).toBe(true);
+    });
+
+    // [2] cross-engagement authority binding is a hard composite-FK violation (same tenant, different engagement).
+    it('rejects a request_spec binding an authorization from a DIFFERENT engagement in the same tenant', async () => {
+      await q(
+        client,
+        `INSERT INTO engagement (id, tenant_id, name, owner_user_id, created_by, timezone)
+         VALUES ($1,$2,'EngB',$3,$3,'UTC')`,
+        [EB, T_A, U],
+      );
+      await q(
+        client,
+        `INSERT INTO scope_version (id, tenant_id, engagement_id, version_number, scope_hash,
+           entry_count, host_count, ipv4_equiv_addresses, cidr_entry_count, created_by)
+         VALUES ('cccccccc-0000-0000-0000-0000000000b2',$1,$2,1,$3,0,0,0,0,$4)`,
+        [T_A, EB, 'b'.repeat(64), U],
+      );
+      const ab = await q(
+        client,
+        `INSERT INTO "authorization" (tenant_id, engagement_id, authorization_reference, authorizing_party_name,
+           authorizing_party_org, engagement_owner_user_id, effective_from, expires_at, allowed_modes,
+           scope_version_id, scope_hash, record_hash)
+         VALUES ($1,$2,'ref','p','o',$3, now(), now()+interval '10 days', ARRAY['passive'],
+                 'cccccccc-0000-0000-0000-0000000000b2',$4,$5) RETURNING id`,
+        [T_A, EB, U, 'b'.repeat(64), 'r'.repeat(64)],
+      );
+      const h = await mkTemplate(client, 'header_set', 'h', 'v1', '{"a":1}', 'inert');
+      // spec in EA binding EB's authorization ⇒ (authorization_id, tenant_id, engagement_id) FK fails.
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','http',$6,'GET','https://example.com/api','example.com',443,'https',
+                 '/api','passive',$7)`,
+        [T_A, EA, U, SCOPE_HASH, ab.rows[0].id, h, 'f'.repeat(64)],
+        /foreign key/i,
+      );
+    });
+
+    // [3] the WebSocket path: a valid wss/GET/frames spec is accepted; each ws constraint rejects.
+    it('enforces the WebSocket constraints (kind_scheme, ws_is_get, ws_needs_frames)', async () => {
+      const h = await mkTemplate(client, 'header_set', 'h', 'v1', '{"a":1}', 'inert');
+      const frames = await mkTemplate(client, 'ws_frame_set', 'wf', 'v1', '{"frames":[]}', 'inert');
+      // valid: kind=websocket, scheme=wss, method=GET, frames present.
+      const okId = await insertSpec(client, h, {
+        authorization_id: authId,
+        kind: 'websocket',
+        scheme: 'wss',
+        canonical_url: 'wss://example.com/ws',
+        ws_frame_set_digest: frames,
+      });
+      expect(okId).toMatch(/^[0-9a-f-]+$/);
+      // kind_scheme: websocket with an http scheme is rejected.
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, ws_frame_set_digest, method, canonical_url, canonical_host, port,
+           scheme, canonical_path, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','websocket',$6,$7,'GET','https://example.com/ws','example.com',443,
+                 'https','/ws','passive',$8)`,
+        [T_A, EA, U, SCOPE_HASH, authId, h, frames, 'f'.repeat(64)],
+        /kind_scheme/,
+      );
+      // ws_is_get: a websocket with a non-GET method is rejected.
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, ws_frame_set_digest, method, canonical_url, canonical_host, port,
+           scheme, canonical_path, mode, approval_ref, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','websocket',$6,$7,'POST','wss://example.com/ws','example.com',443,
+                 'wss','/ws','passive',$8,$9)`,
+        [T_A, EA, U, SCOPE_HASH, authId, h, frames, await mkApproval(), 'f'.repeat(64)],
+        /ws_is_get/,
+      );
+      // ws_needs_frames: a websocket with no frame set is rejected.
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','websocket',$6,'GET','wss://example.com/ws','example.com',443,'wss',
+                 '/ws','passive',$7)`,
+        [T_A, EA, U, SCOPE_HASH, authId, h, 'f'.repeat(64)],
+        /ws_needs_frames/,
+      );
+    });
+
+    // [4] operator_query_value: the exact-version binding FK + append-only.
+    it('operator_query_value: version-binding FK is enforced and the table is append-only', async () => {
+      const h = await mkTemplate(client, 'header_set', 'h', 'v1', '{"a":1}', 'inert');
+      const ov = await q(
+        client,
+        `INSERT INTO operator_query_value (tenant_id, engagement_id, value_set_name, value_version, secret_ref)
+         VALUES ($1,$2,'vs',1,'lease://v1') RETURNING id, value_binding`,
+        [T_A, EA],
+      );
+      // a wrong value_binding for the referenced query value ⇒ the (query_value_ref, value_binding) FK fails.
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, query_value_ref, query_value_binding, query_value_digest, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','http',$6,'GET','https://example.com/api','example.com',443,'https',
+                 '/api',$7,$8,$9,'passive',$10)`,
+        [
+          T_A,
+          EA,
+          U,
+          SCOPE_HASH,
+          authId,
+          h,
+          ov.rows[0].id,
+          'e'.repeat(64),
+          'd'.repeat(64),
+          'f'.repeat(64),
+        ],
+        /foreign key/i,
+      );
+      await rejects(
+        client,
+        `UPDATE operator_query_value SET secret_ref='x' WHERE id=$1`,
+        [ov.rows[0].id],
+        /append-only/,
+      );
+      await rejects(
+        client,
+        `DELETE FROM operator_query_value WHERE id=$1`,
+        [ov.rows[0].id],
+        /append-only/,
+      );
+    });
+
+    // [8] the GENERATED session_digest equals the exact tenant+engagement+account+version content address.
+    it('operator_session.session_digest is the exact generated content address', async () => {
+      const s = await q(
+        client,
+        `INSERT INTO operator_session (tenant_id, engagement_id, account_id, session_version, secret_ref, designated_hosts)
+         VALUES ($1,$2,'acct-x',3,'lease://s', ARRAY['example.com']) RETURNING session_digest`,
+        [T_A, EA],
+      );
+      const expected = await q(
+        client,
+        `SELECT encode(digest($1 || ':' || $2 || ':' || 'acct-x' || ':' || '3', 'sha256'), 'hex') AS h`,
+        [T_A, EA],
+      );
+      expect(s.rows[0].session_digest).toBe(expected.rows[0].h);
+    });
+
+    // [9] the content address is stable under jsonb key reordering (JSON-normalization independence).
+    it('catalog content-address is independent of JSON key order', async () => {
+      const d1 = await mkTemplate(client, 'payload', 'p', 'v1', '{"a":1,"b":2}', 'inert');
+      const d2 = await q(
+        client,
+        `SELECT encode(digest(convert_to(
+           jsonb_build_object('kind','payload','name','p','version','v1','content','{"b":2,"a":1}'::jsonb,'safety_class','inert')::text,
+           'utf8'), 'sha256'), 'hex') AS h`,
+      );
+      expect(d2.rows[0].h).toBe(d1); // reordered content ⇒ same content address
+    });
+
+    // [10] the composite (digest, kind) catalog FK enforces the referenced template's KIND.
+    it('rejects referencing a header_set digest in the check slot (kind mismatch)', async () => {
+      const hs = await mkTemplate(client, 'header_set', 'hh', 'v1', '{"a":1}', 'inert');
+      // check_digest FK is (check_digest, check_kind='check') → the header_set digest has kind='header_set' ⇒ FK fails.
+      await rejects(
+        client,
+        `INSERT INTO request_spec (tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, check_digest, method, canonical_url, canonical_host, port, scheme,
+           canonical_path, mode, spec_sha256)
+         VALUES ($1,$2,$3,$3,$4,$5,'native','http',$6,$6,'GET','https://example.com/api','example.com',443,'https',
+                 '/api','passive',$7)`,
+        [T_A, EA, U, SCOPE_HASH, authId, hs, 'f'.repeat(64)],
+        /foreign key/i,
+      );
     });
   });
 });

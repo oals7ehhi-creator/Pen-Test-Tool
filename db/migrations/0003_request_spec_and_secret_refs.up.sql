@@ -39,9 +39,12 @@ CREATE TABLE catalog_template (
 CREATE FUNCTION catalog_template_digest_verify() RETURNS trigger AS $$
 DECLARE computed CHAR(64);
 BEGIN
-  computed := encode(digest(
-    NEW.kind || E'\x1f' || NEW.name || E'\x1f' || NEW.version || E'\x1f' ||
-    NEW.content::text || E'\x1f' || NEW.safety_class, 'sha256'), 'hex');
+  -- Pre-image is a jsonb object (proper JSON escaping) rather than a delimiter-joined string, so distinct field
+  -- tuples can never collide by smuggling the delimiter into a free-text name/version. jsonb::text is deterministic.
+  computed := encode(digest(convert_to(
+    jsonb_build_object('kind', NEW.kind, 'name', NEW.name, 'version', NEW.version,
+                       'content', NEW.content, 'safety_class', NEW.safety_class)::text, 'utf8'),
+    'sha256'), 'hex');
   IF NEW.digest <> computed THEN
     RAISE EXCEPTION 'catalog_template.digest does not match the content address of its fields';
   END IF;
@@ -173,12 +176,21 @@ CREATE TABLE request_spec (
      NOT (query_template_digest IS NOT NULL AND query_value_ref IS NOT NULL)),
   CONSTRAINT query_secret_shape CHECK (
      (query_value_ref IS NULL AND query_value_binding IS NULL AND query_value_digest IS NULL)
-     OR (query_value_ref IS NOT NULL AND query_value_binding IS NOT NULL AND query_value_digest IS NOT NULL))
+     OR (query_value_ref IS NOT NULL AND query_value_binding IS NOT NULL AND query_value_digest IS NOT NULL)),
+  -- The operator-session path is all-or-nothing too (mirrors query_secret_shape). Without this, MATCH SIMPLE would
+  -- SKIP the (session_ref, session_digest) binding FK whenever session_digest IS NULL, so a spec could name a live
+  -- session without pinning its version, or fold a made-up session_digest into spec_sha256 with no backing row
+  -- (SI-065). This makes the invalid state unrepresentable at the storage layer.
+  CONSTRAINT session_binding_shape CHECK (
+     (session_ref IS NULL AND session_digest IS NULL)
+     OR (session_ref IS NOT NULL AND session_digest IS NOT NULL))
 );
 
 -- Derived approval gate (§7.0/§10): approval_required is set from the request itself — TRUE for a state-changing
 -- method OR when ANY referenced catalog template is safety_class='requires_approval'. The self-declared `mode` is
--- NEVER trusted. The approval_present CHECK then forces an approval_ref whenever this derives TRUE.
+-- NEVER trusted. The approval_present CHECK then forces an approval_ref whenever this derives TRUE. The spec's
+-- separate "state-changing check action class" trigger is subsumed here: a state-changing check MUST carry
+-- safety_class='requires_approval' in its immutable catalog_template, so this same safety_class path gates it.
 CREATE FUNCTION request_spec_derive_approval() RETURNS trigger AS $$
 DECLARE needs BOOLEAN := FALSE; hit INT;
 BEGIN
