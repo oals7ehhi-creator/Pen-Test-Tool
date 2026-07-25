@@ -67,6 +67,12 @@ importers:
         specifier: 6.2.4
         version: 6.2.4
 
+  packages/spec:
+    dependencies:
+      jose:
+        specifier: 6.2.4
+        version: 6.2.4
+
   services/api:
     dependencies:
       '@pentest/shared':

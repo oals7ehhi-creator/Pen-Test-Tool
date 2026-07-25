@@ -10,13 +10,13 @@ what is implemented versus what is still to come — nothing here claims a contr
 
 ## Slice status
 
-| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                     |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`) |
-| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`) |
-| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)            |
-| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | ⏳                                         |
-| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | ⏳                                         |
+| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                     |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                 |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                 |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                            |
+| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 in progress — **4a** core done (`packages/spec`); 4b (schema `0003`) + 4c (Broker) next |
+| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | ⏳                                                                                         |
 
 ## Slice 1 — what it proves (this commit)
 
@@ -102,6 +102,34 @@ operator-query-value tables and the JIT-grant two-stage flow (§7), the Guarded 
 re-guard redirects), and the budget-reservation ledger / window / e-stop / rate-limit interlocks (§8). Those are slices
 4–5. DNS-rebinding defense is a Broker (slice 4) property — the guard classifies literals now, and the
 resolve-validate-**pin** step lands with the Broker.
+
+## Slice 4a — what it proves (this commit)
+
+`@pentest/spec` (`packages/spec`) is the pure, dependency-light core of the two-stage flow (Phase 0 §7.0 + §7.1),
+the foundation the DB schema (4b) and the Guarded Egress Broker (4c) build on:
+
+- **Content-addressed `request_spec` (§7.0).** `computeSpecSha256` is the SHA-256 over the **canonical JSON**
+  (sorted keys, explicit null, `undefined` rejected) of EXACTLY the 22 request-determining fields. INSTANCE identity
+  (`run_id`/`job_id`), the broker-resolved secret POINTERS (`approval_ref`/`session_ref`/`query_value_ref`), and the
+  advisory `mode` are **excluded** — so the same logical request may recur across jobs/runs with the same digest (a
+  repeat, not a replay), and a dynamic request keeps a stable digest while `approval_ref` is attached — while the
+  non-secret bindings (`query_value_binding`, `session_digest`) ARE bound in, so rotation invalidates the digest. The
+  covered field set is asserted in tests so a future edit can't silently fold a field in or out.
+- **Stage-1 egress grant (§7.1).** `mintGrant` / `verifyGrant` — a **short-TTL (≤ 30 s), single-use** JWT (HS256,
+  pinned issuer/audience) that binds `spec_sha256` and carries **no resolved IP and no request line**. Verification
+  recomputes the presented spec's digest and requires equality, consumes the `jti` exactly once (replay defense), and
+  rejects a tampered / expired / not-yet-valid / wrong-audience / wrong-issuer / wrong-key grant with a fixed reason
+  code — and a rejected grant never burns its `jti`.
+
+Tests (`packages/spec/test`, coverage-thresholded 90/85/90/90): canonical-JSON determinism + `undefined`/non-finite
+rejection; digest field-membership and per-field sensitivity (all 22) with the excluded fields proven absent; grant
+round-trip, replay rejection, jti-not-consumed-on-failure, spec-mismatch, and the tamper/expiry/audience/issuer matrix.
+
+**Deliberately still to come in slice 4:** persistence of `request_spec` / `catalog_template` / `operator_session` /
+`operator_query_value` with the derived-`approval_required` + digest-verify + immutability triggers (**4b**, migration
+`0003`), and the Guarded Egress Broker data path — reconstruct-from-spec, DNS resolve, per-resolved-IP network-guard +
+frozen-scope re-check, **pin**, connect, and re-guarded redirects (**4c**). The grant here carries no socket; the
+Broker is the only component that opens one.
 
 ## Dependency-advisory disposition
 
