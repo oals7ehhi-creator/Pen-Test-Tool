@@ -246,8 +246,13 @@ function classifyV4(b: Uint8Array): GuardVerdict {
   return { tier: 'permitted', reason: 'public' };
 }
 
-/** Extract an embedded IPv4 from a transition/embedding IPv6 form, or null if this is a native v6 address. */
-function embeddedV4(b: Uint8Array): Uint8Array | null {
+/**
+ * Extract an embedded IPv4 from a transition/embedding IPv6 form (IPv4-mapped, deprecated compat, 6to4, Teredo,
+ * NAT64), or null if this is a native v6 address. Exported so any component that must decide an address on the SAME
+ * decoded representation the guard classifies (e.g. the broker's connect-time ip/cidr exclusion + elevation match)
+ * shares this one decoder rather than re-deriving it — a mapped form must never evade a v4 scope entry.
+ */
+export function embeddedV4(b: Uint8Array): Uint8Array | null {
   const isZero = (from: number, to: number): boolean => {
     for (let i = from; i < to; i++) if (b[i] !== 0) return false;
     return true;

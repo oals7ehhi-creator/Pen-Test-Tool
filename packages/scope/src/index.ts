@@ -17,6 +17,7 @@ export {
   parseIpLiteral,
   inCidrV4,
   inCidrV6,
+  embeddedV4,
   classifyBytes,
   guardIp,
 } from './ip.js';

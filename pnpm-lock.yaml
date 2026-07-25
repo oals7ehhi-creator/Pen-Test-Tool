@@ -59,6 +59,15 @@ importers:
         specifier: 8.11.10
         version: 8.11.10
 
+  packages/broker:
+    dependencies:
+      '@pentest/scope':
+        specifier: workspace:*
+        version: link:../scope
+      '@pentest/spec':
+        specifier: workspace:*
+        version: link:../spec
+
   packages/scope: {}
 
   packages/shared:
