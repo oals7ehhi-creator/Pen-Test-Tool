@@ -11,6 +11,15 @@
 export { type JsonValue, canonicalJson, sha256Hex, canonicalDigest } from './canonical.js';
 
 export {
+  type OperatorSessionIdentity,
+  type OperatorQueryValueIdentity,
+  type QueryValueEntry,
+  operatorSessionDigest,
+  operatorQueryValueBinding,
+  computeQueryValueDigest,
+} from './bindings.js';
+
+export {
   REQUEST_CLASSES,
   type RequestClass,
   KINDS,

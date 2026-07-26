@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 import { createLogger, type Logger } from '@pentest/shared';
+import { operatorSessionDigest, operatorQueryValueBinding } from '@pentest/spec';
 import { up } from '../src/migrate.js';
 import { DB_EVENTS } from '../src/logevents.js';
 
@@ -223,6 +224,16 @@ describe.skipIf(!url)('slice 4b â€” request_spec / catalog / operator secrets (Â
         [T_A, EA],
       );
       expect(s.rows[0].session_digest).toMatch(/^[0-9a-f]{64}$/);
+      // Cross-engine parity: the DB GENERATED column MUST equal the shared @pentest/spec helper the broker recomputes
+      // at reconstruction â€” a divergence here would make the broker reject valid specs (SI-061 availability).
+      expect(s.rows[0].session_digest).toBe(
+        operatorSessionDigest({
+          tenantId: T_A,
+          engagementId: EA,
+          accountId: 'acct-1',
+          sessionVersion: 1,
+        }),
+      );
       await rejects(
         client,
         `UPDATE operator_session SET secret_ref='x' WHERE id=$1`,
@@ -277,6 +288,15 @@ describe.skipIf(!url)('slice 4b â€” request_spec / catalog / operator secrets (Â
         `INSERT INTO operator_query_value (tenant_id, engagement_id, value_set_name, value_version, secret_ref)
          VALUES ($1,$2,'vs',1,'lease://v1') RETURNING id, value_binding`,
         [T_A, EA],
+      );
+      // Cross-engine parity: the GENERATED value_binding MUST equal the shared @pentest/spec helper the broker uses.
+      expect(ov.rows[0].value_binding).toBe(
+        operatorQueryValueBinding({
+          tenantId: T_A,
+          engagementId: EA,
+          valueSetName: 'vs',
+          valueVersion: 1,
+        }),
       );
       await rejects(
         client,

@@ -7,7 +7,9 @@
  *   - `resolveAndPin` / `guardResolvedIp` — resolve the canonical host, guard EVERY resolved address (§6) + honour
  *     scope exclusions + Tier B elevation, and PIN one validated IP (DNS-rebinding / SSRF-at-connect defense, §7.1
  *     step 11);
- *   - `guardRedirect` — never auto-follow a 3xx; re-decide the Location against the frozen scope (§7.1 step 13).
+ *   - `guardRedirect` — never auto-follow a 3xx; re-decide the Location against the frozen scope (§7.1 step 13);
+ *   - `reconstructRequest` — rebuild the wire request DETERMINISTICALLY from the immutable spec, verifying every
+ *     content-addressed/secret binding before egress (§7.1 step 8, SI-061) — the broker never trusts a worker request.
  *
  * The actual mTLS ingress, DNS/TCP/TLS sockets, and the budget/window/e-stop interlocks are wired in later
  * (slice 4c-transport / slice 5); the resolver and grant-jti consumer are injected so nothing here performs real
@@ -25,3 +27,17 @@ export {
 export { type JobIdentity, IngressError, authorizeIngress } from './ingress.js';
 
 export { type RedirectContext, type RedirectDecision, guardRedirect } from './redirect.js';
+
+export {
+  type HeaderField,
+  type HeaderSet,
+  type Payload,
+  type QueryTemplate,
+  type SessionLease,
+  type QueryValueLease,
+  type ReconstructContext,
+  type ReconstructReason,
+  type ReconstructedRequest,
+  ReconstructError,
+  reconstructRequest,
+} from './reconstruct.js';
