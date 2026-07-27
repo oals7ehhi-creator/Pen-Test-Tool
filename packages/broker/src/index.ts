@@ -13,7 +13,9 @@
  *   - `createResolver` / `connectPinned` — the outbound socket layer: resolve A+AAAA (§7.1 step 11, feeds
  *     `resolveAndPin`) and dial ONLY the pinned IP with SNI/cert-identity bound to the canonical host (§7.1 step 12);
  *   - `serializeRequest` / `readBoundedResponse` — the send/read wire: frame the reconstructed request to exact
- *     HTTP/1.1 bytes and read the response under a hard body cap (§7.1 step 12 SEND, §8 max_response_body_bytes).
+ *     HTTP/1.1 bytes and read the response under a hard body cap (§7.1 step 12 SEND, §8 max_response_body_bytes);
+ *   - `runStage2` — the end-to-end orchestration threading verify-grant → reconstruct → interlocks → resolve/pin →
+ *     connect/send → bounded-read → redirect-re-guard in the security-critical order (§7.1 steps 7–13).
  *
  * The actual mTLS ingress, DNS/TCP/TLS sockets, and the budget/window/e-stop interlocks are wired in later
  * (slice 4c-transport / slice 5); the resolver and grant-jti consumer are injected so nothing here performs real
@@ -65,3 +67,5 @@ export {
   serializeRequest,
   readBoundedResponse,
 } from './wire.js';
+
+export { type Stage2Input, type Stage2Deps, type Stage2Outcome, runStage2 } from './stage2.js';
