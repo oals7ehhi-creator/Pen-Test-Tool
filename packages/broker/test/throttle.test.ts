@@ -78,10 +78,12 @@ describe('evaluateAcquire — circuit → concurrency → spacing', () => {
     ).toEqual({ allow: true, openedToHalfOpen: true });
   });
 
-  it('a half_open breaker allows the probe request (openedToHalfOpen=false, already transitioned)', () => {
+  it('a half_open breaker DENIES further acquires (a probe is outstanding — exactly one probe, no flood)', () => {
+    // Only the open→half_open TRANSITION admits the single probe; while half_open, every other acquire is refused
+    // until the probe completes and resolves the breaker.
     expect(evaluateAcquire(snap({ circuitState: 'half_open' }), CFG, NOW)).toEqual({
-      allow: true,
-      openedToHalfOpen: false,
+      allow: false,
+      reason: 'circuit_open',
     });
   });
 
@@ -93,6 +95,13 @@ describe('evaluateAcquire — circuit → concurrency → spacing', () => {
         NOW,
       ).allow,
     ).toBe(false);
+  });
+
+  it('concurrency precedes spacing (both violated ⇒ concurrency_exceeded, not min_interval)', () => {
+    expect(evaluateAcquire(snap({ inFlight: 2, lastRequestAtMs: NOW - 10 }), CFG, NOW)).toEqual({
+      allow: false,
+      reason: 'concurrency_exceeded',
+    });
   });
 });
 

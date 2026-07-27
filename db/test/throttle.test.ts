@@ -38,8 +38,8 @@ async function rejects(
   throw new Error(`expected rejection but it succeeded: ${sql.slice(0, 80)}`);
 }
 
-const acquire = (c: pg.Client, cooldownS = 30): Promise<pg.QueryResult> =>
-  q(c, `SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, cooldownS]);
+const acquire = (c: pg.Client, cooldownMs = 30_000): Promise<pg.QueryResult> =>
+  q(c, `SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, cooldownMs]);
 const release = (c: pg.Client, success: boolean, threshold = 3): Promise<pg.QueryResult> =>
   q(c, `SELECT release_egress_slot($1,$2,$3,$4)`, [T_A, EA, success, threshold]);
 
@@ -133,13 +133,71 @@ describe.skipIf(!url)('slice 5c — egress-slot throttle (§8)', () => {
       await release(client, true);
       expect((await state(client)).in_flight).toBe(0);
     });
+
+    it('concurrent acquires SERIALISE on the counter lock — cap=1 admits exactly one, never over-admits', async () => {
+      await seed(client, 1, 0); // capacity of ONE
+      const clientB = new pg.Client({ connectionString: url });
+      await clientB.connect();
+      try {
+        // tx A: acquire and HOLD the transaction open (owns the runtime-counter row + its FOR UPDATE lock).
+        await client.query('BEGIN');
+        await client.query(`SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, 0]);
+
+        // tx B on a second connection: the same acquire must BLOCK on A's lock (via the ON CONFLICT / FOR UPDATE).
+        await clientB.query('BEGIN');
+        const bPromise = clientB.query(`SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, 0]);
+        const settled = bPromise.then(
+          () => 'resolved',
+          () => 'rejected',
+        );
+        const raced = await Promise.race([
+          settled,
+          new Promise<string>((r) => setTimeout(() => r('pending'), 500)),
+        ]);
+        expect(raced).toBe('pending'); // B is genuinely blocked while A holds the lock
+
+        // A commits (in_flight -> 1). B unblocks, re-reads in_flight=1 >= cap=1 ⇒ concurrency_exceeded.
+        await client.query('COMMIT');
+        await expect(bPromise).rejects.toThrow(/concurrency_exceeded/);
+        await clientB.query('ROLLBACK');
+
+        // exactly one acquire landed; the counter never exceeded the cap.
+        expect((await state(client)).in_flight).toBe(1);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        await clientB.query('ROLLBACK').catch(() => {});
+        await clientB.end();
+      }
+    });
   });
 
   describe('min-spacing', () => {
-    it('DENY min_interval when a second acquire arrives inside the interval', async () => {
+    it('DENY min_interval when a second acquire arrives inside the interval — and reserves nothing', async () => {
       await seed(client, 8, 5000); // 5s spacing, ample concurrency
       await acquire(client);
-      await rejects(client, `SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, 30], /min_interval/);
+      const before = await state(client);
+      await rejects(
+        client,
+        `SELECT acquire_egress_slot($1,$2,$3)`,
+        [T_A, EA, 30_000],
+        /min_interval/,
+      );
+      const after = await state(client);
+      // a denied acquire is a no-op: it bumps neither in_flight nor last_request_at.
+      expect(after.in_flight).toBe(before.in_flight);
+      expect(after.last_request_at).toEqual(before.last_request_at);
+    });
+  });
+
+  describe('release robustness', () => {
+    it('release on an engagement with no counter row raises unknown_engagement (fail-closed defensive branch)', async () => {
+      await seed(client, 2, 0); // engagement exists; no runtime-counter row (no prior acquire)
+      await rejects(
+        client,
+        `SELECT release_egress_slot($1,$2,$3,$4)`,
+        [T_A, EA, true, 3],
+        /unknown_engagement/,
+      );
     });
   });
 
@@ -156,14 +214,23 @@ describe.skipIf(!url)('slice 5c — egress-slot throttle (§8)', () => {
       expect(s.consecutive_errors).toBe(3);
       expect(s.circuit_opened_at).not.toBeNull();
 
-      // an acquire within the cooldown is refused.
-      await rejects(client, `SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, 30], /circuit_open/);
+      // an acquire within the cooldown (30s) is refused.
+      await rejects(
+        client,
+        `SELECT acquire_egress_slot($1,$2,$3)`,
+        [T_A, EA, 30_000],
+        /circuit_open/,
+      );
 
       // once the cooldown has elapsed (cooldown 0), exactly one probe is let through: open → half_open.
       await acquire(client, 0);
       s = await state(client);
       expect(s.circuit_state).toBe('half_open');
       expect(s.in_flight).toBe(1);
+
+      // a SECOND acquire while half_open is refused — exactly one probe is outstanding, no flood.
+      await rejects(client, `SELECT acquire_egress_slot($1,$2,$3)`, [T_A, EA, 0], /circuit_open/);
+      expect((await state(client)).in_flight).toBe(1); // the refusal reserved nothing
 
       // the probe SUCCEEDS → breaker closes and the error run clears.
       await release(client, true);
@@ -196,16 +263,43 @@ describe.skipIf(!url)('slice 5c — egress-slot throttle (§8)', () => {
   });
 
   describe('RLS', () => {
-    it('acquire runs under the broker tenant role and a tenant-B session sees no counter', async () => {
+    it('acquire runs under the broker tenant role; unset/wrong tenant GUC fails closed and writes nothing', async () => {
       await seed(client, 8, 0);
       await client.query('SET ROLE app_test');
+
+      // (a) with the tenant GUC set, the legitimate acquire succeeds and writes exactly its own counter row.
       await client.query(`SET app.tenant_id = '${T_A}'`);
-      await client.query(`SELECT acquire_egress_slot('${T_A}','${EA}',30)`);
+      await client.query(`SELECT acquire_egress_slot('${T_A}','${EA}',0)`);
+      expect(
+        (await q(client, `SELECT count(*)::int AS n FROM engagement_runtime_counter`)).rows[0].n,
+      ).toBe(1);
+
+      // (b) a tenant-B session sees none of tenant A's counter (RLS isolation).
       await client.query(`SET app.tenant_id = '${T_B}'`);
-      const none = await q(client, `SELECT count(*)::int AS n FROM engagement_runtime_counter`);
-      expect(none.rows[0].n).toBe(0);
+      expect(
+        (await q(client, `SELECT count(*)::int AS n FROM engagement_runtime_counter`)).rows[0].n,
+      ).toBe(0);
+      // and a T_B-GUC acquire targeting T_A fails closed (the WITH CHECK / row invisibility refuses the write).
+      await rejects(
+        client,
+        `SELECT acquire_egress_slot('${T_A}','${EA}',0)`,
+        [],
+        /row-level security|unknown_engagement/,
+      );
+
+      // (c) with the GUC unset entirely, the acquire fails closed too.
+      await client.query(`RESET app.tenant_id`);
+      await rejects(
+        client,
+        `SELECT acquire_egress_slot('${T_A}','${EA}',0)`,
+        [],
+        /row-level security|unknown_engagement/,
+      );
+
       await client.query('RESET ROLE');
       await client.query('RESET app.tenant_id');
+      // none of the fail-closed attempts moved tenant A's slot.
+      expect((await state(client)).in_flight).toBe(1);
     });
   });
 });

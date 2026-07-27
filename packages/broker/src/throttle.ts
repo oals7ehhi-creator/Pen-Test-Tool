@@ -77,6 +77,10 @@ export function evaluateAcquire(
     } else {
       return { allow: false, reason: 'circuit_open' };
     }
+  } else if (snapshot.circuitState === 'half_open') {
+    // A probe is already outstanding — admit NO further requests until its completion resolves the breaker to
+    // `closed` (success) or `open` (failure). This is what makes it EXACTLY ONE probe, not `max_concurrency` of them.
+    return { allow: false, reason: 'circuit_open' };
   }
   if (snapshot.inFlight >= config.maxConcurrency) {
     return { allow: false, reason: 'concurrency_exceeded' };

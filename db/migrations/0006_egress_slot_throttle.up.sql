@@ -14,6 +14,12 @@
 -- per-host concurrency + RPS token buckets land in a later slice. Extension-free. The down migration drops both funcs.
 --
 -- INVOCATION: SECURITY INVOKER — the broker calls these with its tenant GUC set, so RLS scopes them to that tenant.
+--
+-- KNOWN LIMITATION (concurrency, not safety): `in_flight` is a bare counter, so a broker that crashes BETWEEN acquire
+-- and release strands a slot — repeated crashes could wedge an engagement at `max_concurrency`. This never causes an
+-- UNSAFE egress (a stranded slot only makes the semaphore stricter), so it is a liveness, not a safety, concern. The
+-- crash-safe fix — modelling each slot as a self-expiring lease row (owner + expires_at) reclaimed by a sweeper, like
+-- the budget_reservation ledger (0004) — is deferred to the per-host slice that reworks this counter into per-host state.
 -- =============================================================================================================
 
 -- Acquire an egress slot, or RAISE a fixed reason (circuit_open / concurrency_exceeded / min_interval). p_cooldown_s is
@@ -21,7 +27,7 @@
 CREATE FUNCTION acquire_egress_slot(
   p_tenant     UUID,
   p_engagement UUID,
-  p_cooldown_s INT
+  p_cooldown_ms INT
 ) RETURNS void AS $$
 DECLARE
   v_in_flight   INT;
@@ -50,13 +56,18 @@ BEGIN
     RAISE EXCEPTION 'unknown_engagement';
   END IF;
 
-  -- (1) CIRCUIT: an 'open' breaker still cooling denies; once the cooldown elapses, allow one probe (open -> half_open).
+  -- (1) CIRCUIT: an 'open' breaker still cooling denies; once the cooldown elapses, allow ONE probe (open -> half_open).
+  -- A breaker already 'half_open' has a probe outstanding — deny until its release resolves it, so exactly one probe
+  -- is ever in flight (not up to max_concurrency of them). Cooldown is in MILLISECONDS, mirroring the pure layer + the
+  -- spacing check below.
   IF v_circuit = 'open' THEN
-    IF now() - COALESCE(v_opened_at, now()) >= make_interval(secs => p_cooldown_s) THEN
+    IF now() - COALESCE(v_opened_at, now()) >= (p_cooldown_ms || ' milliseconds')::interval THEN
       v_to_half := true;
     ELSE
       RAISE EXCEPTION 'circuit_open';
     END IF;
+  ELSIF v_circuit = 'half_open' THEN
+    RAISE EXCEPTION 'circuit_open';
   END IF;
 
   -- (2) CONCURRENCY.
