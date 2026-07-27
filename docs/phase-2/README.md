@@ -321,6 +321,14 @@ interlock / resolve deny (charge-before-egress); a redirect **surfaced but not a
 spec-mismatch and identity-mismatch rejection; the scheme→transport mapping (http⇒TCP, wss⇒TLS); and the interlock hook
 receiving the reconstructed request + claims (order proof).
 
+An adversarial 4-lens review (spec-fidelity / security / correctness / test-adequacy) returned **SHIP** — the step
+ordering, spec binding, and no-egress-on-denial were confirmed correct. Its three fail-closed/robustness fixes are
+landed here: the `beforeEgress` interlock is now a **required** dependency (the composition cannot reach egress without
+the charge slot being invoked — no silent no-op default); a rejecting DNS resolver is mapped to a fixed
+`{stage: resolve}` instead of escaping unmapped; and a synchronous throw after connect destroys the socket rather than
+leaking it — each with a regression test (plus interlock-runs-before-DNS, single-use-jti-across-runs, a no-leak oracle,
+and the redirect hop/`maxHops` bound).
+
 **Deliberately still to come in the Broker:** the **mTLS ingress server** — terminating the per-job client certificate
 into the `JobIdentity` that `authorizeIngress` (and thus `runStage2`) consumes — is the one remaining transport piece.
 Then the slice-5 interlocks fill the `beforeEgress` hook (budget charge-before-send, windows, emergency-stop,

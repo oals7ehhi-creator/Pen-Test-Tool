@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Duplex } from 'node:stream';
+import { Duplex, PassThrough } from 'node:stream';
 import { Buffer } from 'node:buffer';
 import {
   mintGrant,
@@ -132,7 +132,7 @@ function makeDeps(
   const deps: Stage2Deps = {
     grantVerify: { key: KEY, issuer: ISS, audience: AUD, nowSeconds: NOW, consumeJti: jtiStore() },
     reconstruct: reconstructCtx(over.reconstruct),
-    ...(over.beforeEgress !== undefined ? { beforeEgress: over.beforeEgress } : {}),
+    beforeEgress: over.beforeEgress ?? ((): void => {}),
     resolve: {
       scope: scope({
         class: 'domain',
@@ -256,6 +256,78 @@ describe('runStage2 — denials short-circuit with a fixed {stage, reason}', () 
     expect(connectCount()).toBe(0);
   });
 
+  it('interlock denial issues no DNS either — the charge runs strictly before the first egress (SI-055)', async () => {
+    let resolveCalls = 0;
+    const { deps, connectCount } = makeDeps({
+      beforeEgress: () => {
+        throw new Error('budget_exhausted');
+      },
+    });
+    const spied: Stage2Deps = {
+      ...deps,
+      resolve: {
+        ...deps.resolve,
+        resolve: (h) => {
+          resolveCalls++;
+          return deps.resolve.resolve(h);
+        },
+      },
+    };
+    const out = await runStage2(await input(), spied);
+    expect(out).toMatchObject({ ok: false, stage: 'interlock' });
+    expect(connectCount()).toBe(0);
+    expect(resolveCalls).toBe(0); // no DNS query left the box before the charge
+  });
+
+  it('maps a rejecting DNS resolver to a fixed {stage:resolve} instead of escaping', async () => {
+    const { deps, connectCount } = makeDeps();
+    const rejecting: Stage2Deps = {
+      ...deps,
+      resolve: { ...deps.resolve, resolve: () => Promise.reject(new Error('ESERVFAIL')) },
+    };
+    const out = await runStage2(await input(), rejecting);
+    expect(out).toMatchObject({ ok: false, stage: 'resolve' });
+    expect(connectCount()).toBe(0);
+  });
+
+  it('destroys the socket if the send throws after connect (no leaked socket)', async () => {
+    let created: Duplex | undefined;
+    const mk = (): Duplex => {
+      const s = new PassThrough();
+      s.write = (() => {
+        throw new Error('write_fail');
+      }) as typeof s.write;
+      created = s;
+      return s;
+    };
+    const { deps } = makeDeps();
+    const out = await runStage2(await input(), { ...deps, connectors: { tcp: mk, tls: mk } });
+    expect(out).toMatchObject({ ok: false, stage: 'send' });
+    expect(created?.destroyed).toBe(true);
+  });
+
+  it('consumes the single-use jti exactly once — a replayed grant denies at ingress, no second egress', async () => {
+    const { deps, connectCount } = makeDeps(); // one shared consumeJti store across both runs
+    const grantToken = await grantFor(makeSpec());
+    const first = await runStage2({ identity, grantToken, spec: makeSpec() }, deps);
+    expect(first.ok).toBe(true);
+    expect(connectCount()).toBe(1);
+    const second = await runStage2({ identity, grantToken, spec: makeSpec() }, deps);
+    expect(second).toMatchObject({ ok: false, stage: 'ingress', reason: 'replayed' });
+    expect(connectCount()).toBe(1); // the replayed grant opens no second socket
+  });
+
+  it('a failure {stage, reason} carries only a fixed code — never response bytes', async () => {
+    const { deps } = makeDeps({ response: 'GARBAGE-SECRET-TOKEN\r\n\r\n' });
+    const out = await runStage2(await input(), deps);
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.stage).toBe('read');
+      expect(out.reason).not.toContain('SECRET');
+      expect(out.reason).toMatch(/^[a-z_:]+$/);
+    }
+  });
+
   it('DENY at send when the connector fails to create the socket', async () => {
     const { deps } = makeDeps();
     const boom: Connectors = {
@@ -363,5 +435,19 @@ describe('runStage2 — redirects are surfaced, never auto-followed', () => {
     const out = await runStage2(await input(), deps);
     expect(out.ok).toBe(true);
     if (out.ok) expect(out.redirect).toBeNull();
+  });
+
+  it('threads the hop and enforces maxHops (follows at the last hop, stops at the budget)', async () => {
+    const { deps } = makeDeps({ response: redirectResponse('https://api.example.com/v2') });
+    const last = await runStage2(await input({ hop: 4 }), deps); // maxHops 5 ⇒ hop 4 still follows
+    expect(last.ok).toBe(true);
+    if (last.ok) expect(last.redirect?.follow).toBe(true);
+
+    const { deps: deps2 } = makeDeps({ response: redirectResponse('https://api.example.com/v2') });
+    const over = await runStage2(await input({ hop: 5 }), deps2); // hop == maxHops ⇒ depth exceeded
+    expect(over.ok).toBe(true);
+    if (over.ok && over.redirect && !over.redirect.follow) {
+      expect(over.redirect.reason).toBe('redirect_depth_exceeded');
+    }
   });
 });

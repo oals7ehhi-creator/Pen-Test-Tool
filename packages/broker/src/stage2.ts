@@ -33,7 +33,8 @@ import {
   type ReconstructContext,
   type ReconstructedRequest,
 } from './reconstruct.js';
-import { resolveAndPin, type ResolveContext } from './resolvePin.js';
+import type { Duplex } from 'node:stream';
+import { resolveAndPin, type ResolveContext, type PinDecision } from './resolvePin.js';
 import { connectPinned, type Connectors } from './connect.js';
 import {
   serializeRequest,
@@ -60,9 +61,11 @@ export interface Stage2Deps {
   readonly reconstruct: ReconstructContext;
   /**
    * Interlocks (§7.1 steps 9–10, slice 5): runs AFTER reconstruct and BEFORE any egress. Throw to DENY — no socket is
-   * opened, so a denial here guarantees no packet leaves. Default: no-op (interlocks land in slice 5).
+   * opened, so a denial here guarantees no packet leaves (SI-055). REQUIRED so the composition cannot reach egress
+   * without the interlock slot being invoked; slice 5 fills it with the real state-recheck + budget charge, and a
+   * caller that has no interlock must pass an EXPLICIT no-op (a conscious, visible choice — never a silent default).
    */
-  readonly beforeEgress?: (ctx: {
+  readonly beforeEgress: (ctx: {
     readonly claims: GrantClaims;
     readonly request: ReconstructedRequest;
   }) => void | Promise<void>;
@@ -132,20 +135,26 @@ export async function runStage2(input: Stage2Input, deps: Stage2Deps): Promise<S
     return { ok: false, stage: 'reconstruct', reason: reasonOf(e) };
   }
 
-  // 9–10. INTERLOCKS — state re-check + budget charge BEFORE any egress. A denial here opens no socket.
+  // 9–10. INTERLOCKS — state re-check + budget charge BEFORE any egress. The hook is REQUIRED (fail-closed by
+  // construction): the composition cannot reach DNS/connect without it having run. A denial here opens no socket.
   try {
-    if (deps.beforeEgress !== undefined) await deps.beforeEgress({ claims, request });
+    await deps.beforeEgress({ claims, request });
   } catch (e) {
     return { ok: false, stage: 'interlock', reason: reasonOf(e) };
   }
 
   // 11. RESOLVE + PIN — the FIRST egress; guard every resolved address, pin one validated IP.
-  const pin = await resolveAndPin(request.host, deps.resolve);
+  let pin: PinDecision;
+  try {
+    pin = await resolveAndPin(request.host, deps.resolve);
+  } catch (e) {
+    return { ok: false, stage: 'resolve', reason: reasonOf(e) };
+  }
   if (!pin.ok) return { ok: false, stage: 'resolve', reason: pin.reason };
 
   // 12. CONNECT + SEND — dial ONLY the pinned IP and issue exactly the reconstructed request.
   const useTls = request.scheme === 'https' || request.scheme === 'wss';
-  let socket;
+  let socket: Duplex | undefined;
   try {
     socket = connectPinned(
       pin.pinnedIp,
@@ -154,6 +163,8 @@ export async function runStage2(input: Stage2Input, deps: Stage2Deps): Promise<S
     );
     socket.write(serializeRequest(request));
   } catch (e) {
+    // A synchronous throw after the socket was created (e.g. from serialize/write) must not leak an open socket.
+    socket?.destroy();
     return { ok: false, stage: 'send', reason: reasonOf(e) };
   }
 
