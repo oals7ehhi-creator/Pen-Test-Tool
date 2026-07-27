@@ -10,13 +10,13 @@ what is implemented versus what is still to come — nothing here claims a contr
 
 ## Slice status
 
-| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                        |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                    |
-| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                    |
-| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                               |
-| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 in progress — **4a** grant/spec core + **4b** schema `0003` + **4c** Broker decision core + **4d** request reconstruction done; Broker transport (mTLS ingress + DNS/TCP/TLS sockets) next |
-| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | ⏳                                                                                                                                                                                            |
+| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                      |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                  |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                  |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                             |
+| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 in progress — **4a** grant/spec core + **4b** schema `0003` + **4c** Broker decision core + **4d** request reconstruction + **4e** outbound socket layer (DNS resolve + pinned connect) done; mTLS ingress + send/read wire + Stage-2 orchestration next |
+| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | ⏳                                                                                                                                                                                                                                                          |
 
 ## Slice 1 — what it proves (this commit)
 
@@ -234,6 +234,36 @@ broker-controlled-header screen on both the curated set and the session lease. A
 session-lease header-smuggling gap (**HIGH**, fixed — the session lease now gets the same screen as the curated set), a
 header-name whitespace evasion, a Host-header port/IPv6 omission, and a fail-closed gap on a query path with null keys,
 all fixed with regression tests.
+
+## Slice 4e — what it proves (this commit)
+
+The Broker's **outbound socket layer** (`packages/broker/src/resolver.ts`, `connect.ts`) — the concrete realization of
+§7.1 step 11 (resolve) + step 12 (connect), the point where the pin becomes a real socket. All DNS/socket I/O is
+injectable; the security-relevant option construction is pure and unit-tested, and a real loopback socket proves the
+pinned IP is what actually gets dialed.
+
+- **DNS resolution (§7.1 step 11).** `createResolver` resolves **A + AAAA** and merges them (deduped), feeding
+  `resolveAndPin` — which guards every address and pins one. It uses `dns.resolve4/6` (NOT `dns.lookup`), so the OS
+  hosts file cannot inject a loopback answer; a per-family `NODATA` does not fail the whole resolution; an empty merged
+  result is returned so `resolveAndPin` fails closed with `no_resolution`.
+- **Pinned connect (§7.1 step 12, SI-003/SI-004).** `connectPinned` dials **only** the pinned IP — enforced
+  structurally by an IP-literal guard, so `net`/`tls` can never fall back to `dns.lookup` (no second, unguarded
+  resolution / rebinding). For TLS the **SNI is the canonical host**, the certificate identity is validated against the
+  **canonical host** (never the pinned IP, never a name Node would otherwise default to), and `rejectUnauthorized` is
+  pinned to `true` in-code so `NODE_TLS_REJECT_UNAUTHORIZED=0` cannot silently disable chain validation.
+
+Tests (`packages/broker/test/resolver.test.ts`, `connect.test.ts`; package at **100%** coverage): A/AAAA merge, per-family
+NODATA tolerance, empty-resolution fail-closed, and dedup; the connect contract (dial pinned IP, SNI = canonical host,
+cert bound to canonical host, `rejectUnauthorized` explicit); the non-IP-pin refusal; and a real loopback TCP round-trip
+proving the pinned IP is dialed while the canonical host is only presented as identity. An adversarial 4-lens review
+returned **SHIP** (no blocker/high); its three non-blocking items (explicit `rejectUnauthorized`, the structural
+IP-literal guard, and a `rejectUnauthorized` assertion) are all landed here.
+
+**Deliberately still to come in the Broker:** the **mTLS ingress** server (terminating the per-job client identity into
+`authorizeIngress`), the **send/read wire layer** (issue the reconstructed request over the pinned socket; enforce
+size/time caps; surface — never auto-follow — redirects), and the **Stage-2 orchestration** that threads
+ingress → reconstruct → resolve/pin → connect → send. Then the slice-5 interlocks (budget charge-before-send, windows,
+emergency-stop, per-target rate/concurrency/circuit-breakers, hash-chained audit).
 
 ## Dependency-advisory disposition
 

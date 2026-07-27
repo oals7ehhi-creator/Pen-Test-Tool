@@ -9,7 +9,9 @@
  *     step 11);
  *   - `guardRedirect` — never auto-follow a 3xx; re-decide the Location against the frozen scope (§7.1 step 13);
  *   - `reconstructRequest` — rebuild the wire request DETERMINISTICALLY from the immutable spec, verifying every
- *     content-addressed/secret binding before egress (§7.1 step 8, SI-061) — the broker never trusts a worker request.
+ *     content-addressed/secret binding before egress (§7.1 step 8, SI-061) — the broker never trusts a worker request;
+ *   - `createResolver` / `connectPinned` — the outbound socket layer: resolve A+AAAA (§7.1 step 11, feeds
+ *     `resolveAndPin`) and dial ONLY the pinned IP with SNI/cert-identity bound to the canonical host (§7.1 step 12).
  *
  * The actual mTLS ingress, DNS/TCP/TLS sockets, and the budget/window/e-stop interlocks are wired in later
  * (slice 4c-transport / slice 5); the resolver and grant-jti consumer are injected so nothing here performs real
@@ -41,3 +43,14 @@ export {
   ReconstructError,
   reconstructRequest,
 } from './reconstruct.js';
+
+export { type DnsResolver, nodeDnsResolver, createResolver } from './resolver.js';
+
+export {
+  type ConnectTarget,
+  type Connectors,
+  nodeConnectors,
+  buildTcpOptions,
+  buildTlsOptions,
+  connectPinned,
+} from './connect.js';
