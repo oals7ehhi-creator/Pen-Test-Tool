@@ -105,6 +105,12 @@ function reasonOf(e: unknown): string {
   ) {
     return e.reason;
   }
+  // The interlock hook (slice 5) denies with a fixed-reason error (e.g. BudgetError) — surface its code so the
+  // interlock stage reports `budget_exhausted` / `emergency_stop` rather than a generic `error`. Our reason codes are
+  // always fixed tokens (never response/secret content), so echoing a string `reason` here cannot leak.
+  if (typeof (e as { reason?: unknown }).reason === 'string') {
+    return (e as { reason: string }).reason;
+  }
   return 'error';
 }
 

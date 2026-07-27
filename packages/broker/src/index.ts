@@ -73,6 +73,17 @@ export {
 export { type Stage2Input, type Stage2Deps, type Stage2Outcome, runStage2 } from './stage2.js';
 
 export {
+  type BudgetDenyReason,
+  type ChargeRequest,
+  type ChargeReceipt,
+  type ChargeOutcome,
+  type BudgetLedger,
+  type BudgetInterlockConfig,
+  BudgetError,
+  createBudgetInterlock,
+} from './budget.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,

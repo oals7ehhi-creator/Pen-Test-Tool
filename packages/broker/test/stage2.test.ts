@@ -10,11 +10,13 @@ import {
 import type { ScopeVersion, ScopeEntry } from '@pentest/scope';
 import {
   runStage2,
+  createBudgetInterlock,
   type Stage2Deps,
   type Stage2Input,
   type JobIdentity,
   type Connectors,
   type ReconstructContext,
+  type BudgetLedger,
 } from '../src/index.js';
 
 /**
@@ -235,6 +237,23 @@ describe('runStage2 — denials short-circuit with a fixed {stage, reason}', () 
     });
     const out = await runStage2(await input(), deps);
     expect(out).toMatchObject({ ok: false, stage: 'interlock' });
+    expect(connectCount()).toBe(0);
+  });
+
+  it('the budget interlock surfaces its fixed reason — a denying ledger DENIES with reason budget_exhausted, no socket', async () => {
+    const denyingLedger: BudgetLedger = {
+      charge: () => Promise.resolve({ ok: false, reason: 'budget_exhausted' }),
+    };
+    const { deps, connectCount } = makeDeps({
+      beforeEgress: createBudgetInterlock({
+        ledger: denyingLedger,
+        owner: 'broker-A',
+        grantJti: 'jti-x',
+        specId: 'spec-x',
+      }),
+    });
+    const out = await runStage2(await input(), deps);
+    expect(out).toMatchObject({ ok: false, stage: 'interlock', reason: 'budget_exhausted' });
     expect(connectCount()).toBe(0);
   });
 
