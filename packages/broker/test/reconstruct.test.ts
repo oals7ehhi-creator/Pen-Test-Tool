@@ -421,6 +421,25 @@ describe('reconstructRequest — review hardening', () => {
     });
   });
 
+  it('DENY a header VALUE carrying CR/LF/NUL (HTTP request-splitting defense), curated or session', async () => {
+    for (const bad of ['a\r\nX-Injected: 1', 'a\nb', 'a\rb', 'a\0b']) {
+      const curated = makeCtx({
+        fetchHeaderSet: () => Promise.resolve({ headers: [{ name: 'x-custom', value: bad }] }),
+      });
+      await expect(reconstructRequest(makeSpec(), curated), bad).rejects.toMatchObject({
+        reason: 'header_set_forbidden_header',
+      });
+      const spec = makeSpec({ sessionDigest: operatorSessionDigest(sessionIdentity) });
+      const session = makeCtx({
+        resolveSession: () =>
+          Promise.resolve({ identity: sessionIdentity, headers: [{ name: 'cookie', value: bad }] }),
+      });
+      await expect(reconstructRequest(spec, session), `session:${bad}`).rejects.toMatchObject({
+        reason: 'header_set_forbidden_header',
+      });
+    }
+  });
+
   it('DENY a header name that evades the filter by trailing whitespace or is otherwise malformed', async () => {
     for (const bad of ['host ', ' host', 'ho st', 'content-length\t', 'bad:name', 'x\r']) {
       const ctx = makeCtx({

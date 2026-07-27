@@ -130,14 +130,21 @@ const DEFAULT_PORT: Record<SpecScheme, number> = { https: 443, http: 80, wss: 44
 
 /** RFC 7230 header field-name token: `1*tchar`, no whitespace / controls / separators. */
 const HEADER_NAME_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** A header field-VALUE containing CR, LF, or NUL would let a curated/secret header SPLIT the request on the wire. */
+const HEADER_VALUE_FORBIDDEN = /[\r\n\0]/;
 
 /**
- * Screen a supplied header NAME (from either the curated set or the operator-session lease). Rejects a malformed name
+ * Screen a supplied header (from either the curated set or the operator-session lease). Rejects a malformed name
  * (so `"host "`, control chars, or an embedded `:` cannot slip a broker-controlled header past the lowercase Set
- * lookup) and any broker-controlled header (Host / Content-Length are set authoritatively). Fixed reason code only.
+ * lookup), any broker-controlled header (Host / Content-Length are set authoritatively), and any VALUE carrying
+ * CR/LF/NUL (which would enable HTTP request splitting/smuggling once serialized). Fixed reason code only.
  */
-function screenHeaderName(name: string): void {
-  if (!HEADER_NAME_TOKEN.test(name) || BROKER_CONTROLLED_HEADERS.has(name.toLowerCase())) {
+function screenHeader(field: HeaderField): void {
+  if (
+    !HEADER_NAME_TOKEN.test(field.name) ||
+    BROKER_CONTROLLED_HEADERS.has(field.name.toLowerCase()) ||
+    HEADER_VALUE_FORBIDDEN.test(field.value)
+  ) {
     throw new ReconstructError('header_set_forbidden_header');
   }
 }
@@ -154,7 +161,7 @@ export async function reconstructRequest(
   // 1. Fixed safe header-set (always present). Reject a curated set that smuggles a broker-controlled/malformed header.
   const headerSet = await ctx.fetchHeaderSet(spec.headerSetDigest);
   if (headerSet === null) throw new ReconstructError('header_set_not_found');
-  for (const h of headerSet.headers) screenHeaderName(h.name);
+  for (const h of headerSet.headers) screenHeader(h);
 
   // 2. Inert payload (optional) → bytes.
   let body: Uint8Array | null = null;
@@ -177,7 +184,7 @@ export async function reconstructRequest(
     }
     // The session lease is secret-manager data, NOT the immutable spec — it gets the SAME broker-controlled-header
     // screen as the curated set, so a lease cannot smuggle a Host / Content-Length the broker must own authoritatively.
-    for (const h of lease.headers) screenHeaderName(h.name);
+    for (const h of lease.headers) screenHeader(h);
     sessionHeaders = lease.headers;
   }
 

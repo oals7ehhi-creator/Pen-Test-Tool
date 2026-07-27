@@ -11,7 +11,9 @@
  *   - `reconstructRequest` — rebuild the wire request DETERMINISTICALLY from the immutable spec, verifying every
  *     content-addressed/secret binding before egress (§7.1 step 8, SI-061) — the broker never trusts a worker request;
  *   - `createResolver` / `connectPinned` — the outbound socket layer: resolve A+AAAA (§7.1 step 11, feeds
- *     `resolveAndPin`) and dial ONLY the pinned IP with SNI/cert-identity bound to the canonical host (§7.1 step 12).
+ *     `resolveAndPin`) and dial ONLY the pinned IP with SNI/cert-identity bound to the canonical host (§7.1 step 12);
+ *   - `serializeRequest` / `readBoundedResponse` — the send/read wire: frame the reconstructed request to exact
+ *     HTTP/1.1 bytes and read the response under a hard body cap (§7.1 step 12 SEND, §8 max_response_body_bytes).
  *
  * The actual mTLS ingress, DNS/TCP/TLS sockets, and the budget/window/e-stop interlocks are wired in later
  * (slice 4c-transport / slice 5); the resolver and grant-jti consumer are injected so nothing here performs real
@@ -54,3 +56,12 @@ export {
   buildTlsOptions,
   connectPinned,
 } from './connect.js';
+
+export {
+  type HttpResponse,
+  type ReadOptions,
+  type WireReason,
+  WireError,
+  serializeRequest,
+  readBoundedResponse,
+} from './wire.js';
