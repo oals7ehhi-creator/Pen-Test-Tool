@@ -165,4 +165,106 @@ describe.skipIf(!url)('slice 5d — request-rate token buckets (§8)', () => {
     await client.query('RESET ROLE');
     await client.query('RESET app.tenant_id');
   });
+
+  it('RLS fail-closed: with app.tenant_id unset the draw is refused and no bucket is created or mutated', async () => {
+    await seed(client, 2, 1);
+    // establish tenant-A's buckets as the broker would (under the tenant GUC).
+    await client.query('SET ROLE app_test');
+    await client.query(`SET app.tenant_id = '${T_A}'`);
+    await client.query(`SELECT take_rate_tokens('${T_A}','${EA}','h.example')`); // global + host born, drawn
+    // DROP the tenant GUC: the RLS predicate becomes NULL ⇒ the engagement (and its buckets) are invisible ⇒
+    // the function fails closed (unknown_engagement, or an RLS violation) rather than drawing without a tenant.
+    await client.query('RESET app.tenant_id');
+    await rejects(
+      client,
+      `SELECT take_rate_tokens('${T_A}','${EA}','h.example')`,
+      [],
+      /row-level security|unknown_engagement/,
+    );
+    await client.query('RESET ROLE'); // superuser bypasses RLS to observe the real rows
+    // no phantom row and no mutation to the pre-existing buckets: the refused draw persisted nothing.
+    expect((await q(client, `SELECT count(*)::int AS n FROM rate_bucket`)).rows[0].n).toBe(2);
+    expect(await tokensOf(client, 'h.example')).toBeLessThan(1); // still the drained value, not refilled/re-created
+  });
+
+  it('SQL fractional-rate floor: capacity=GREATEST(1,rate) admits one burst, then ~1 per (1/rate)s', async () => {
+    await seed(client, 50, 0.5); // host rate 0.5/s ⇒ capacity floored to 1 (one burst, then one per 2s)
+    await take(client, 'h.example'); // the single burst token
+    await rejects(
+      client,
+      `SELECT take_rate_tokens($1,$2,$3)`,
+      [T_A, EA, 'h.example'],
+      /rate_limited_host/,
+    ); // empty again, effectively no time accrued
+    // accrue exactly 2s ⇒ 2 * 0.5 = 1 token ⇒ admits again (proves the SQL LEAST(cap, …) at the ≥1 boundary
+    // together with the GREATEST(1.0, rate) capacity floor — a sub-1-rps host can still ever admit).
+    await q(
+      client,
+      `UPDATE rate_bucket SET tokens=0, refill_at=now()-interval '2 seconds'
+         WHERE engagement_id=$1 AND scope='h.example'`,
+      [EA],
+    );
+    await take(client, 'h.example');
+    expect(await tokensOf(client, 'h.example')).toBeLessThan(1); // drew the one accrued token back to ~0
+  });
+
+  it('a global-denied draw fabricates NO host bucket: the fresh-host INSERT rolls back with the RAISE', async () => {
+    await seed(client, 1, 1); // global capacity 1 — one draw total, then global is the binding limit
+    await take(client, 'a.example'); // global 1 -> 0
+    // a brand-new host: its bucket row is INSERTed inside the same call, but the global check RAISEs first and the
+    // whole draw rolls back — the symmetric no-leak to the host-denied case (which leaves the global token intact).
+    await rejects(
+      client,
+      `SELECT take_rate_tokens($1,$2,$3)`,
+      [T_A, EA, 'x.example'],
+      /rate_limited_global/,
+    );
+    expect(
+      (
+        await q(
+          client,
+          `SELECT count(*)::int AS n FROM rate_bucket WHERE engagement_id=$1 AND scope=$2`,
+          [EA, 'x.example'],
+        )
+      ).rows[0].n,
+    ).toBe(0); // no phantom 'x.example' bucket survived the rolled-back draw
+  });
+
+  it('concurrent draws SERIALISE on the global bucket lock — global cap=1 admits exactly one, never over-admits', async () => {
+    await seed(client, 1, 1); // global capacity ONE — the binding limit across ALL hosts
+    const clientB = new pg.Client({ connectionString: url });
+    await clientB.connect();
+    try {
+      // tx A: draw for host a.example and HOLD the tx open (owns the global rate_bucket row + its FOR UPDATE lock).
+      await client.query('BEGIN');
+      await client.query(`SELECT take_rate_tokens($1,$2,$3)`, [T_A, EA, 'a.example']);
+
+      // tx B on a second connection, a DIFFERENT host: it must still contend for the SAME global bucket and BLOCK
+      // (on A's uncommitted global-row insert / its FOR UPDATE lock) — proving global is enforced across hosts.
+      await clientB.query('BEGIN');
+      const bPromise = clientB.query(`SELECT take_rate_tokens($1,$2,$3)`, [T_A, EA, 'b.example']);
+      const settled = bPromise.then(
+        () => 'resolved',
+        () => 'rejected',
+      );
+      const raced = await Promise.race([
+        settled,
+        new Promise<string>((r) => setTimeout(() => r('pending'), 500)),
+      ]);
+      expect(raced).toBe('pending'); // B is genuinely blocked while A holds the global lock
+
+      // A commits (global -> 0). B unblocks, re-reads global≈0 (barely refilled in <1s) ⇒ rate_limited_global.
+      await client.query('COMMIT');
+      await expect(bPromise).rejects.toThrow(/rate_limited_global/);
+      await clientB.query('ROLLBACK');
+
+      // exactly one draw landed: global is drained and B fabricated no b.example bucket (its tx rolled back).
+      expect(await tokensOf(client, 'global')).toBeLessThan(1);
+      expect((await q(client, `SELECT count(*)::int AS n FROM rate_bucket`)).rows[0].n).toBe(2); // global + a.example
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      await clientB.query('ROLLBACK').catch(() => {});
+      await clientB.end();
+    }
+  });
 });

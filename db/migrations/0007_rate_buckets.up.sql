@@ -68,12 +68,14 @@ BEGIN
   SELECT tokens, refill_at INTO v_htok, v_hrefill
     FROM rate_bucket WHERE engagement_id = p_engagement AND scope = p_host FOR UPDATE;
 
-  -- Refill each bucket by the elapsed time (capped at capacity), then require ≥ 1 token in BOTH before consuming.
-  v_gnew := LEAST(v_gcap, v_gtok + EXTRACT(EPOCH FROM (now() - v_grefill)) * v_grate);
+  -- Refill each bucket by the elapsed time (floored at 0, capped at capacity), then require ≥ 1 token in BOTH before
+  -- consuming. The GREATEST(0, …) floor mirrors the pure layer's Math.max(0, …): now() is the wall clock (not
+  -- monotonic across transactions), so a backward step must never SUBTRACT tokens and starve a full bucket.
+  v_gnew := LEAST(v_gcap, v_gtok + GREATEST(0, EXTRACT(EPOCH FROM (now() - v_grefill))) * v_grate);
   IF v_gnew < 1 THEN
     RAISE EXCEPTION 'rate_limited_global';
   END IF;
-  v_hnew := LEAST(v_hcap, v_htok + EXTRACT(EPOCH FROM (now() - v_hrefill)) * v_hrate);
+  v_hnew := LEAST(v_hcap, v_htok + GREATEST(0, EXTRACT(EPOCH FROM (now() - v_hrefill))) * v_hrate);
   IF v_hnew < 1 THEN
     RAISE EXCEPTION 'rate_limited_host';
   END IF;
