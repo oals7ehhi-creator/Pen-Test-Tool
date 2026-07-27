@@ -69,6 +69,36 @@ describe('extractJobIdentity', () => {
     expect(extractJobIdentity(certWith(`URI:${JOB_URI}, URI:${JOB_URI}`))).toEqual(IDENTITY);
   });
 
+  it('DENY ambiguous_identity for two DISTINCT identities that would collide on a naive space-joined key', () => {
+    // `x%20y`→tenant `x y` (engagement `z`) vs `x`+`y%20z`→engagement `y z`: a space-joined dedupe key would fold
+    // both to "x y z w v" and hide the ambiguity. A collision-free key keeps them distinct ⇒ ambiguous_identity.
+    const a = 'spiffe://d/tenant/x%20y/engagement/z/run/w/job/v';
+    const b = 'spiffe://d/tenant/x/engagement/y%20z/run/w/job/v';
+    expect(() => extractJobIdentity(certWith(`URI:${a}, URI:${b}`))).toThrow(/ambiguous_identity/);
+  });
+
+  it('DENY no_job_identity for a SPIFFE URI with an empty trust domain (authority)', () => {
+    // `spiffe:///tenant/…` parses with an 8-segment path but an EMPTY authority — not a valid SPIFFE ID, no pin needed.
+    expect(() =>
+      extractJobIdentity(certWith('URI:spiffe:///tenant/t1/engagement/e1/run/r1/job/j1')),
+    ).toThrow(/no_job_identity/);
+  });
+
+  it('applies URL dot-segment normalization: traversal that breaks the job shape DENY; `x/..` collapses to the same job', () => {
+    // `new URL` normalizes `..` (and its percent-encoded form `%2e%2e`) BEFORE we split — a traversal that pops a real
+    // path segment leaves a 6-segment path ⇒ no_job_identity. There is no way to smuggle a different job through it.
+    for (const san of [
+      'URI:spiffe://d/tenant/../engagement/e1/run/r1/job/j1',
+      'URI:spiffe://d/tenant/t1/engagement/e1/run/r1/job/%2e%2e',
+    ]) {
+      expect(() => extractJobIdentity(certWith(san)), san).toThrow(/no_job_identity/);
+    }
+    // `…/job/j1/x/..` normalizes back to `…/job/j1` — the SAME legitimate identity, never an escalation.
+    expect(
+      extractJobIdentity(certWith('URI:spiffe://d/tenant/t1/engagement/e1/run/r1/job/j1/x/..')),
+    ).toEqual({ tenantId: 't1', engagementId: 'e1', runId: 'r1', jobId: 'j1' });
+  });
+
   it('pins the SPIFFE trust domain when one is expected', () => {
     expect(extractJobIdentity(certWith(`URI:${JOB_URI}`), 'broker.pentest')).toEqual(IDENTITY);
     expect(() => extractJobIdentity(certWith(`URI:${JOB_URI}`), 'other.domain')).toThrow(
