@@ -22,7 +22,8 @@ export type LiveStateReason =
   | 'not_yet_effective'
   | 'authorization_expired'
   | 'blackout'
-  | 'window_closed';
+  | 'window_closed'
+  | 'invalid_timezone';
 
 /** A recurring weekly window: active on `daysOfWeek` (0=Mon..6=Sun) between two local-time-of-day seconds. */
 export interface RecurringWindow {
@@ -135,7 +136,15 @@ export function evaluateLiveState(ctx: LiveStateContext): LiveStateResult {
   }
 
   // An allow-window is REQUIRED — `now` must fall inside at least one recurring_weekly / one_off window.
-  const { dow, sec } = localParts(nowMs, ctx.timezone);
+  // An unparseable IANA timezone means the effective-window rule cannot be evaluated ⇒ fail closed (SI-049), rather
+  // than throwing a raw `RangeError` out of the evaluator. `evaluateLiveState` is thus TOTAL: it never throws.
+  let dow: number;
+  let sec: number;
+  try {
+    ({ dow, sec } = localParts(nowMs, ctx.timezone));
+  } catch {
+    return { allowed: false, reason: 'invalid_timezone' };
+  }
   let insideAllow = false;
   for (const w of ctx.windows) {
     if (w.kind === 'recurring_weekly') {

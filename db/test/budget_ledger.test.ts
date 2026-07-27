@@ -726,5 +726,66 @@ describe.skipIf(!url)('slice 5a â€” budget charge-before-send ledger + intent (Â
       expect((await q(client, `SELECT sweep_expired_leases() AS n`)).rows[0].n).toBe(1);
       expect((await q(client, `SELECT sweep_expired_leases() AS n`)).rows[0].n).toBe(0);
     });
+
+    it('run as a SYSTEM (RLS-exempt) role it reclaims ACROSS engagements in one pass', async () => {
+      // a second engagement (same tenant) with its own scope/authorization/spec.
+      const EB = 'bbbbbbbb-0000-0000-0000-000000000002';
+      const SPEC_B = 'eeeeeeee-0000-0000-0000-0000000000b2';
+      const HB = 'b'.repeat(64);
+      await q(
+        client,
+        `INSERT INTO engagement (id, tenant_id, name, owner_user_id, created_by, timezone)
+         VALUES ($1,$2,'EB',$3,$3,'UTC')`,
+        [EB, T_A, U],
+      );
+      await q(
+        client,
+        `INSERT INTO scope_version (id, tenant_id, engagement_id, version_number, scope_hash, entry_count,
+           host_count, ipv4_equiv_addresses, cidr_entry_count, created_by)
+         VALUES ('cccccccc-0000-0000-0000-0000000000b2',$1,$2,1,$3,0,0,0,0,$4)`,
+        [T_A, EB, HB, U],
+      );
+      await q(
+        client,
+        `INSERT INTO "authorization" (id, tenant_id, engagement_id, authorization_reference, authorizing_party_name,
+           authorizing_party_org, engagement_owner_user_id, effective_from, expires_at, allowed_modes,
+           scope_version_id, scope_hash, record_hash)
+         VALUES ('dddddddd-0000-0000-0000-0000000000b2',$1,$2,'ref','p','o',$3, now(), now()+interval '10 days',
+                 ARRAY['passive'],'cccccccc-0000-0000-0000-0000000000b2',$4,$5)`,
+        [T_A, EB, U, HB, 'r'.repeat(64)],
+      );
+      const hdr = await q(client, `SELECT digest FROM catalog_template LIMIT 1`);
+      await q(
+        client,
+        `INSERT INTO request_spec (id, tenant_id, engagement_id, run_id, job_id, scope_hash, authorization_id,
+           request_class, kind, header_set_digest, method, canonical_url, canonical_host, port, scheme, canonical_path,
+           mode, spec_sha256)
+         VALUES ($1,$2,$3,$4,$4,$5,'dddddddd-0000-0000-0000-0000000000b2','native','http',$6,'GET',
+                 'https://example.com/api','example.com',443,'https','/api','passive',$7)`,
+        [SPEC_B, T_A, EB, U, HB, hdr.rows[0].digest, SPEC_SHA],
+      );
+
+      // one past-deadline claimed lease in EACH engagement.
+      await lease(client, {
+        jti: 'stale-A',
+        state: 'claimed',
+        expiresSql: `now()-interval '1 second'`,
+      });
+      await q(
+        client,
+        `INSERT INTO budget_reservation (tenant_id, engagement_id, spec_id, grant_jti, state, owner, fence_token, expires_at)
+         VALUES ($1,$2,$3,'stale-B','claimed','broker-A',1, now()-interval '1 second')`,
+        [T_A, EB, SPEC_B],
+      );
+
+      // one system sweep reclaims BOTH (this run is the RLS-exempt owner).
+      const n = await q(client, `SELECT sweep_expired_leases() AS n`);
+      expect(n.rows[0].n).toBe(2);
+      const states = await q(
+        client,
+        `SELECT state FROM budget_reservation WHERE grant_jti IN ('stale-A','stale-B')`,
+      );
+      expect(states.rows.every((r) => r.state === 'expired')).toBe(true);
+    });
   });
 });

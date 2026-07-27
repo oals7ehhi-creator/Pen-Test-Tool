@@ -131,6 +131,117 @@ describe('evaluateLiveState — validity + window rule (§2.3)', () => {
   });
 });
 
+describe('evaluateLiveState — hardening (all weekdays, boundaries, DST, invalid tz)', () => {
+  it('maps every weekday 0=Mon..6=Sun correctly (an adjacent-day window closes)', () => {
+    // 2026-01-05 Mon .. 2026-01-11 Sun, each at 12:00 UTC.
+    const DAYS: Array<[number, number]> = [
+      [Date.UTC(2026, 0, 5, 12, 0, 0), 0],
+      [Date.UTC(2026, 0, 6, 12, 0, 0), 1],
+      [Date.UTC(2026, 0, 7, 12, 0, 0), 2],
+      [Date.UTC(2026, 0, 8, 12, 0, 0), 3],
+      [Date.UTC(2026, 0, 9, 12, 0, 0), 4],
+      [Date.UTC(2026, 0, 10, 12, 0, 0), 5],
+      [Date.UTC(2026, 0, 11, 12, 0, 0), 6],
+    ];
+    for (const [nowMs, dow] of DAYS) {
+      expect(
+        evaluateLiveState(base({ nowMs, windows: [recurring([dow], 0, 86_399)] })),
+        `dow ${dow} own-day`,
+      ).toEqual({ allowed: true });
+      expect(
+        evaluateLiveState(base({ nowMs, windows: [recurring([(dow + 1) % 7], 0, 86_399)] }))
+          .allowed,
+        `dow ${dow} adjacent-day`,
+      ).toBe(false);
+    }
+  });
+
+  it('window bounds are half-open: start inclusive, end exclusive (incl. the midnight seam of a wrap)', () => {
+    const w = recurring([0], 9 * 3600, 17 * 3600); // Mon 09:00–17:00
+    expect(
+      evaluateLiveState(base({ nowMs: Date.UTC(2026, 0, 5, 9, 0, 0), windows: [w] })).allowed,
+    ).toBe(true); // exactly 09:00:00 (start, inclusive)
+    expect(
+      evaluateLiveState(base({ nowMs: Date.UTC(2026, 0, 5, 17, 0, 0), windows: [w] })).allowed,
+    ).toBe(false); // exactly 17:00:00 (end, exclusive)
+
+    const wrap = recurring([4], 22 * 3600, 2 * 3600); // Fri 22:00 → Sat 02:00
+    expect(
+      evaluateLiveState(base({ nowMs: Date.UTC(2026, 0, 9, 22, 0, 0), windows: [wrap] })).allowed,
+    ).toBe(true); // Fri 22:00:00 (start)
+    expect(
+      evaluateLiveState(base({ nowMs: Date.UTC(2026, 0, 10, 2, 0, 0), windows: [wrap] })).allowed,
+    ).toBe(false); // Sat 02:00:00 (end, exclusive)
+    expect(
+      evaluateLiveState(base({ nowMs: Date.UTC(2026, 0, 10, 0, 0, 0), windows: [wrap] })).allowed,
+    ).toBe(true); // Sat 00:00:00 (midnight seam, sec=0, via the prev-day Fri arm)
+
+    // an absolute (one_off) window's end is exclusive too.
+    const oneOff: TestingWindow = {
+      kind: 'one_off',
+      startAtMs: MON_1200_UTC - 1000,
+      endAtMs: MON_1200_UTC,
+    };
+    expect(evaluateLiveState(base({ nowMs: MON_1200_UTC, windows: [oneOff] })).allowed).toBe(false);
+    // a blackout's end is exclusive: at now === blackout.endAtMs it no longer covers, so an allow-window wins.
+    const blackout: TestingWindow = {
+      kind: 'blackout',
+      startAtMs: MON_1200_UTC - 1000,
+      endAtMs: MON_1200_UTC,
+    };
+    expect(
+      evaluateLiveState(
+        base({ nowMs: MON_1200_UTC, windows: [recurring([0], 0, 86_399), blackout] }),
+      ).allowed,
+    ).toBe(true);
+  });
+
+  it('resolves DST-correctly in the engagement timezone (not a fixed offset)', () => {
+    // 2026-07-15T02:00Z in America/New_York is EDT (-04:00) ⇒ Tue 22:00 local (a fixed -05:00/EST would give 21:00).
+    const edt = Date.UTC(2026, 6, 15, 2, 0, 0);
+    const tueEve = recurring([1], 21 * 3600 + 1800, 22 * 3600 + 1800); // Tue 21:30–22:30 local
+    expect(
+      evaluateLiveState(base({ nowMs: edt, timezone: 'America/New_York', windows: [tueEve] }))
+        .allowed,
+    ).toBe(true); // 22:00 EDT ∈ [21:30,22:30) — only correct if DST (EDT) is applied
+    expect(
+      evaluateLiveState(base({ nowMs: edt, timezone: 'UTC', windows: [tueEve] })).allowed,
+    ).toBe(false); // 02:00 UTC ∉
+
+    // Spring-forward gap: 02:00–02:59 local never occurs on 2026-03-08 ⇒ a Sun 02:00–03:00 window opens at no instant.
+    const gap = recurring([6], 2 * 3600, 3 * 3600);
+    for (const ms of [Date.UTC(2026, 2, 8, 6, 59, 0), Date.UTC(2026, 2, 8, 7, 0, 0)]) {
+      expect(
+        evaluateLiveState(base({ nowMs: ms, timezone: 'America/New_York', windows: [gap] }))
+          .allowed,
+        `spring-forward ${ms}`,
+      ).toBe(false);
+    }
+
+    // Fall-back: 01:00–01:59 local occurs TWICE on 2026-11-01 (EDT 05:30Z and EST 06:30Z) ⇒ a Sun 01:00–02:00
+    // window opens at both real instants.
+    const repeated = recurring([6], 1 * 3600, 2 * 3600);
+    for (const ms of [Date.UTC(2026, 10, 1, 5, 30, 0), Date.UTC(2026, 10, 1, 6, 30, 0)]) {
+      expect(
+        evaluateLiveState(base({ nowMs: ms, timezone: 'America/New_York', windows: [repeated] }))
+          .allowed,
+        `fall-back ${ms}`,
+      ).toBe(true);
+    }
+  });
+
+  it('DENY invalid_timezone — an unparseable IANA timezone fails closed (evaluateLiveState never throws)', () => {
+    expect(evaluateLiveState(base({ timezone: 'Mars/Phobos' }))).toEqual({
+      allowed: false,
+      reason: 'invalid_timezone',
+    });
+    expect(evaluateLiveState(base({ timezone: '' }))).toEqual({
+      allowed: false,
+      reason: 'invalid_timezone',
+    });
+  });
+});
+
 describe('createLiveStateGate + composeBeforeEgress', () => {
   const claims = { tenantId: 't', engagementId: 'e' } as unknown as GrantClaims;
   const request = { targetUrl: 'https://example.com/' } as unknown as ReconstructedRequest;
@@ -148,6 +259,12 @@ describe('createLiveStateGate + composeBeforeEgress', () => {
   it('awaits an async context loader', async () => {
     const gate = createLiveStateGate(async () => base({ revoked: true }));
     await expect(gate(arg)).rejects.toThrow(/authorization_revoked/);
+  });
+
+  it('fails closed on an invalid timezone with the fixed reason (no raw RangeError escapes)', async () => {
+    const gate = createLiveStateGate(() => base({ timezone: 'Mars/Phobos' }));
+    await expect(gate(arg)).rejects.toBeInstanceOf(LiveStateError);
+    await expect(gate(arg)).rejects.toThrow(/invalid_timezone/);
   });
 
   it('composeBeforeEgress runs hooks in order and short-circuits on the first throw', async () => {

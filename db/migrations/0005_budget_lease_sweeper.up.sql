@@ -11,8 +11,16 @@
 -- Extension-free; reuses the 0004 transition trigger. The down migration drops only this function.
 -- =============================================================================================================
 
--- Expire every past-deadline 'claimed' lease (freeing its reserved capacity) and return how many were swept. Each
--- UPDATE fires budget_reservation_transition(), which re-checks (deadline passed, not charged) and stamps resolved_at.
+-- Expire every past-deadline 'claimed' lease (moving it to the terminal 'expired' state) and return how many were
+-- swept. Each UPDATE fires budget_reservation_transition(), which re-checks (deadline passed, not charged) and stamps
+-- resolved_at. Availability already excludes past-deadline claims (0004), so this is ledger-state housekeeping, not a
+-- capacity change; safety never depends on the sweeper running.
+--
+-- INVOCATION: this is a SYSTEM, owner-agnostic maintenance job. It is SECURITY INVOKER, so under FORCE ROW LEVEL
+-- SECURITY it sweeps only the rows visible to the caller. Run it as an RLS-EXEMPT system role (not the per-tenant
+-- broker role) so it reclaims across ALL engagements/tenants; a per-tenant invocation would under-sweep other tenants'
+-- stale claims (harmless — a stranded 'claimed' row reserves no capacity past its deadline — but it leaves ledger
+-- housekeeping undone).
 CREATE FUNCTION sweep_expired_leases() RETURNS integer AS $$
 DECLARE
   n integer;
