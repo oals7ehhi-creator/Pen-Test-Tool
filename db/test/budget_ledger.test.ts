@@ -286,10 +286,59 @@ describe.skipIf(!url)('slice 5a — budget charge-before-send ledger + intent (�
         /invalid_lease_ttl/,
       );
     });
+
+    it('DENY unknown_spec (fixed reason, before the composite spec FK) for a spec not in this engagement', async () => {
+      await seed(client, 5);
+      // the spec digest is resolved BEFORE the lease INSERT, so a bad spec_id gives the fixed reason, not a raw FK error.
+      await rejects(
+        client,
+        `SELECT * FROM budget_charge_and_intent($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          T_A,
+          EA,
+          '00000000-0000-0000-0000-000000000000',
+          'j1',
+          'broker-A',
+          'https://example.com/api',
+          30,
+        ],
+        /unknown_spec/,
+      );
+      const n = await q(client, `SELECT count(*)::int AS n FROM budget_reservation`);
+      expect(n.rows[0].n).toBe(0); // nothing claimed/charged
+    });
+
+    it('a terminal charged lease is EXCLUDED from availability — at total=2 two charges both succeed (used=2)', async () => {
+      await seed(client, 2);
+      const c1 = await charge(client, { jti: 'j1' }); // used 0->1; availability 2-1-0 = 1 > 0
+      const c2 = await charge(client, { jti: 'j2' }); // the first (charged) lease must NOT count as a live claim
+      expect(c1.reservation_id).not.toBe(c2.reservation_id);
+      const eng = await q(client, `SELECT request_budget_used FROM engagement WHERE id=$1`, [EA]);
+      expect(eng.rows[0].request_budget_used).toBe(2);
+    });
   });
 
   describe('state-machine transition trigger', () => {
     beforeEach(() => seed(client, 100));
+
+    it('a lease cannot be BORN in a terminal state — the INSERT guard forces state=claimed, charged_at/resolved_at NULL', async () => {
+      // Without this guard, a directly-inserted 'charged' row would be a terminal charged lease that never ran the
+      // claimed->charged transition, so it would never increment request_budget_used — bypassing the sole meter.
+      const born = (cols: string, vals: string): string =>
+        `INSERT INTO budget_reservation (tenant_id, engagement_id, spec_id, grant_jti, owner, fence_token, expires_at${cols})
+         VALUES ($1,$2,$3,$4,'b',1, now()+interval '30 s'${vals})`;
+      const cases: Array<[string, string]> = [
+        [`, state, charged_at`, `, 'charged', now()`], // born charged
+        [`, state`, `, 'released'`], // born released
+        [`, state`, `, 'expired'`], // born expired
+        [`, state, charged_at`, `, 'claimed', now()`], // claimed but with a charged_at
+        [`, resolved_at`, `, now()`], // claimed but with a resolved_at
+      ];
+      let i = 0;
+      for (const [cols, vals] of cases) {
+        await rejects(client, born(cols, vals), [T_A, EA, SPEC, `jti-born-${i++}`], /born claimed/);
+      }
+    });
 
     it("'charged' is terminal — no release / expire / re-claim", async () => {
       const c1 = await charge(client, { jti: 'j1' });
@@ -514,6 +563,97 @@ describe.skipIf(!url)('slice 5a — budget charge-before-send ledger + intent (�
       expect(some.rows[0].n).toBe(1);
       await client.query('RESET ROLE');
       await client.query('RESET app.tenant_id');
+    });
+
+    it('the charge runs under the broker RLS role with app.tenant_id set, and fails closed when it is unset', async () => {
+      // (a) as the non-superuser role WITH the tenant GUC: the full write path (runtime counter, lease, engagement
+      // used-increment, audit chain + intent) passes every WITH CHECK ⇒ the legitimate charge succeeds.
+      await client.query('SET ROLE app_test');
+      await client.query(`SET app.tenant_id = '${T_A}'`);
+      const ok = await q(client, `SELECT * FROM budget_charge_and_intent($1,$2,$3,$4,$5,$6,$7)`, [
+        T_A,
+        EA,
+        SPEC,
+        'jr1',
+        'broker-A',
+        'https://example.com/api',
+        30,
+      ]);
+      expect(ok.rows[0].reservation_id).toMatch(/^[0-9a-f-]{36}$/);
+
+      // (b) with the GUC UNSET the charge fails closed and writes nothing — the runtime-counter WITH CHECK rejects the
+      // write (or, had the row been invisible, the FOR UPDATE would see no row ⇒ unknown_engagement). Either denies.
+      await client.query('RESET app.tenant_id');
+      await rejects(
+        client,
+        `SELECT * FROM budget_charge_and_intent($1,$2,$3,$4,$5,$6,$7)`,
+        [T_A, EA, SPEC, 'jr2', 'broker-A', 'https://example.com/api', 30],
+        /row-level security|unknown_engagement/,
+      );
+      await client.query('RESET ROLE');
+      await client.query('RESET app.tenant_id');
+      // exactly one charge landed (the GUC-set one); the unset attempt changed nothing.
+      const eng = await q(client, `SELECT request_budget_used FROM engagement WHERE id=$1`, [EA]);
+      expect(eng.rows[0].request_budget_used).toBe(1);
+    });
+  });
+
+  // The whole no-over-commit story rests on the per-engagement engagement_runtime_counter FOR UPDATE lock + the
+  // under-lock availability re-read. These run for real on two concurrent connections so the serialisation is proven,
+  // not assumed: removing the FOR UPDATE (or hoisting the availability read above it) would make this test fail.
+  describe('concurrency — serialised charges (no over-commit)', () => {
+    it('two concurrent charges at total=1 serialise: exactly one succeeds, the other DENIES budget_exhausted', async () => {
+      await seed(client, 1); // the engagement_runtime_counter row does NOT exist yet (first-ever-charge race)
+      const clientB = new pg.Client({ connectionString: url });
+      await clientB.connect();
+      try {
+        // tx A: charge and HOLD the transaction open — it owns the runtime-counter row + its FOR UPDATE lock.
+        await client.query('BEGIN');
+        const a = await q(client, `SELECT * FROM budget_charge_and_intent($1,$2,$3,$4,$5,$6,$7)`, [
+          T_A,
+          EA,
+          SPEC,
+          'jA',
+          'broker-A',
+          'https://example.com/api',
+          30,
+        ]);
+        expect(a.rows[0].reservation_id).toMatch(/^[0-9a-f-]{36}$/);
+
+        // tx B (second connection): the same charge must BLOCK on A's lock (the ON CONFLICT insert / FOR UPDATE).
+        await clientB.query('BEGIN');
+        const bPromise = clientB.query(
+          `SELECT * FROM budget_charge_and_intent($1,$2,$3,$4,$5,$6,$7)`,
+          [T_A, EA, SPEC, 'jB', 'broker-B', 'https://example.com/api', 30],
+        );
+        const settled = bPromise.then(
+          () => 'resolved',
+          () => 'rejected',
+        );
+        const raced = await Promise.race([
+          settled,
+          new Promise<string>((r) => setTimeout(() => r('pending'), 500)),
+        ]);
+        expect(raced).toBe('pending'); // B is genuinely blocked while A holds the lock
+
+        // A commits (used -> 1). B now unblocks, re-reads used=1 under the lock ⇒ availability 1-1-0 = 0 ⇒ DENY.
+        await client.query('COMMIT');
+        await expect(bPromise).rejects.toThrow(/budget_exhausted/);
+        await clientB.query('ROLLBACK');
+
+        // exactly one of the two concurrent charges landed; the counter never over-committed.
+        const eng = await q(client, `SELECT request_budget_used FROM engagement WHERE id=$1`, [EA]);
+        expect(eng.rows[0].request_budget_used).toBe(1);
+        const charged = await q(
+          client,
+          `SELECT count(*)::int AS n FROM budget_reservation WHERE state='charged'`,
+        );
+        expect(charged.rows[0].n).toBe(1);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        await clientB.query('ROLLBACK').catch(() => {});
+        await clientB.end();
+      }
     });
   });
 

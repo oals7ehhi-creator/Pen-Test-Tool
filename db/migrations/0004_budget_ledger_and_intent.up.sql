@@ -133,7 +133,21 @@ END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER budget_reservation_transition_t
   BEFORE UPDATE ON budget_reservation
   FOR EACH ROW EXECUTE FUNCTION budget_reservation_transition();
--- UPDATE-only: the CHECK constraints already bound the INSERT shape (a lease is born 'claimed', charged_at NULL).
+-- Born shape: a lease MUST be born 'claimed' with charged_at / resolved_at NULL. A CHECK cannot enforce this (it also
+-- runs on the charge UPDATE and would reject the legitimate claimed->charged transition), and the born-shape CHECKs
+-- alone do NOT bound it (charged_has_time permits a directly-inserted 'charged' row). This BEFORE INSERT guard makes
+-- budget_reservation_transition_t the ONLY route out of 'claimed', so the sole request_budget_used increment can never
+-- be bypassed by inserting a lease already in a terminal state.
+CREATE FUNCTION budget_reservation_insert_shape() RETURNS trigger AS $$
+BEGIN
+  IF NEW.state <> 'claimed' OR NEW.charged_at IS NOT NULL OR NEW.resolved_at IS NOT NULL THEN
+    RAISE EXCEPTION 'a budget lease must be born claimed (state=claimed, charged_at/resolved_at NULL)';
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER budget_reservation_insert_shape_t
+  BEFORE INSERT ON budget_reservation
+  FOR EACH ROW EXECUTE FUNCTION budget_reservation_insert_shape();
 -- DELETE is revoked (a lease is never removed; terminal states are the audit record).
 CREATE TRIGGER budget_reservation_no_delete_t
   BEFORE DELETE ON budget_reservation
@@ -250,6 +264,14 @@ BEGIN
     RAISE EXCEPTION 'budget_exhausted';
   END IF;
 
+  -- Resolve the spec digest (for the intent payload) BEFORE the lease INSERT, so an unknown spec fails with the fixed
+  -- reason `unknown_spec` rather than a raw foreign_key_violation from the lease's composite spec FK.
+  SELECT spec_sha256 INTO v_spec_sha FROM request_spec
+    WHERE id = p_spec_id AND tenant_id = p_tenant AND engagement_id = p_engagement;
+  IF v_spec_sha IS NULL THEN
+    RAISE EXCEPTION 'unknown_spec';
+  END IF;
+
   -- Allocate the fence token (monotonic) under the same lock.
   v_ftoken := v_fence + 1;
   UPDATE engagement_runtime_counter SET fence_seq = v_ftoken WHERE engagement_id = p_engagement;
@@ -272,11 +294,6 @@ BEGIN
   IF v_chain_id IS NULL THEN
     INSERT INTO audit_chain (id, stream, tenant_id, engagement_id)
       VALUES (gen_random_uuid(), 'engagement', p_tenant, p_engagement) RETURNING id INTO v_chain_id;
-  END IF;
-  SELECT spec_sha256 INTO v_spec_sha FROM request_spec
-    WHERE id = p_spec_id AND tenant_id = p_tenant AND engagement_id = p_engagement;
-  IF v_spec_sha IS NULL THEN
-    RAISE EXCEPTION 'unknown_spec';
   END IF;
 
   v_intent := audit_append(

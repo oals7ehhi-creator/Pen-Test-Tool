@@ -9,3 +9,4 @@ DROP TABLE IF EXISTS engagement_runtime_counter CASCADE;
 DROP FUNCTION IF EXISTS budget_charge_and_intent(UUID, UUID, UUID, TEXT, TEXT, TEXT, INT);
 DROP FUNCTION IF EXISTS audit_append(UUID, TEXT, UUID, TEXT, TEXT, TEXT, UUID, UUID, JSONB);
 DROP FUNCTION IF EXISTS budget_reservation_transition();
+DROP FUNCTION IF EXISTS budget_reservation_insert_shape();
