@@ -84,6 +84,20 @@ export {
 } from './budget.js';
 
 export {
+  type LiveStateReason,
+  type RecurringWindow,
+  type AbsoluteWindow,
+  type TestingWindow,
+  type LiveStateContext,
+  type LiveStateResult,
+  type BeforeEgressHook,
+  LiveStateError,
+  evaluateLiveState,
+  createLiveStateGate,
+  composeBeforeEgress,
+} from './livestate.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,

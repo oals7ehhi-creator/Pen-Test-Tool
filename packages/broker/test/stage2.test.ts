@@ -11,6 +11,8 @@ import type { ScopeVersion, ScopeEntry } from '@pentest/scope';
 import {
   runStage2,
   createBudgetInterlock,
+  createLiveStateGate,
+  composeBeforeEgress,
   type Stage2Deps,
   type Stage2Input,
   type JobIdentity,
@@ -254,6 +256,38 @@ describe('runStage2 — denials short-circuit with a fixed {stage, reason}', () 
     });
     const out = await runStage2(await input(), deps);
     expect(out).toMatchObject({ ok: false, stage: 'interlock', reason: 'budget_exhausted' });
+    expect(connectCount()).toBe(0);
+  });
+
+  it('the live-state gate runs BEFORE the budget charge: a closed window DENIES window_closed, no charge, no socket', async () => {
+    // A ledger that would succeed — but the gate (composed first) must deny before it is ever consulted.
+    let charged = false;
+    const ledger: BudgetLedger = {
+      charge: () => {
+        charged = true;
+        return Promise.resolve({
+          ok: true,
+          receipt: { reservationId: 'r', fenceToken: '1', intentEventId: 'e' },
+        });
+      },
+    };
+    const closedGate = createLiveStateGate(() => ({
+      nowMs: Date.UTC(2026, 0, 5, 12, 0, 0),
+      timezone: 'UTC',
+      effectiveFromMs: 0,
+      expiresAtMs: Date.UTC(2030, 0, 1),
+      revoked: false,
+      windows: [], // no allow-window ⇒ window_closed (deny-by-default)
+    }));
+    const { deps, connectCount } = makeDeps({
+      beforeEgress: composeBeforeEgress(
+        closedGate,
+        createBudgetInterlock({ ledger, owner: 'b', grantJti: 'j', specId: 's' }),
+      ),
+    });
+    const out = await runStage2(await input(), deps);
+    expect(out).toMatchObject({ ok: false, stage: 'interlock', reason: 'window_closed' });
+    expect(charged).toBe(false); // the gate denied before the charge was attempted
     expect(connectCount()).toBe(0);
   });
 

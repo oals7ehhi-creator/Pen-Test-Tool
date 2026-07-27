@@ -683,4 +683,48 @@ describe.skipIf(!url)('slice 5a — budget charge-before-send ledger + intent (�
       );
     });
   });
+
+  describe('lease sweeper (§8.1) — reclaim crashed claims', () => {
+    beforeEach(() => seed(client, 100));
+
+    it('expires ONLY past-deadline claimed leases; leaves live / charged / released untouched', async () => {
+      const stale = await lease(client, {
+        jti: 'stale',
+        state: 'claimed',
+        expiresSql: `now()-interval '1 second'`,
+      });
+      const live = await lease(client, {
+        jti: 'live',
+        state: 'claimed',
+        expiresSql: `now()+interval '60 seconds'`,
+      });
+      const chargedId = (await charge(client, { jti: 'chg' })).reservation_id; // terminal 'charged'
+      const rel = await lease(client, { jti: 'rel', state: 'claimed' });
+      await q(client, `UPDATE budget_reservation SET state='released' WHERE id=$1`, [rel]);
+
+      const n = await q(client, `SELECT sweep_expired_leases() AS n`);
+      expect(n.rows[0].n).toBe(1); // exactly the one past-deadline claim
+
+      const rows = await q(
+        client,
+        `SELECT id, state, resolved_at FROM budget_reservation ORDER BY grant_jti`,
+      );
+      const byId = new Map(rows.rows.map((r) => [r.id, r]));
+      expect(byId.get(stale)!.state).toBe('expired');
+      expect(byId.get(stale)!.resolved_at).not.toBeNull(); // the trigger stamped it
+      expect(byId.get(live)!.state).toBe('claimed'); // future deadline ⇒ not swept
+      expect(byId.get(chargedId)!.state).toBe('charged'); // terminal ⇒ never swept
+      expect(byId.get(rel)!.state).toBe('released'); // terminal ⇒ never swept
+    });
+
+    it('is idempotent: a second sweep (and an empty ledger) reclaims nothing', async () => {
+      await lease(client, {
+        jti: 'stale',
+        state: 'claimed',
+        expiresSql: `now()-interval '1 second'`,
+      });
+      expect((await q(client, `SELECT sweep_expired_leases() AS n`)).rows[0].n).toBe(1);
+      expect((await q(client, `SELECT sweep_expired_leases() AS n`)).rows[0].n).toBe(0);
+    });
+  });
 });

@@ -10,13 +10,13 @@ what is implemented versus what is still to come — nothing here claims a contr
 
 ## Slice status
 
-| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                      |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                  |
-| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                  |
-| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                             |
-| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                    |
-| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a** done — budget charge-before-send ledger + durable intent (migration `0004`, broker interlock); windows/e-stop-at-mint, rate/concurrency/circuit, hash-chained audit wiring, WS bounds, dual control still to come |
+| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                               |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                           |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                           |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                      |
+| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                             |
+| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**+**5b** done — budget charge-before-send ledger + durable intent (`0004`); live-state gate (window/expiry/revocation re-check) + claimed-lease sweeper (`0005`); rate/concurrency/circuit, hash-chained audit wiring, WS bounds, dual control still to come |
 
 ## Slice 1 — what it proves (this commit)
 
@@ -409,6 +409,41 @@ with no socket opened.
 `claimed`-lease **sweeper** job; per-target rate / concurrency / circuit-breakers (the runtime-counter fields);
 the broker wiring that emits the remaining hash-chained audit events (`scope.decision.*`, `request.completed`);
 WebSocket per-connection bounds; and approval policy + dual control at request time.
+
+## Slice 5b — what it proves (this commit)
+
+The Stage-2 **live-state gate** (§2.3 effective-window rule / §7.1 step 9) + the **claimed-lease sweeper** (§8.1) —
+the clock-derived re-checks that run BEFORE the budget charge, so a request outside its testing window / after
+expiry is denied with no budget charged and no socket opened, and a crashed broker's stranded claim is reclaimed.
+
+- **Pure live-state evaluator** (`packages/broker/src/livestate.ts`). `evaluateLiveState` decides, on the injected
+  trusted-clock instant, the effective-window rule fail-closed and **deny-by-default**: revocation → expiry (the
+  `expires_at` boundary is _expired_) → not-yet-effective deny first; a `blackout` covering `now` **wins** over any
+  allow-window; and an allow-window is **REQUIRED** — `now` must fall inside at least one `recurring_weekly` / `one_off`
+  window, so an engagement with no allow-window (or an empty window set) can test at **no** time. Windows and DST are
+  resolved in the **engagement timezone** via `Intl` before comparison (incl. midnight-wrapping recurring windows).
+  It is the pure Stage-2 gate; the Scope Authority reuses the same rule at Stage-1 grant-mint.
+- **Composition** (`createLiveStateGate` + `composeBeforeEgress`). The gate is a `beforeEgress` hook that DENIES with a
+  fixed-reason `LiveStateError` (`authorization_revoked` / `not_yet_effective` / `authorization_expired` / `blackout` /
+  `window_closed`, surfaced by `runStage2` as `{stage:'interlock', reason}`). `composeBeforeEgress(gate, budget)` runs
+  the gate FIRST and fail-closed, so a window/expiry denial happens **before** the budget charge — never charging for a
+  request that may not run. (e-stop remains the DB hard-gate re-checked UNDER the charge lock, slice 5a.)
+- **Claimed-lease sweeper** (`sweep_expired_leases()`, migration `0005`). Transitions **only** past-deadline `claimed`
+  leases to `expired` (freeing the ledger state), reusing the 0004 transition trigger which independently rejects any
+  expire-after-charge / expire-before-deadline — so the sweeper can never touch a `charged` (terminal) or `released`
+  lease or violate charge-before-send even if its predicate were wrong.
+
+Tests: `packages/broker/test/livestate.test.ts` (14 cases; broker package still **100%** coverage) — every deny reason,
+the allow paths (recurring same-day + one_off), the midnight-wrap window, blackout-wins-over-allow, the timezone
+resolution (a New-York-evening instant that is a different UTC day), and the gate/compose fail-closed ordering. A
+`runStage2` integration proves the composed gate denies `window_closed` **before** the ledger is consulted (no charge,
+no socket). `db/test/budget_ledger.test.ts` (sweeper cases) — the sweeper expires only past-deadline claims, leaves
+live/charged/released untouched, stamps `resolved_at`, and is idempotent; `migrate:ci` covers `0005`'s exact inverse.
+
+**Deliberately still to come in slice 5:** per-target rate / concurrency / circuit-breakers (the runtime-counter
+fields); the broker wiring that emits the remaining hash-chained audit events (`scope.decision.*`, `request.completed`);
+WebSocket per-connection bounds; approval policy + dual control at request time; and the Stage-1 reuse of this same
+window/expiry rule at grant-mint.
 
 ## Dependency-advisory disposition
 
