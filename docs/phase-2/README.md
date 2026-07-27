@@ -10,13 +10,13 @@ what is implemented versus what is still to come — nothing here claims a contr
 
 ## Slice status
 
-| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                                                |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                            |
-| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                            |
-| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                                       |
-| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                                              |
-| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**–**5d** done — budget ledger + intent (`0004`); live-state gate + sweeper (`0005`); concurrency/spacing/circuit slot throttle (`0006`); global + per-host RPS token buckets (`0007`); per-host concurrency, hash-chained audit wiring, WS bounds, dual control still to come |
+| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                                                                                                             |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                                                                                         |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                                                                                         |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                                                                                                    |
+| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                                                                                                           |
+| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**–**5e** done — budget ledger + intent (`0004`); live-state gate + sweeper (`0005`); concurrency/spacing/circuit slot throttle (`0006`); global + per-host RPS token buckets (`0007`); per-host concurrency crash-safe slot leases (`0008`); hash-chained audit wiring, WS bounds, dual control, Stage-1 window/expiry reuse still to come |
 
 ## Slice 1 — what it proves (this commit)
 
@@ -506,6 +506,42 @@ and RLS; `migrate:ci` covers `0007`'s exact inverse.
 the in-flight counter into a crash-safe lease; the broker emission of the remaining hash-chained audit events;
 WebSocket per-connection bounds; approval policy + dual control at request time; and Stage-1 reuse of the window/expiry
 rule at grant-mint.
+
+## Slice 5e — what it proves (this commit)
+
+**Per-host concurrency** (§8) — the per-host version of the 5c egress-slot semaphore, reworked as a **crash-safe
+lease**. Before a request leaves, the broker must hold one live slot for its target host, and the number of live slots
+per `(engagement, host)` may never exceed `engagement.per_host_concurrency`.
+
+- **Pure decision core** (`packages/broker/src/hostconc.ts`). `evaluateHostSlot` admits only while the live-slot count
+  is **strictly below** the cap (mirroring the SQL `v_live >= v_cap` refusal). The gate `createHostConcurrencyGate` is a
+  `beforeEgress` hook over an injected `HostSlotController` that DENIES with a fixed-reason `HostConcurrencyError`
+  (`host_concurrency_exceeded`, surfaced by `runStage2` as `{stage:'interlock', reason}`) or on any controller throw
+  (fail-closed). The slot is keyed by the RECONSTRUCTED request's canonical host — the address the broker will dial.
+- **Crash-safe LEASE, not a bare counter** (`host_slot` + `acquire_host_slot` / `release_host_slot` /
+  `sweep_expired_slots`, migration `0008`). Each slot is a lease row with an `expires_at`; the acquire counts only
+  **live** (`expires_at > now()`) slots, so a broker that crashes between acquire and release stops occupying its slot
+  the instant the lease expires — capacity self-heals **without** the sweeper, exactly like the budget ledger's
+  availability excluding past-deadline claims (§8.1). This is the crash-safe rework the 5c per-engagement `in_flight`
+  counter (a bare integer a crash strands) deferred. `release_host_slot` is idempotent (a late release after a swept
+  expiry is a harmless no-op); `sweep_expired_slots` is the RLS-exempt housekeeping job that bounds table size.
+- **No over-admit under contention.** The count-then-insert runs under the per-engagement runtime-counter `FOR UPDATE`
+  lock (get-or-created as `0006` does), so concurrent draws for the same host serialise and can never both admit into an
+  over-count; a release is a bare `DELETE` that only ever frees a slot. SECURITY INVOKER under FORCE RLS — an unset/wrong
+  tenant GUC fails closed.
+
+Tests: `packages/broker/test/hostconc.test.ts` (7 cases; broker package still **100%** coverage) — the pure
+below-cap/at-cap admission decision and the gate's fixed-reason fail-closed denial; a `runStage2` integration proving
+the gate denies (`host_concurrency_exceeded`) with no socket. `db/test/hostconc.test.ts` (10 DB-gated cases) — admit up
+to the cap then deny, per-host independence, release-frees-a-slot, release idempotency, the **crash-safe** expired-lease
+exclusion, the sweeper reclaiming only expired leases, `unknown_engagement`, a two-connection **concurrency race** (cap
+1 admits exactly one, never over-admits), and RLS (isolation + unset-GUC fail-closed); `migrate:ci` covers `0008`'s
+exact inverse.
+
+**Deliberately still to come in slice 5:** the broker emission of the remaining hash-chained audit events; WebSocket
+per-connection bounds; approval policy + dual control at request time; and Stage-1 reuse of the window/expiry rule at
+grant-mint. (A crash-safe lease rework of the per-ENGAGEMENT `in_flight` counter — `0006` — remains a documented
+follow-up; a stranded global slot is a liveness, never a safety, concern, as it only makes admission stricter.)
 
 ## Dependency-advisory disposition
 

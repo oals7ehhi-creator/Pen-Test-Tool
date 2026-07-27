@@ -131,6 +131,20 @@ export {
 } from './ratelimit.js';
 
 export {
+  type HostConcurrencyReason,
+  type HostSlotSnapshot,
+  type HostSlotConfig,
+  type HostSlotDecision,
+  type HostSlotRef,
+  type HostSlotReleaseRef,
+  type HostSlotOutcome,
+  type HostSlotController,
+  HostConcurrencyError,
+  evaluateHostSlot,
+  createHostConcurrencyGate,
+} from './hostconc.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,
