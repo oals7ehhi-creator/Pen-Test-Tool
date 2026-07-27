@@ -291,4 +291,69 @@ describe.skipIf(!url)('slice 5e — per-host concurrency slot leases (§8)', () 
     await client.query('RESET ROLE');
     expect(await rowCount(client)).toBe(0); // superuser bypasses RLS to confirm nothing was inserted
   });
+
+  it('DENY invalid_lease_ttl for a non-positive TTL — never mints a born-expired phantom slot', async () => {
+    await seed(client, 4, 1);
+    // ttl <= 0 would make expires_at <= now(): the row would report success yet hold no LIVE slot (fail-open). Refuse it.
+    for (const badTtl of [0, -1]) {
+      await rejects(
+        client,
+        `SELECT acquire_host_slot($1,$2,$3,$4,$5,$6)`,
+        [T_A, EA, 'a.example', 'broker-1', randomUUID(), badTtl],
+        /invalid_lease_ttl/,
+      );
+    }
+    expect(await rowCount(client)).toBe(0); // no phantom lease inserted
+    // a positive TTL still admits normally.
+    await acquire(client, 'a.example', 'broker-1', 60_000);
+    expect(await liveCount(client, 'a.example')).toBe(1);
+  });
+
+  it('TTL self-heal end-to-end: an acquire-minted short lease expires on its OWN deadline, freeing the seat', async () => {
+    await seed(client, 4, 1); // per-host cap 1
+    // acquire through acquire_host_slot with a short TTL, exercising its now() + (p_ttl_ms||' ms')::interval math
+    // (NOT a hand-inserted timestamp): a unit regression (seconds instead of ms) would keep the slot live for minutes.
+    await acquire(client, 'a.example', 'broker-1', 120);
+    const deadline = Date.now() + 3000;
+    // poll until the lease self-expires out of the LIVE count.
+    while ((await liveCount(client, 'a.example')) > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(await liveCount(client, 'a.example')).toBe(0); // the ~120ms lease is no longer live
+    // the cap-1 host therefore admits again (the expired row does not occupy the seat).
+    await acquire(client, 'a.example', 'broker-1', 60_000);
+    expect(await liveCount(client, 'a.example')).toBe(1);
+  });
+
+  it("RLS (host_slot's OWN policy): under an unset GUC a bare SELECT is hidden and a bare INSERT is denied", async () => {
+    await seed(client, 4, 2);
+    const held = await acquire(client, 'h.example'); // one real tenant-A slot (as superuser)
+    await client.query('SET ROLE app_test');
+    await client.query('RESET app.tenant_id'); // policy predicate becomes NULL ⇒ USING hides, WITH CHECK denies
+    // USING: the tenant-A row is invisible to a session with no tenant GUC.
+    expect((await q(client, `SELECT count(*)::int AS n FROM host_slot`)).rows[0].n).toBe(0);
+    // WITH CHECK: a direct INSERT (engagement FK satisfied) is refused by host_slot's own policy, not the engagement gate.
+    await rejects(
+      client,
+      `INSERT INTO host_slot (id, engagement_id, tenant_id, host, owner, expires_at)
+       VALUES ($1,$2,$3,'h.example','rogue', now()+interval '1 minute')`,
+      [randomUUID(), EA, T_A],
+      /row-level security/,
+    );
+    await client.query('RESET ROLE');
+    expect(await rowCount(client)).toBe(1); // still just the one real slot — nothing smuggled in
+    await release(client, held);
+  });
+
+  it('RLS scopes release_host_slot: a tenant-B session cannot delete a tenant-A slot', async () => {
+    await seed(client, 4, 2);
+    const held = await acquire(client, 'h.example'); // tenant-A slot (as superuser)
+    await client.query('SET ROLE app_test');
+    await client.query(`SET app.tenant_id = '${T_B}'`); // a DIFFERENT tenant's broker session
+    // the DELETE runs under RLS: tenant-A's row is invisible ⇒ release is a no-op, not a cross-tenant delete.
+    await client.query(`SELECT release_host_slot('${T_A}','${EA}','${held}')`);
+    await client.query('RESET ROLE');
+    await client.query('RESET app.tenant_id');
+    expect(await rowCount(client)).toBe(1); // the tenant-A slot survived the foreign release
+  });
 });

@@ -64,6 +64,13 @@ BEGIN
     RAISE EXCEPTION 'unknown_engagement';
   END IF;
 
+  -- A non-positive TTL would mint a BORN-EXPIRED lease: the row inserts and the function RETURNs success, yet the
+  -- live-count filter (expires_at > now()) excludes it immediately — a "held" slot that reserves no capacity, so a
+  -- caller passing ttl<=0 would defeat the per-host cap (fail-OPEN). Reject it up front, matching budget_charge_and_intent (0004).
+  IF p_ttl_ms IS NULL OR p_ttl_ms <= 0 THEN
+    RAISE EXCEPTION 'invalid_lease_ttl';
+  END IF;
+
   -- Serialise this engagement's admissions on the runtime-counter row (get-or-create + lock), as 0006 does.
   INSERT INTO engagement_runtime_counter (engagement_id, tenant_id, window_started_at)
     VALUES (p_engagement, p_tenant, now())

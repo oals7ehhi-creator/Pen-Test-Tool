@@ -523,8 +523,10 @@ per `(engagement, host)` may never exceed `engagement.per_host_concurrency`.
   **live** (`expires_at > now()`) slots, so a broker that crashes between acquire and release stops occupying its slot
   the instant the lease expires — capacity self-heals **without** the sweeper, exactly like the budget ledger's
   availability excluding past-deadline claims (§8.1). This is the crash-safe rework the 5c per-engagement `in_flight`
-  counter (a bare integer a crash strands) deferred. `release_host_slot` is idempotent (a late release after a swept
-  expiry is a harmless no-op); `sweep_expired_slots` is the RLS-exempt housekeeping job that bounds table size.
+  counter (a bare integer a crash strands) deferred. A non-positive TTL is refused up front (`invalid_lease_ttl`) so a
+  born-expired phantom slot can never report success while holding no capacity. `release_host_slot` is idempotent (a
+  late release after a swept expiry is a harmless no-op); `sweep_expired_slots` is the RLS-exempt housekeeping job that
+  bounds table size.
 - **No over-admit under contention.** The count-then-insert runs under the per-engagement runtime-counter `FOR UPDATE`
   lock (get-or-created as `0006` does), so concurrent draws for the same host serialise and can never both admit into an
   over-count; a release is a bare `DELETE` that only ever frees a slot. SECURITY INVOKER under FORCE RLS — an unset/wrong
@@ -532,11 +534,12 @@ per `(engagement, host)` may never exceed `engagement.per_host_concurrency`.
 
 Tests: `packages/broker/test/hostconc.test.ts` (7 cases; broker package still **100%** coverage) — the pure
 below-cap/at-cap admission decision and the gate's fixed-reason fail-closed denial; a `runStage2` integration proving
-the gate denies (`host_concurrency_exceeded`) with no socket. `db/test/hostconc.test.ts` (10 DB-gated cases) — admit up
+the gate denies (`host_concurrency_exceeded`) with no socket. `db/test/hostconc.test.ts` (14 DB-gated cases) — admit up
 to the cap then deny, per-host independence, release-frees-a-slot, release idempotency, the **crash-safe** expired-lease
-exclusion, the sweeper reclaiming only expired leases, `unknown_engagement`, a two-connection **concurrency race** (cap
-1 admits exactly one, never over-admits), and RLS (isolation + unset-GUC fail-closed); `migrate:ci` covers `0008`'s
-exact inverse.
+exclusion, an **end-to-end TTL self-heal** (a short acquire-minted lease expires on its own deadline), the sweeper
+reclaiming only expired leases, `unknown_engagement`, `invalid_lease_ttl` on a non-positive TTL, a two-connection
+**concurrency race** (cap 1 admits exactly one, never over-admits), and RLS (tenant isolation, unset-GUC fail-closed,
+`host_slot`'s own USING/WITH CHECK, and a tenant-scoped `release`); `migrate:ci` covers `0008`'s exact inverse.
 
 **Deliberately still to come in slice 5:** the broker emission of the remaining hash-chained audit events; WebSocket
 per-connection bounds; approval policy + dual control at request time; and Stage-1 reuse of the window/expiry rule at
