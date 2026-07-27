@@ -287,6 +287,13 @@ Tests (`packages/broker/test/wire.test.ts`, package at **100%** lines / branch �
   matrix (malformed status/header, non-numeric Content-Length, bad chunk size, over-large header section, early close,
   timeout). Plus the reconstruct CR/LF/NUL header-value regression, curated and session.
 
+An adversarial 4-lens review (request-smuggling / response-desync / correctness / test-adequacy) returned **SHIP** — the
+request-smuggling vector was pre-closed by the header-value screen. Its four confirmed RFC-correctness fixes are landed
+here: chunked overrides `Content-Length` (RFC 9112 §6.1, so a `Content-Length: 0` can't empty a chunked body); a
+conflicting duplicate `Content-Length` fails closed; a body that exactly fills the cap is no longer mis-flagged
+truncated; and an interim `1xx` head is skipped rather than mistaken for the final response — each with a regression
+test (plus pipelined-after-body, fragmented-head, chunk-extension/trailer, and negative-`Content-Length` coverage).
+
 ## Dependency-advisory disposition
 
 - **CVE-2026-14257 / GHSA-mh99-v99m-4gvg — `brace-expansion` ReDoS/DoS (high).** Published upstream after Phase 2

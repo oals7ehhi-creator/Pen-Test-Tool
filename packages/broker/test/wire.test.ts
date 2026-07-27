@@ -264,3 +264,114 @@ describe('readBoundedResponse — fails closed', () => {
     }
   });
 });
+
+/** A loopback server that writes `parts` one at a time with a small gap, straddling packet boundaries, then closes. */
+function serveStreamed(parts: readonly string[]): Promise<{ port: number; server: net.Server }> {
+  const server = net.createServer((sock) => {
+    let i = 0;
+    const pump = (): void => {
+      if (i < parts.length) {
+        sock.write(parts[i] as string);
+        i++;
+        setTimeout(pump, 10);
+      } else {
+        sock.end();
+      }
+    };
+    pump();
+  });
+  return new Promise((resolve) =>
+    server.listen(0, '127.0.0.1', () =>
+      resolve({ port: (server.address() as net.AddressInfo).port, server }),
+    ),
+  );
+}
+
+describe('readBoundedResponse — review hardening (RFC framing edge cases)', () => {
+  it('does not flag truncated when the body exactly fills maxBodyBytes', async () => {
+    const res = await readFrom('HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc', {
+      maxBodyBytes: 3,
+    });
+    expect(Buffer.from(res.body).toString('utf8')).toBe('abc');
+    expect(res.truncated).toBe(false);
+  });
+
+  it('skips an interim 1xx head and parses the FINAL response', async () => {
+    const res = await readFrom(
+      'HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello',
+      { maxBodyBytes: 1024 },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(Buffer.from(res.body).toString('utf8')).toBe('hello');
+  });
+
+  it('lets chunked override Content-Length (RFC 9112 §6.1) — CL:0 does NOT empty a chunked body', async () => {
+    const res = await readFrom(
+      'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n',
+      { maxBodyBytes: 1024 },
+    );
+    expect(Buffer.from(res.body).toString('utf8')).toBe('hello');
+  });
+
+  it('rejects a conflicting duplicate Content-Length, but accepts an identical one', async () => {
+    await expect(
+      readFrom('HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello', {
+        maxBodyBytes: 16,
+      }),
+    ).rejects.toBeInstanceOf(WireError);
+    const ok = await readFrom(
+      'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello',
+      {
+        maxBodyBytes: 16,
+      },
+    );
+    expect(Buffer.from(ok.body).toString('utf8')).toBe('hello');
+  });
+
+  it('rejects a negative Content-Length', async () => {
+    await expect(
+      readFrom('HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n', { maxBodyBytes: 16 }),
+    ).rejects.toBeInstanceOf(WireError);
+  });
+
+  it('drops pipelined bytes after a Content-Length body (anti-smuggling)', async () => {
+    const res = await readFrom(
+      'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 500 Internal Server Error\r\nContent-Length: 3\r\n\r\nBAD',
+      { maxBodyBytes: 1024 },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(Buffer.from(res.body).toString('utf8')).toBe('hello');
+    expect(res.truncated).toBe(false);
+  });
+
+  it('decodes chunk extensions and ignores terminal trailers', async () => {
+    const ext = await readFrom(
+      'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;name=v\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n',
+      { maxBodyBytes: 1024 },
+    );
+    expect(Buffer.from(ext.body).toString('utf8')).toBe('Wikipedia');
+    const trailer = await readFrom(
+      'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\nX-Trailer: v\r\n\r\n',
+      { maxBodyBytes: 1024 },
+    );
+    expect(Buffer.from(trailer.body).toString('utf8')).toBe('Wiki');
+  });
+
+  it('reassembles a response whose head is split across packets (status line + header value straddle)', async () => {
+    const { port, server } = await serveStreamed([
+      'HTTP/1.1 20', // status line split mid-code
+      '0 OK\r\nX-Split: abc', // header value begins
+      'def\r\nContent-Length: 5\r\n\r', // value continues; separator split
+      '\nhello', // final LF of the head separator + body
+    ]);
+    try {
+      const sock = net.connect(port, '127.0.0.1');
+      const res = await readBoundedResponse(sock, { maxBodyBytes: 1024 });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers).toContainEqual({ name: 'x-split', value: 'abcdef' });
+      expect(Buffer.from(res.body).toString('utf8')).toBe('hello');
+    } finally {
+      server.close();
+    }
+  });
+});

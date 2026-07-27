@@ -98,11 +98,17 @@ function parseHead(head: Buffer): ParsedHead | null {
     headers.push({ name, value });
     if (name === 'content-length') {
       if (!/^\d+$/.test(value)) return null;
-      contentLength = Number(value);
+      const n = Number(value);
+      // A differing duplicate Content-Length is an ambiguous framing (RFC 9112 §6.3) — fail closed.
+      if (contentLength !== null && contentLength !== n) return null;
+      contentLength = n;
     } else if (name === 'transfer-encoding' && /(^|,)\s*chunked\s*$/i.test(value)) {
       chunked = true;
     }
   }
+  // Chunked overrides Content-Length (RFC 9112 §6.1): when both are present the message is chunked-framed and the
+  // Content-Length is ignored — never let a `Content-Length: 0` short-circuit a chunked body to empty.
+  if (chunked) contentLength = null;
   return {
     statusCode: Number(m[2]),
     reasonPhrase: m[3] ?? '',
@@ -113,9 +119,9 @@ function parseHead(head: Buffer): ParsedHead | null {
   };
 }
 
-/** A status that never carries a body (RFC 9110 §6.4.1): 1xx, 204, 304. */
+/** A FINAL status that never carries a body (RFC 9110 §6.4.1): 204, 304. (1xx interim heads are skipped upstream.) */
 function bodyless(status: number): boolean {
-  return (status >= 100 && status < 200) || status === 204 || status === 304;
+  return status === 204 || status === 304;
 }
 
 /**
@@ -155,9 +161,10 @@ export function readBoundedResponse(socket: Duplex, opts: ReadOptions): Promise<
     };
 
     const pushBody = (buf: Buffer): boolean => {
-      // Append up to the cap; returns true when the cap is reached (⇒ truncate + finish).
+      // Append up to the cap; returns true when the buffer OVERFLOWS the cap (⇒ truncate + finish). A body that
+      // exactly fills `maxBodyBytes` is NOT truncated — nothing was lost; only genuine excess sets the flag.
       const room = opts.maxBodyBytes - bodyLen;
-      if (buf.length >= room) {
+      if (buf.length > room) {
         if (room > 0) {
           bodyParts.push(buf.subarray(0, room));
           bodyLen += room;
@@ -212,7 +219,7 @@ export function readBoundedResponse(socket: Duplex, opts: ReadOptions): Promise<
       bytesRead += data.length;
       pending = pending.length === 0 ? data : Buffer.concat([pending, data]);
 
-      if (head === null) {
+      while (head === null) {
         const sep = pending.indexOf('\r\n\r\n', 0, 'latin1');
         if (sep === -1) {
           if (pending.length > maxHeaderBytes) fail('header_too_large');
@@ -225,9 +232,11 @@ export function readBoundedResponse(socket: Duplex, opts: ReadOptions): Promise<
           );
           return;
         }
-        head = parsed;
         pending = pending.subarray(sep + 4);
-
+        // An interim 1xx response (e.g. `100 Continue`) is NOT the final response — discard it and keep reading, so a
+        // real 200/500/… that follows is what gets parsed. (Loop, so a final head already in `pending` is handled now.)
+        if (parsed.statusCode >= 100 && parsed.statusCode < 200) continue;
+        head = parsed;
         if (
           opts.headRequest === true ||
           bodyless(parsed.statusCode) ||
