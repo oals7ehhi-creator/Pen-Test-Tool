@@ -10,13 +10,13 @@ what is implemented versus what is still to come — nothing here claims a contr
 
 ## Slice status
 
-| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                                                   |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                               |
-| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                               |
-| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                                          |
-| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                                                 |
-| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**–**5c** done — budget charge-before-send ledger + intent (`0004`); live-state gate + claimed-lease sweeper (`0005`); concurrency/spacing/circuit-breaker slot throttle (`0006`); per-host + RPS token buckets, hash-chained audit wiring, WS bounds, dual control still to come |
+| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                                                |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                            |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                            |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                                       |
+| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                                              |
+| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**–**5d** done — budget ledger + intent (`0004`); live-state gate + sweeper (`0005`); concurrency/spacing/circuit slot throttle (`0006`); global + per-host RPS token buckets (`0007`); per-host concurrency, hash-chained audit wiring, WS bounds, dual control still to come |
 
 ## Slice 1 — what it proves (this commit)
 
@@ -474,6 +474,38 @@ sub-threshold accumulation, and RLS; `migrate:ci` covers `0006`'s exact inverse.
 **Deliberately still to come in slice 5:** per-HOST concurrency + the global/per-host **RPS token buckets** (need
 per-host runtime state); the broker emission of the remaining hash-chained audit events; WebSocket per-connection
 bounds; approval policy + dual control at request time; and the Stage-1 reuse of the window/expiry rule at grant-mint.
+
+## Slice 5d — what it proves (this commit)
+
+The **request-rate token buckets** (§8) — the rate-limiting pre-egress interlock. Every request must draw a token from
+BOTH the engagement-GLOBAL bucket (`global_max_rps`) and the PER-HOST bucket for its target host (`per_host_max_rps`).
+
+- **Pure token-bucket core** (`packages/broker/src/ratelimit.ts`). `refillAndTake` refills a bucket by the elapsed
+  time at its rate (capped at a burst `capacity`) and draws one token if ≥ 1 is available. `evaluateRateLimit` draws
+  from the global then the per-host bucket **check-both-then-consume-both**: a token is consumed from EACH only when
+  BOTH can satisfy the request, so a global-allowed / host-denied request never leaks a global token (or vice-versa).
+- **Broker gate** (`createRateLimitGate`). A `beforeEgress` hook over an injected `RateLimiter` that DENIES with a
+  fixed-reason `RateLimitError` (`rate_limited_global` / `rate_limited_host`, surfaced by `runStage2` as
+  `{stage:'interlock', reason}`) or on any limiter throw (fail-closed). The per-host bucket is keyed by the
+  RECONSTRUCTED request's canonical host — the address the broker will actually dial.
+- **Atomic DB layer** (`rate_bucket` + `take_rate_tokens`, migration `0007`). One row per `(engagement, scope)` —
+  `scope = 'global'` for the engagement bucket or the host for a per-host bucket. `take_rate_tokens` reads the rates
+  from the engagement, get-or-creates + locks both buckets in a FIXED order (global, then host — no deadlock), refills
+  and requires ≥ 1 token in BOTH before consuming, and RAISEs a fixed reason otherwise. A fresh bucket is born full;
+  capacity = `GREATEST(1, rate)` so a sub-1-rps rate can still ever admit a request. Persisted only on a full allow —
+  a denial rolls back, so no bucket loses accrued time and no token leaks.
+
+Tests: `packages/broker/test/ratelimit.test.ts` (11 cases; broker package still **100%** coverage) — the bucket
+refill/draw incl. capacity cap and a fractional rate, the global-then-host combined draw with no token leak, and the
+gate's fixed-reason fail-closed denial; a `runStage2` integration proving the rate gate denies (`rate_limited_host`)
+with no socket. `db/test/ratelimit.test.ts` (6 DB-gated cases) — the global-cap exhaustion, per-host bucket
+independence, the check-both-consume-both no-leak invariant, time-based refill, `invalid_host` / `unknown_engagement`,
+and RLS; `migrate:ci` covers `0007`'s exact inverse.
+
+**Deliberately still to come in slice 5:** per-HOST concurrency (a per-host version of the 5c semaphore) and reworking
+the in-flight counter into a crash-safe lease; the broker emission of the remaining hash-chained audit events;
+WebSocket per-connection bounds; approval policy + dual control at request time; and Stage-1 reuse of the window/expiry
+rule at grant-mint.
 
 ## Dependency-advisory disposition
 

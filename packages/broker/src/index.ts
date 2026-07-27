@@ -114,6 +114,23 @@ export {
 } from './throttle.js';
 
 export {
+  type RateLimitReason,
+  type BucketState,
+  type BucketConfig,
+  type BucketResult,
+  type RateSnapshot,
+  type RateConfig,
+  type RateDecision,
+  type RateRef,
+  type RateOutcome,
+  type RateLimiter,
+  RateLimitError,
+  refillAndTake,
+  evaluateRateLimit,
+  createRateLimitGate,
+} from './ratelimit.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,

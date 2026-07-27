@@ -13,6 +13,7 @@ import {
   createBudgetInterlock,
   createLiveStateGate,
   createThrottleGate,
+  createRateLimitGate,
   composeBeforeEgress,
   type Stage2Deps,
   type Stage2Input,
@@ -21,6 +22,7 @@ import {
   type ReconstructContext,
   type BudgetLedger,
   type ThrottleController,
+  type RateLimiter,
 } from '../src/index.js';
 
 /**
@@ -269,6 +271,16 @@ describe('runStage2 — denials short-circuit with a fixed {stage, reason}', () 
     const { deps, connectCount } = makeDeps({ beforeEgress: createThrottleGate(controller) });
     const out = await runStage2(await input(), deps);
     expect(out).toMatchObject({ ok: false, stage: 'interlock', reason: 'concurrency_exceeded' });
+    expect(connectCount()).toBe(0);
+  });
+
+  it('the rate-limit gate DENIES with its fixed reason (rate_limited_host) and opens no socket', async () => {
+    const limiter: RateLimiter = {
+      take: () => Promise.resolve({ ok: false, reason: 'rate_limited_host' }),
+    };
+    const { deps, connectCount } = makeDeps({ beforeEgress: createRateLimitGate(limiter) });
+    const out = await runStage2(await input(), deps);
+    expect(out).toMatchObject({ ok: false, stage: 'interlock', reason: 'rate_limited_host' });
     expect(connectCount()).toBe(0);
   });
 
