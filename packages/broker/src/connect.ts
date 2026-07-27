@@ -60,8 +60,8 @@ export function buildTlsOptions(
     host: pinnedIp,
     port: target.port,
     servername: target.host,
-    // Enforce chain validation IN-CODE: an explicit `true` overrides NODE_TLS_REJECT_UNAUTHORIZED=0, so the cert
-    // binding cannot be silently disabled by the runtime environment (SI-004 stays a technical control).
+    // Enforce chain validation IN-CODE: an explicit `true` cannot be silently disabled by a global TLS-verification
+    // bypass in the runtime environment, so the cert binding (SI-004) stays a technical control, not a config default.
     rejectUnauthorized: true,
     // Ignore the name Node would pass (derived from host/servername) and always check against the canonical host.
     checkServerIdentity: (_hostname, cert) => checkIdentity(target.host, cert),

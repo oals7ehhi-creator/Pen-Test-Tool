@@ -250,7 +250,8 @@ pinned IP is what actually gets dialed.
   structurally by an IP-literal guard, so `net`/`tls` can never fall back to `dns.lookup` (no second, unguarded
   resolution / rebinding). For TLS the **SNI is the canonical host**, the certificate identity is validated against the
   **canonical host** (never the pinned IP, never a name Node would otherwise default to), and `rejectUnauthorized` is
-  pinned to `true` in-code so `NODE_TLS_REJECT_UNAUTHORIZED=0` cannot silently disable chain validation.
+  pinned to `true` in-code so a global TLS-verification bypass in the environment cannot silently disable chain
+  validation.
 
 Tests (`packages/broker/test/resolver.test.ts`, `connect.test.ts`; package at **100%** coverage): A/AAAA merge, per-family
 NODATA tolerance, empty-resolution fail-closed, and dedup; the connect contract (dial pinned IP, SNI = canonical host,
