@@ -98,6 +98,22 @@ export {
 } from './livestate.js';
 
 export {
+  type CircuitState,
+  type ThrottleReason,
+  type ThrottleConfig,
+  type ThrottleSnapshot,
+  type AcquireDecision,
+  type CircuitUpdate,
+  type EngagementRef,
+  type AcquireOutcome,
+  type ThrottleController,
+  ThrottleError,
+  evaluateAcquire,
+  recordResult,
+  createThrottleGate,
+} from './throttle.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,

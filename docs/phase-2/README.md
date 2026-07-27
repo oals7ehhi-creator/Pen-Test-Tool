@@ -10,13 +10,13 @@ what is implemented versus what is still to come — nothing here claims a contr
 
 ## Slice status
 
-| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                               |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                           |
-| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                           |
-| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                      |
-| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                             |
-| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**+**5b** done — budget charge-before-send ledger + durable intent (`0004`); live-state gate (window/expiry/revocation re-check) + claimed-lease sweeper (`0005`); rate/concurrency/circuit, hash-chained audit wiring, WS bounds, dual control still to come |
+| Slice                             | Scope                                                                                                                                                                                                                                                                               | Status                                                                                                                                                                                                                                                                                   |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1 — Scope Authority pure core** | Canonicalization (§5) + two-tier SSRF network guard (§6): decode any obfuscated/transition IP form to canonical bytes and classify `hard_deny` / `restricted` / `permitted`; canonicalize full candidate URLs (scheme/host/port/path, userinfo stripped). Package `@pentest/scope`. | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                               |
+| **2 — Scope-entry matching**      | Allow/exclude `domain`/`ip`/`cidr`/`port`/`protocol`/`path_prefix`/`api_resource` matching; exclusions-first; Tier B elevation gating; deny-by-default over a frozen `scope_version`; breadth accounting.                                                                           | ✅ implemented + tested (`packages/scope`)                                                                                                                                                                                                                                               |
+| **3 — Schema & persistence**      | Engagement / authorization / scope_version / scope_entry / approval / audit tables + migrations (composite tenant+engagement FKs, RLS, immutability triggers).                                                                                                                      | ✅ implemented + tested (`db/`)                                                                                                                                                                                                                                                          |
+| 4 — Two-stage flow                | Immutable content-addressed `request_spec`; JIT single-use Stage-1 grants bound to `spec_sha256`; Guarded Egress Broker (resolve → validate → **pin** → connect → re-guard redirects).                                                                                              | 🔶 broker complete — **4a**–**4h** done (grant/spec core, schema `0003`, decision core, reconstruction, socket layer, send/read wire, Stage-2 orchestration, mTLS ingress auth); slice 5 interlocks next                                                                                 |
+| 5 — Interlocks                    | Budget charge-before-send ledger; testing windows / expiry / emergency-stop; per-target rate/concurrency/circuit-breakers; hash-chained audit; WebSocket bounds; approval policy + dual control.                                                                                    | 🔶 **5a**–**5c** done — budget charge-before-send ledger + intent (`0004`); live-state gate + claimed-lease sweeper (`0005`); concurrency/spacing/circuit-breaker slot throttle (`0006`); per-host + RPS token buckets, hash-chained audit wiring, WS bounds, dual control still to come |
 
 ## Slice 1 — what it proves (this commit)
 
@@ -444,6 +444,36 @@ live/charged/released untouched, stamps `resolved_at`, and is idempotent; `migra
 fields); the broker wiring that emits the remaining hash-chained audit events (`scope.decision.*`, `request.completed`);
 WebSocket per-connection bounds; approval policy + dual control at request time; and the Stage-1 reuse of this same
 window/expiry rule at grant-mint.
+
+## Slice 5c — what it proves (this commit)
+
+The **egress-slot throttle** (§8) — the third pre-egress interlock: before a request leaves, the broker ACQUIRES a
+slot bounded by the engagement's runtime posture, and RELEASES it (feeding the circuit breaker) on completion.
+
+- **Pure decision core** (`packages/broker/src/throttle.ts`). `evaluateAcquire` decides in order — **CIRCUIT** (an
+  `open` breaker within its cooldown denies; once the cooldown elapses exactly one `half_open` probe is let through)
+  → **CONCURRENCY** (`in_flight >= max_concurrency` denies) → **SPACING** (`now - last_request_at <
+min_request_interval_ms` denies); only a full allow reserves a slot. `recordResult` is the breaker transition on
+  completion: a success closes it and clears the error run; a failed `half_open` probe re-opens immediately; a `closed`
+  breaker opens once consecutive failures reach the threshold.
+- **Broker gate** (`createThrottleGate`). A `beforeEgress` hook over an injected `ThrottleController` that DENIES with
+  a fixed-reason `ThrottleError` (`circuit_open` / `concurrency_exceeded` / `min_interval`, surfaced by `runStage2` as
+  `{stage:'interlock', reason}`) or on any controller throw (fail-closed). The slot is released by the caller after the
+  request completes, which also drives the breaker.
+- **Atomic DB layer** (`acquire_egress_slot` / `release_egress_slot`, migration `0006`). The same logic executed
+  atomically over `engagement_runtime_counter` under its `FOR UPDATE` lock, so concurrent acquires cannot over-admit
+  past `max_concurrency` and the breaker transitions cannot race. `in_flight` is floored at 0 on release.
+
+Tests: `packages/broker/test/throttle.test.ts` (14 cases; broker package still **100%** coverage) — the decision
+order, the half-open probe, the breaker transitions, and the gate's fixed-reason fail-closed denial; a `runStage2`
+integration proving the throttle gate denies (`concurrency_exceeded`) with no socket. `db/test/throttle.test.ts`
+(7 DB-gated cases) — the concurrency cap + slot-free-on-release, `in_flight` floor, min-spacing denial, the full
+circuit lifecycle (threshold-open → cooldown-deny → half-open probe → close-on-success / re-open-on-probe-failure),
+sub-threshold accumulation, and RLS; `migrate:ci` covers `0006`'s exact inverse.
+
+**Deliberately still to come in slice 5:** per-HOST concurrency + the global/per-host **RPS token buckets** (need
+per-host runtime state); the broker emission of the remaining hash-chained audit events; WebSocket per-connection
+bounds; approval policy + dual control at request time; and the Stage-1 reuse of the window/expiry rule at grant-mint.
 
 ## Dependency-advisory disposition
 
