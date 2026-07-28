@@ -145,6 +145,17 @@ export {
 } from './hostconc.js';
 
 export {
+  type WsBoundsReason,
+  type WsCaps,
+  type WsConnectionState,
+  type WsFrameDecision,
+  type WsGovernor,
+  WsBoundsError,
+  evaluateWsFrame,
+  createWsGovernor,
+} from './wsbounds.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,
