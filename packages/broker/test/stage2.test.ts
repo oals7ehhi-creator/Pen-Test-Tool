@@ -15,6 +15,7 @@ import {
   createThrottleGate,
   createRateLimitGate,
   createHostConcurrencyGate,
+  createWsAdmissionGate,
   composeBeforeEgress,
   type Stage2Deps,
   type Stage2Input,
@@ -25,6 +26,7 @@ import {
   type ThrottleController,
   type RateLimiter,
   type HostSlotController,
+  type WsSlotController,
 } from '../src/index.js';
 
 /**
@@ -301,6 +303,38 @@ describe('runStage2 — denials short-circuit with a fixed {stage, reason}', () 
       reason: 'host_concurrency_exceeded',
     });
     expect(connectCount()).toBe(0);
+  });
+
+  it('the WS admission gate DENIES a wss handshake at the connection cap (ws_connection_limit) and opens no socket', async () => {
+    const controller: WsSlotController = {
+      acquire: () => Promise.resolve({ ok: false, reason: 'ws_connection_limit' }),
+      release: () => Promise.resolve(),
+    };
+    const wssSpec = makeSpec({
+      kind: 'websocket',
+      scheme: 'wss',
+      port: 443,
+      canonicalUrl: 'wss://example.com/ws',
+      canonicalPath: '/ws',
+      wsFrameSetDigest: 'w'.repeat(64),
+      method: 'GET',
+    });
+    const { deps, connectCount } = makeDeps({ beforeEgress: createWsAdmissionGate(controller) });
+    const out = await runStage2(await input({ spec: wssSpec }), deps);
+    expect(out).toMatchObject({ ok: false, stage: 'interlock', reason: 'ws_connection_limit' });
+    expect(connectCount()).toBe(0);
+  });
+
+  it('the WS admission gate is a NO-OP for an HTTP request — the request proceeds to a response', async () => {
+    // an HTTP spec consumes no connection slot: a controller that would DENY is never consulted, so the request runs.
+    const controller: WsSlotController = {
+      acquire: () => Promise.resolve({ ok: false, reason: 'ws_connection_limit' }),
+      release: () => Promise.resolve(),
+    };
+    const { deps, connectCount } = makeDeps({ beforeEgress: createWsAdmissionGate(controller) });
+    const out = await runStage2(await input(), deps);
+    expect(out.ok).toBe(true);
+    expect(connectCount()).toBe(1);
   });
 
   it('the live-state gate runs BEFORE the budget charge: a closed window DENIES window_closed, no charge, no socket', async () => {

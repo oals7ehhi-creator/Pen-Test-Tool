@@ -156,6 +156,20 @@ export {
 } from './wsbounds.js';
 
 export {
+  type WsAdmissionReason,
+  type WsAdmissionSnapshot,
+  type WsAdmissionConfig,
+  type WsAdmissionDecision,
+  type WsSlotRef,
+  type WsSlotReleaseRef,
+  type WsSlotOutcome,
+  type WsSlotController,
+  WsConnectionLimitError,
+  evaluateWsAdmission,
+  createWsAdmissionGate,
+} from './wsadmit.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,
