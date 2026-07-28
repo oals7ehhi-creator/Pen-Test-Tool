@@ -559,18 +559,23 @@ establishes.
   so an idle-then-active peer cannot outlive the cap; **(2) COUNT** — the message must not push the total past
   `ws_max_messages`; **(3) SIZE** — the message must not exceed `ws_max_message_bytes`. The first breach wins and
   terminates the connection with a fixed reason (`ws_duration_exceeded` / `ws_message_count_exceeded` /
-  `ws_message_too_large`) — never destructive fuzzing (SI-063). `createWsGovernor` is the stateful wrapper the (future)
-  WebSocket wire path calls per frame: it threads the running message count and fails closed with a fixed-reason
-  `WsBoundsError` on any breach, carrying only the reason code (never a size/count/peer detail).
+  `ws_message_too_large`) — never destructive fuzzing (SI-063). A non-finite `nowMs` or a non-finite/negative message
+  size also fails **closed** (a comparison against `NaN` is always false, so an unreadable reading would otherwise
+  silently SKIP its cap): the connection terminates rather than relay a garbage input. `createWsGovernor` is the stateful
+  wrapper the (future) WebSocket wire path calls per frame: it threads the running message count and fails closed with a
+  fixed-reason `WsBoundsError` on any breach, carrying only the reason code (never a size/count/peer detail).
 - **No persistence.** Unlike the budget / rate / concurrency interlocks, a connection's budget is one broker's live
   in-memory state for the lifetime of a single socket, so there is no database layer — the governor is pure and
   fully unit-tested.
 
-Tests: `packages/broker/test/wsbounds.test.ts` (12 cases; broker package still **100%** coverage) — an in-budget
+Tests: `packages/broker/test/wsbounds.test.ts` (19 cases; broker package still **100%** coverage) — an in-budget
 message advancing the count; each cap at its exact boundary (duration `>=` terminates, `ws_max_messages` admits then
 the next terminates, a message exactly at the byte cap admits and one over terminates); the deterministic precedence
-when several caps breach at once (duration > count > size); and the stateful governor threading the budget, exposing
-the running count, and throwing the fixed-reason `WsBoundsError` without advancing the count on a breach.
+when several caps breach at once (duration > count > size); the stateful governor threading the budget, exposing the
+running count, and throwing the fixed-reason `WsBoundsError` (exact reason on the thrown error, no byte-count leak)
+without advancing the count on a breach; **fail-closed** termination on a non-finite clock / non-finite-or-negative
+size; and `evaluateWsFrame` purity (no input-state mutation, a backward clock stays within lifetime, a 0-byte message
+admitted at the size floor).
 
 **Deliberately still to come in slice 5:** the `ws_in_flight <= max_ws_connections` admission semaphore (a crash-safe,
 renewable connection lease — long-lived WS connections make crash-safety matter even more than for HTTP) and the

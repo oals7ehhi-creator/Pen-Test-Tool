@@ -123,10 +123,73 @@ describe('createWsGovernor — the stateful per-connection wrapper', () => {
     expect(g.messages).toBe(1);
   });
 
+  it('the admit-THROWN WsBoundsError carries ONLY the exact reason code (no size/count leak)', () => {
+    const g = createWsGovernor(caps(300_000, 5, 1024), OPENED);
+    let caught: unknown;
+    try {
+      g.admit(2048, OPENED + 1); // over the 1 KiB size cap
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(WsBoundsError);
+    expect((caught as WsBoundsError).reason).toBe('ws_message_too_large');
+    expect((caught as WsBoundsError).message).toBe('ws_message_too_large'); // exact, not a substring — no byte count
+  });
+
   it('the WsBoundsError message is exactly the fixed reason code (no leak)', () => {
     const err = new WsBoundsError('ws_message_too_large');
     expect(err).toBeInstanceOf(WsBoundsError);
     expect(err.message).toBe('ws_message_too_large');
     expect(err.reason).toBe('ws_message_too_large');
+  });
+});
+
+describe('fails CLOSED on a non-finite / adversarial reading', () => {
+  const C = caps(300_000, 3, 1024);
+
+  it('a non-finite clock terminates ws_duration_exceeded — it never SKIPS the lifetime cap', () => {
+    // `NaN >= maxDurationMs` is false; a naive check would admit forever. The governor must terminate instead.
+    expect(evaluateWsFrame(st(0), C, { bytes: 1 }, NaN)).toEqual({
+      allow: false,
+      reason: 'ws_duration_exceeded',
+    });
+    expect(evaluateWsFrame(st(0), C, { bytes: 1 }, Infinity)).toEqual({
+      allow: false,
+      reason: 'ws_duration_exceeded',
+    });
+  });
+
+  it('a non-finite or negative size terminates ws_message_too_large — it never SKIPS the size cap', () => {
+    expect(evaluateWsFrame(st(0), C, { bytes: NaN }, OPENED)).toEqual({
+      allow: false,
+      reason: 'ws_message_too_large',
+    });
+    expect(evaluateWsFrame(st(0), C, { bytes: -1 }, OPENED)).toEqual({
+      allow: false,
+      reason: 'ws_message_too_large',
+    });
+  });
+
+  it('the governor throws the fixed reason on a non-finite clock or size', () => {
+    expect(() => createWsGovernor(C, OPENED).admit(1, NaN)).toThrow(/ws_duration_exceeded/);
+    expect(() => createWsGovernor(C, OPENED).admit(NaN, OPENED)).toThrow(/ws_message_too_large/);
+  });
+});
+
+describe('evaluateWsFrame — purity + edge inputs', () => {
+  const C = caps(300_000, 3, 1024);
+
+  it('does not mutate the input state (returns a fresh advanced state)', () => {
+    const s = st(2);
+    evaluateWsFrame(s, C, { bytes: 1 }, OPENED);
+    expect(s).toEqual({ openedAtMs: OPENED, messagesSeen: 2 }); // input snapshot untouched
+  });
+
+  it('a backward clock stays within the lifetime (allowed)', () => {
+    expect(evaluateWsFrame(st(0), C, { bytes: 1 }, OPENED - 1000).allow).toBe(true);
+  });
+
+  it('a 0-byte message is within the size floor (allowed)', () => {
+    expect(evaluateWsFrame(st(0), C, { bytes: 0 }, OPENED).allow).toBe(true);
   });
 });

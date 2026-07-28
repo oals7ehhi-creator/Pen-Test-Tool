@@ -59,7 +59,9 @@ export type WsFrameDecision =
  *   (2) COUNT    — this message must not push the total past `maxMessages` (`messagesSeen + 1 > maxMessages`);
  *   (3) SIZE     — this message's payload must not exceed `maxMessageBytes`.
  * The first failing check wins (deterministic reason). On allow, returns the advanced state (`messagesSeen + 1`) for the
- * caller to thread into the next frame; on denial the connection must be closed and no further frame relayed.
+ * caller to thread into the next frame; on denial the connection must be closed and no further frame relayed. A
+ * non-finite `nowMs` or a non-finite/negative `frame.bytes` fails CLOSED (a comparison against NaN is always false, so
+ * an unreadable reading would otherwise SKIP its cap): the connection is terminated rather than a garbage input relayed.
  */
 export function evaluateWsFrame(
   state: WsConnectionState,
@@ -67,13 +69,17 @@ export function evaluateWsFrame(
   frame: { readonly bytes: number },
   nowMs: number,
 ): WsFrameDecision {
-  if (nowMs - state.openedAtMs >= caps.maxDurationMs) {
+  // Fail CLOSED on a non-finite clock: a NaN/Infinity nowMs must never SKIP the lifetime check (`NaN >= x` is false),
+  // which would silently disable the duration cap. An unreadable clock terminates the connection.
+  if (!Number.isFinite(nowMs) || nowMs - state.openedAtMs >= caps.maxDurationMs) {
     return { allow: false, reason: 'ws_duration_exceeded' };
   }
   if (state.messagesSeen + 1 > caps.maxMessages) {
     return { allow: false, reason: 'ws_message_count_exceeded' };
   }
-  if (frame.bytes > caps.maxMessageBytes) {
+  // Fail CLOSED on a non-finite / negative size: a NaN/negative frame.bytes must never SKIP the size cap
+  // (`NaN > x` is false) — a nonsensical measured size terminates the connection rather than being relayed.
+  if (!Number.isFinite(frame.bytes) || frame.bytes < 0 || frame.bytes > caps.maxMessageBytes) {
     return { allow: false, reason: 'ws_message_too_large' };
   }
   return {
