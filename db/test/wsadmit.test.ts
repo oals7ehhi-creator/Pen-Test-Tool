@@ -117,7 +117,7 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
     expect(await liveCount(client)).toBe(3); // never over-admits
   });
 
-  it('a cap of 0 disables WebSockets entirely — every acquire is refused', async () => {
+  it('a cap of 0 disables WebSockets entirely — every acquire is refused, with no side effect', async () => {
     await seed(client, 0, 300);
     await rejects(
       client,
@@ -126,6 +126,13 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
       /ws_connection_limit/,
     );
     expect(await rowCount(client)).toBe(0);
+    // the ws_connection_limit RAISE rolls the whole call back — the serialization get-or-create of the runtime-counter
+    // row (reached before the cap check) must NOT survive the refusal.
+    expect(
+      Number(
+        (await q(client, `SELECT count(*)::int AS n FROM engagement_runtime_counter`)).rows[0].n,
+      ),
+    ).toBe(0);
   });
 
   it('release frees a slot: after a release the engagement admits again', async () => {
@@ -149,7 +156,7 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
     expect(await rowCount(client)).toBe(0);
   });
 
-  it('derives the lease lifetime from ws_max_duration_s (not a caller value)', async () => {
+  it('derives the lease lifetime from ws_max_duration_s + the pre-open grace (not a caller value)', async () => {
     await seed(client, 2, 5); // 5s max connection lifetime
     await acquire(client);
     const s = Number(
@@ -160,7 +167,9 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
         )
       ).rows[0].s,
     );
-    expect(s).toBeCloseTo(5, 3); // expires_at = acquired_at + ws_max_duration_s, both stamped from the same now()
+    // expires_at = acquired_at + ws_max_duration_s + 60s grace (both stamped from the same now()), so the counted
+    // lease always outlives the connection's governed end (t_open + ws_max_duration_s).
+    expect(s).toBeCloseTo(65, 3);
   });
 
   it('CRASH-SAFE: an expired lease is excluded from the count, so a crashed owner never wedges the engagement', async () => {
@@ -184,14 +193,15 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
     );
   });
 
-  it('TTL self-heal end-to-end: an acquire-minted lease expires on ws_max_duration_s, freeing the seat', async () => {
-    await seed(client, 1, 1); // 1s connection lifetime (the schema floor)
-    await acquire(client); // exercises acquire's own now() + ws_max_duration_s math (not a hand-inserted timestamp)
-    const deadline = Date.now() + 4000;
-    while ((await liveCount(client)) > 0 && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    expect(await liveCount(client)).toBe(0); // the ~1s lease is no longer live
+  it('TTL self-heal: once an acquire-minted lease passes its deadline it leaves the live count, freeing the seat', async () => {
+    await seed(client, 1, 300);
+    const s = await acquire(client); // a REAL acquire-minted lease (deadline now() + ws_max_duration_s + grace)
+    expect(await liveCount(client)).toBe(1);
+    // fast-forward THIS acquire-minted lease past its deadline (its connection's lifetime elapsing / the broker crashing)
+    // — deterministic, since the real deadline is minutes out. A hand-INSERTed row is covered by the crash-safe test;
+    // here the lease under test was produced by acquire_ws_slot itself.
+    await q(client, `UPDATE ws_slot SET expires_at = now() - interval '1 second' WHERE id=$1`, [s]);
+    expect(await liveCount(client)).toBe(0); // no longer live ⇒ does not occupy the cap
     await acquire(client); // the cap-1 engagement admits again
     expect(await liveCount(client)).toBe(1);
   });
@@ -279,15 +289,17 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
     await client.query('RESET app.tenant_id');
   });
 
-  it('RLS fail-closed: with app.tenant_id unset the acquire is refused and creates no slot', async () => {
+  it('RLS fail-closed: with app.tenant_id unset the engagement read is hidden ⇒ acquire refuses (unknown_engagement)', async () => {
     await seed(client, 2, 300);
     await client.query('SET ROLE app_test');
     await client.query('RESET app.tenant_id');
+    // the engagement row is RLS-hidden under the unset GUC, so the cap lookup NOT FOUND ⇒ unknown_engagement, before
+    // ws_slot is ever touched. (ws_slot's OWN write policy is proven by the dedicated own-policy test below.)
     await rejects(
       client,
       `SELECT acquire_ws_slot('${T_A}','${EA}','broker-1','${randomUUID()}')`,
       [],
-      /row-level security|unknown_engagement/,
+      /unknown_engagement/,
     );
     await client.query('RESET ROLE');
     expect(await rowCount(client)).toBe(0);
@@ -321,5 +333,33 @@ describe.skipIf(!url)('slice 5g — WebSocket connection admission slots (§8/§
     await client.query('RESET ROLE');
     await client.query('RESET app.tenant_id');
     expect(await rowCount(client)).toBe(1); // the tenant-A slot survived the foreign release
+  });
+
+  it('RLS write-forgery guard: a tenant-B session cannot MINT a tenant-A slot by passing p_tenant=T_A', async () => {
+    await seed(client, 2, 300);
+    await client.query('SET ROLE app_test');
+    await client.query(`SET app.tenant_id = '${T_B}'`); // a DIFFERENT tenant's broker session
+    // the engagement is invisible under the T_B GUC ⇒ unknown_engagement; even had it been read, the ws_slot WITH CHECK
+    // would reject a T_A row under a T_B session. Either way no cross-tenant slot is forged.
+    await rejects(
+      client,
+      `SELECT acquire_ws_slot('${T_A}','${EA}','broker-B','${randomUUID()}')`,
+      [],
+      /unknown_engagement|row-level security/,
+    );
+    await client.query('RESET ROLE');
+    await client.query('RESET app.tenant_id');
+    expect(await rowCount(client)).toBe(0);
+  });
+
+  it('release under the MATCHING tenant role frees the slot (positive RLS path)', async () => {
+    await seed(client, 1, 300);
+    const held = await acquire(client); // tenant-A slot (as superuser)
+    await client.query('SET ROLE app_test');
+    await client.query(`SET app.tenant_id = '${T_A}'`); // the broker's OWN tenant
+    await client.query(`SELECT release_ws_slot('${T_A}','${EA}','${held}')`);
+    await client.query('RESET ROLE');
+    await client.query('RESET app.tenant_id');
+    expect(await rowCount(client)).toBe(0); // the own-tenant release succeeded (the DELETE is visible under RLS)
   });
 });

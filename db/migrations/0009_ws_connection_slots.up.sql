@@ -7,12 +7,15 @@
 -- (the authoritative `ws_in_flight`, §8). Like the per-host concurrency slots (0008) this is a CRASH-SAFE LEASE — a slot
 -- counts only while unexpired, so a broker that crashes mid-connection stops occupying its slot when the lease expires.
 --
--- LEASE LIFETIME: bounded to the connection's MAX permitted lifetime, `ws_max_duration_s` (the DB derives it, so the
--- caller cannot over-lease). A well-behaved connection is terminated by the per-connection governor (slice 5f,
--- `evaluateWsFrame`) at or before that bound and RELEASES its slot early on close; a crashed broker's slot self-heals at
--- the bound WITHOUT any heartbeat. (`max_ws_connections` is small — 0..64 — so a stranded slot's liveness cost is
--- modest, and a stranded slot only makes admission STRICTER, never unsafe.) A cap of 0 disables WebSockets entirely
--- (0 >= 0 refuses every acquire).
+-- LEASE LIFETIME: the DB derives it (the caller cannot over-lease) as `ws_max_duration_s` PLUS a small pre-open grace,
+-- so the counted lease always OUTLIVES the connection's governed termination point. The slot is acquired at the
+-- handshake (t_acquire) but the per-connection governor (slice 5f, `evaluateWsFrame`) measures the connection lifetime
+-- from socket OPEN (t_open > t_acquire); a bare `ws_max_duration_s` lease would expire before `t_open +
+-- ws_max_duration_s` and briefly UNCOUNT a still-permitted connection. The grace covers that pre-open latency. A
+-- well-behaved connection is terminated by the governor at/before its bound and RELEASES its slot early on close; a
+-- crashed broker's slot self-heals at the (grace-extended) bound WITHOUT any heartbeat. (`max_ws_connections` is small —
+-- 0..64 — so a stranded slot's liveness cost is modest, and a stranded slot only makes admission STRICTER, never
+-- unsafe.) A cap of 0 disables WebSockets entirely (0 >= 0 refuses every acquire).
 --
 -- Mirrors the pure `evaluateWsAdmission` logic in @pentest/broker (wsadmit.ts); the atomic count-under-lock + insert
 -- lives here so the broker package stays I/O-free. ADMISSION SERIALISATION: the count-then-insert runs under the
@@ -54,6 +57,14 @@ DECLARE
   v_cap   INT;
   v_dur_s INT;
   v_live  INT;
+  -- Pre-open grace. The slot is acquired at the handshake (beforeEgress, t_acquire) but the per-connection duration
+  -- governor (slice 5f) measures lifetime from socket OPEN (t_open > t_acquire, after DNS+TCP+TLS). A bare
+  -- t_acquire + ws_max_duration_s lease would therefore expire BEFORE the connection's governed end (t_open +
+  -- ws_max_duration_s), leaving a still-permitted connection briefly UNCOUNTED (an ws_in_flight under-count that could
+  -- over-admit). The grace covers the pre-open latency (well above any real DNS+connect+TLS handshake time) so the
+  -- counted lease always outlives t_open + ws_max_duration_s. Its only cost is reclaiming a CRASHED slot v_grace_s
+  -- later — immaterial for a 0..64 cap.
+  v_grace_s CONSTANT INT := 60;
 BEGIN
   -- Read the caps FIRST so a missing/other-tenant engagement fails closed with a clean reason (before any side effect).
   SELECT max_ws_connections, ws_max_duration_s INTO v_cap, v_dur_s
@@ -78,7 +89,7 @@ BEGIN
   END IF;
 
   INSERT INTO ws_slot (id, engagement_id, tenant_id, owner, expires_at)
-    VALUES (p_slot_id, p_engagement, p_tenant, p_owner, now() + (v_dur_s || ' seconds')::interval);
+    VALUES (p_slot_id, p_engagement, p_tenant, p_owner, now() + ((v_dur_s + v_grace_s) || ' seconds')::interval);
 END; $$ LANGUAGE plpgsql;
 
 -- Release a held connection slot on close: delete the lease. Idempotent — a slot already reclaimed by the sweeper (or a

@@ -597,11 +597,14 @@ may never exceed `engagement.max_ws_connections` (the authoritative `ws_in_fligh
   surfaced by `runStage2` as `{stage:'interlock', reason}`) or on any controller throw (fail-closed). An HTTP request
   consumes no connection slot and passes straight through (the gate is a no-op).
 - **Crash-safe LEASE with a lifetime-bounded deadline** (`ws_slot` + `acquire_ws_slot` / `release_ws_slot` /
-  `sweep_expired_ws_slots`, migration `0009`). Each slot is a lease row whose `expires_at` is derived by the DB from
-  `ws_max_duration_s` — the connection's MAX permitted lifetime — so the caller cannot over-lease and **no heartbeat is
-  needed**: a well-behaved connection (terminated by the 5f governor at or before that bound) releases its slot on close,
-  and a crashed broker's slot self-heals at the bound. The acquire counts only **live** (`expires_at > now()`) slots, so
-  a crashed owner's stale connection never blocks. `release_ws_slot` is idempotent; `sweep_expired_ws_slots` is the
+  `sweep_expired_ws_slots`, migration `0009`). Each slot is a lease row whose `expires_at` is derived by the DB as
+  `ws_max_duration_s` — the connection's MAX permitted lifetime — **plus a small pre-open grace**, so the caller cannot
+  over-lease and **no heartbeat is needed**. The grace matters because the slot is acquired at the handshake
+  (`t_acquire`) while the 5f governor measures the connection lifetime from socket OPEN (`t_open > t_acquire`); a bare
+  `ws_max_duration_s` lease would expire before the connection's governed end (`t_open + ws_max_duration_s`) and briefly
+  **uncount** a still-permitted connection. A well-behaved connection releases its slot on close, and a crashed broker's
+  slot self-heals at the (grace-extended) bound. The acquire counts only **live** (`expires_at > now()`) slots, so a
+  crashed owner's stale connection never blocks. `release_ws_slot` is idempotent; `sweep_expired_ws_slots` is the
   RLS-exempt housekeeping job.
 - **No over-admit under contention.** The count-then-insert runs under the per-engagement runtime-counter `FOR UPDATE`
   lock (get-or-created, as `0006`/`0008` do), so concurrent handshakes serialise and can never both admit into an
@@ -612,11 +615,13 @@ Tests: `packages/broker/test/wsadmit.test.ts` (8 cases; broker package still **1
 below/at-cap/cap-0 admission decision, the gate acquiring per-engagement on a ws/wss handshake, the fixed-reason
 fail-closed denial, and the **no-op on an HTTP request**; two `runStage2` integrations (a wss handshake denies
 `ws_connection_limit` with no socket; an HTTP request proceeds because the WS gate no-ops). `db/test/wsadmit.test.ts`
-(14 DB-gated cases) — admit-to-cap-then-deny, cap-0 disables WS, release-frees, release idempotency, the lease lifetime
-**derived from `ws_max_duration_s`**, the **crash-safe** expired-lease exclusion, an **end-to-end TTL self-heal**, the
-sweeper reclaiming only expired leases, `unknown_engagement`, a two-connection **concurrency race** (cap 1 admits
-exactly one), and RLS (tenant isolation, unset-GUC fail-closed, `ws_slot`'s own USING/WITH CHECK, and a tenant-scoped
-`release`); `migrate:ci` covers `0009`'s exact inverse.
+(16 DB-gated cases) — admit-to-cap-then-deny, cap-0 disables WS (and leaves no runtime-counter row after the refusal
+rollback), release-frees, release idempotency, the lease lifetime **derived from `ws_max_duration_s` + the grace**, the
+**crash-safe** expired-lease exclusion, a **TTL self-heal** on an acquire-minted lease, the sweeper reclaiming only
+expired leases, `unknown_engagement`, a two-connection **concurrency race** (cap 1 admits exactly one), and RLS (tenant
+isolation, unset-GUC fail-closed via the engagement read, `ws_slot`'s own USING/WITH CHECK, a cross-tenant
+**write-forgery** guard on acquire, and both a scoped and a positive-path `release`); `migrate:ci` covers `0009`'s exact
+inverse.
 
 **Deliberately still to come in slice 5:** the outbound-frame source restriction to the approved content-addressed
 `ws_frame_set` (SI-063); the broker emission of the remaining hash-chained audit events; approval policy + dual control
