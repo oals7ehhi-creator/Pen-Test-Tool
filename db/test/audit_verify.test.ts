@@ -67,6 +67,23 @@ async function tamper(c: pg.Client, sql: string, params: unknown[] = []): Promis
   }
 }
 
+/**
+ * The same privileged actor can also drop NOT NULL before writing NULLs — the attack that turns every `<>` comparison
+ * into NULL (and so into a SKIPPED check) unless the verifier guards for it explicitly.
+ */
+async function tamperNullable(c: pg.Client, sql: string, params: unknown[] = []): Promise<void> {
+  await q(
+    c,
+    `ALTER TABLE audit_event ALTER COLUMN event_type DROP NOT NULL,
+                             ALTER COLUMN payload DROP NOT NULL,
+                             ALTER COLUMN payload_sha256 DROP NOT NULL,
+                             ALTER COLUMN prev_hash DROP NOT NULL,
+                             ALTER COLUMN event_hash DROP NOT NULL`,
+  );
+  await q(c, `ALTER TABLE audit_chain ALTER COLUMN head_hash DROP NOT NULL`);
+  await tamper(c, sql, params);
+}
+
 /** Seed the tenant + engagement + an engagement audit chain, then append `n` events. */
 async function seed(c: pg.Client, n = 3): Promise<void> {
   await q(c, `INSERT INTO tenant (id, name) VALUES ($1,'A'),($2,'B')`, [T_A, T_B]);
@@ -246,7 +263,7 @@ describe.skipIf(!url)('slice 5i — audit-chain verification (§9)', () => {
       expect(['chain_broken', 'event_hash_mismatch', 'seq_gap']).toContain(v.reason);
     });
 
-    it('detects an APPENDED forgery (a fabricated event past the head)', async () => {
+    it('detects a CARELESS appended forgery (hashes not re-derived, head not advanced)', async () => {
       await seed(client, 2);
       await tamper(
         client,
@@ -256,10 +273,133 @@ describe.skipIf(!url)('slice 5i — audit-chain verification (§9)', () => {
                 repeat('c',64), repeat('d',64), repeat('e',64)`,
         [CHAIN, T_A, EA, U],
       );
+      // deterministic: the prev_hash link is checked before either digest, so this is exactly chain_broken.
+      expect(await verify(client)).toMatchObject({
+        ok: false,
+        bad_seq: 3,
+        reason: 'chain_broken',
+      });
+    });
+
+    it('detects a fully RE-HASHED replacement of the last event — caught only by the head_hash disjunct', async () => {
+      await seed(client, 3);
+      // Replace event 3's payload and re-derive ITS digests correctly, so checks 0-6 all pass on the walk. seq and
+      // count are unchanged, so head_seq still matches — only head_HASH reveals the substitution.
+      await tamper(
+        client,
+        `UPDATE audit_event AS e
+            SET payload='{"k":"swapped"}'::jsonb,
+                payload_sha256 = encode(digest(convert_to('{"k": "swapped"}','utf8'),'sha256'),'hex'),
+                event_hash = encode(digest(convert_to(
+                  e.prev_hash||':'||e.seq::text||':'||e.chain_id::text||':'||e.event_type||':'||
+                  encode(digest(convert_to('{"k": "swapped"}','utf8'),'sha256'),'hex'),'utf8'),'sha256'),'hex')
+          WHERE e.seq=3`,
+      );
       const v = await verify(client);
       expect(v.ok).toBe(false);
-      expect(v.bad_seq).toBe(3);
-      expect(['chain_broken', 'payload_tampered', 'event_hash_mismatch']).toContain(v.reason);
+      expect(v.reason).toBe('head_mismatch'); // head_seq still 3; only the stored head HASH differs
+      expect(v.events_checked).toBe(3);
+    });
+  });
+
+  describe('NULL-operand attack — a skipped check must never read as a passed check', () => {
+    it('BLOCKING REGRESSION: a rewritten payload with its digests NULLed is NOT attested ok', async () => {
+      await seed(client, 2);
+      // The whole point: `NULL <> x` is NULL, and `IF NULL THEN` does not fire — so before the null_field guard this
+      // exact chain verified ok=true with the payload reading {"k":"EVIL"}. It must now fail closed.
+      await tamperNullable(
+        client,
+        `UPDATE audit_event SET payload='{"k":"EVIL"}'::jsonb, payload_sha256=NULL, event_hash=NULL WHERE seq=2`,
+      );
+      await q(client, `UPDATE audit_chain SET head_hash=NULL WHERE id=$1`, [CHAIN]);
+      const v = await verify(client);
+      expect(v.ok).toBe(false);
+      expect(v.reason).toBe('null_field');
+    });
+
+    it('detects a NULLed event_type', async () => {
+      await seed(client, 2);
+      await tamperNullable(client, `UPDATE audit_event SET event_type=NULL WHERE seq=2`);
+      expect(await verify(client)).toMatchObject({ ok: false, bad_seq: 2, reason: 'null_field' });
+    });
+
+    it('detects a NULLed payload', async () => {
+      await seed(client, 2);
+      await tamperNullable(client, `UPDATE audit_event SET payload=NULL WHERE seq=1`);
+      expect(await verify(client)).toMatchObject({ ok: false, bad_seq: 1, reason: 'null_field' });
+    });
+
+    it('detects a NULLed chain head (truncation hidden behind a NULL)', async () => {
+      await seed(client, 3);
+      await tamperNullable(client, `DELETE FROM audit_event WHERE seq > 1`);
+      await q(client, `UPDATE audit_chain SET head_hash=NULL WHERE id=$1`, [CHAIN]);
+      expect(await verify(client)).toMatchObject({ ok: false, reason: 'null_field' });
+    });
+
+    it('detects a TOTAL NULL WIPE of every bound field (the case IS DISTINCT FROM alone would pass)', async () => {
+      await seed(client, 2);
+      // both sides NULL ⇒ `IS DISTINCT FROM` finds no difference; only the explicit guard catches this.
+      await tamperNullable(
+        client,
+        `UPDATE audit_event SET event_type=NULL, payload=NULL, payload_sha256=NULL, prev_hash=NULL, event_hash=NULL`,
+      );
+      await q(client, `UPDATE audit_chain SET head_hash=NULL WHERE id=$1`, [CHAIN]);
+      expect(await verify(client)).toMatchObject({ ok: false, reason: 'null_field' });
+    });
+  });
+
+  describe('chain identity is re-derived, not trusted', () => {
+    it('detects an event RE-ATTRIBUTED to another tenant/engagement', async () => {
+      await seed(client, 3);
+      await tamper(client, `UPDATE audit_event SET tenant_id=$1 WHERE seq=2`, [T_B]);
+      expect(await verify(client)).toMatchObject({
+        ok: false,
+        bad_seq: 2,
+        reason: 'identity_mismatch',
+      });
+    });
+  });
+
+  describe('documented LIMITS — asserted as clean verdicts so the boundary is visible', () => {
+    it('LIMIT: rewriting WHO and WHEN (actor_*, occurred_at, subject_*) verifies clean', async () => {
+      await seed(client, 3);
+      // none of these fields is bound into event_hash, so `ok` attests to ORDER/TYPE/PAYLOAD — not attribution.
+      await tamper(
+        client,
+        `UPDATE audit_event
+            SET actor_role='administrator', actor_type='system',
+                occurred_at = occurred_at - interval '30 days'
+          WHERE seq=2`,
+      );
+      expect(await verify(client)).toMatchObject({ ok: true, reason: 'ok' });
+    });
+
+    it('LIMIT: an ENTIRE fabricated history verifies clean (the strongest form of the audit_chain gap)', async () => {
+      await seed(client, 3);
+      const real = (await q(client, `SELECT event_type FROM audit_event ORDER BY seq`)).rows.map(
+        (r) => r.event_type as string,
+      );
+      // An actor who can write audit_chain does not need to forge hashes at all: erase the events, rewind the head to
+      // genesis, and replay a DIFFERENT history through the sanctioned appender. Every digest is then correct by
+      // construction and the chain verifies perfectly — while recording events that never happened.
+      await tamper(client, `DELETE FROM audit_event WHERE chain_id='${CHAIN}'`);
+      await q(client, `UPDATE audit_chain SET head_seq=0, head_hash=repeat('0',64) WHERE id=$1`, [
+        CHAIN,
+      ]);
+      await append(client, 'request.fabricated', { story: 'never happened' });
+
+      expect(await verify(client)).toEqual({
+        ok: true,
+        events_checked: 1,
+        bad_seq: null,
+        reason: 'ok',
+      });
+      // the real history is simply gone — nothing INTERNAL to the chain can reveal that.
+      const now = (await q(client, `SELECT event_type FROM audit_event ORDER BY seq`)).rows.map(
+        (r) => r.event_type as string,
+      );
+      expect(real).toHaveLength(3);
+      expect(now).toEqual(['request.fabricated']);
     });
   });
 

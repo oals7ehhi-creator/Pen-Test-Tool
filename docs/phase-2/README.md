@@ -697,32 +697,56 @@ now.
   who can disable a trigger and write the table. That actor is precisely who the hash chain exists to catch.
   `verify_audit_chain(chain_id)` (migration `0010`) re-derives **every digest from the stored payload** rather than
   trusting any stored digest to vouch for itself.
-- **Six checks, first failure wins, one fixed reason each** — `genesis_mismatch` (the first event does not start from
-  the 64-zero head), `seq_gap` (seq is not contiguous 1..N), `chain_broken` (an event's `prev_hash` is not its
-  predecessor's `event_hash`), `payload_tampered` (the payload digest no longer covers the stored payload),
-  `event_hash_mismatch` (the chained pre-image — prev : seq : chain : type : payload digest — no longer matches), and
-  `head_mismatch`. **The head check is the truncation check, and it is why the head is stored at all:** lopping the last
-  N events off leaves a perfectly valid chain _prefix_ on which all five other checks pass. Only the stored head reveals
-  that events used to follow.
+- **Eight checks, first failure wins, one fixed reason each** — `null_field`, `identity_mismatch`, `genesis_mismatch`
+  (the first event does not start from the 64-zero head), `seq_gap` (seq is not contiguous 1..N), `chain_broken` (an
+  event's `prev_hash` is not its predecessor's `event_hash`), `payload_tampered` (the payload digest no longer covers
+  the stored payload), `event_hash_mismatch` (the chained pre-image — prev : seq : chain : type : payload digest — no
+  longer matches), and `head_mismatch`. **The head check is the truncation check, and it is why the head is stored at
+  all:** lopping the last N events off leaves a perfectly valid chain _prefix_ on which every other check passes. Only
+  the stored head reveals that events used to follow.
+- **`null_field` is load-bearing, not hygiene** — and the adversarial review caught its absence as a **blocking**
+  defect. In SQL `NULL <> x` evaluates to NULL and `IF NULL THEN` does not fire, so a NULL operand silently **skips**
+  the very comparison meant to catch it: a chain whose payload had been rewritten to `{"k":"EVIL"}` with its digests
+  NULLed verified `ok = true` (reproduced against live Postgres before the fix). Every comparison is now additionally
+  written `IS DISTINCT FROM`, but the explicit guard is what covers the case where _both_ sides are NULL — a NULL
+  operand also makes the recomputed hash NULL. `identity_mismatch` re-derives each event's tenant/engagement from the
+  **chain**, the authoritative identity, since `0002`'s identity trigger sits on the write path this threat model
+  presumes disabled. The `search_path` is pinned, because the same actor could otherwise shadow `digest()` (classically
+  via `pg_temp`) and have the verifier hash with their own function.
 - **Read-only and RLS-scoped.** The function writes nothing, so verification can never itself alter the evidence. It is
   `SECURITY INVOKER`, so it verifies exactly what the caller can see: a per-tenant role attests to its own chains, a
   system auditor role across tenants — and a caller who can see only _part_ of a chain gets a break, not a pass. You
   cannot attest to what you cannot read.
 
-Tests: `db/test/audit_verify.test.ts` (16 DB-gated cases) — a clean multi-event chain and a brand-new empty chain both
+Tests: `db/test/audit_verify.test.ts` (25 DB-gated cases) — a clean multi-event chain and a brand-new empty chain both
 verify; `unknown_chain` for an absent id; then the **tamper battery**, each write performed with the append-only
 triggers disabled (not a workaround — that _is_ the threat model): a mutated payload, a payload rewritten **with its
 digest recomputed** (still caught, because `event_hash` binds that digest), a flipped `event_type`, a cut `prev_hash`
 link, a forged genesis, a deleted middle event, a **truncated tail** (the case a prefix-only checker would miss), a
-staged reorder — `UNIQUE (chain_id, seq)` already forces an attacker through a temporary slot — and an appended
-forgery; plus proof that verifying writes nothing, and RLS (owning tenant passes, other tenant and unset-GUC both
-fail closed).
+staged reorder — `UNIQUE (chain_id, seq)` already forces an attacker through a temporary slot — a careless appended
+forgery, and a **fully re-hashed replacement of the last event**, which is caught _only_ by the `head_hash` disjunct.
+Then the **NULL battery** (including the total wipe that `IS DISTINCT FROM` alone would pass), the tenant
+re-attribution case, proof that verifying writes nothing, and RLS (owning tenant passes; other tenant and unset-GUC
+both fail closed).
 
-**Honest limit, recorded as a passing test rather than hidden:** an attacker who truncates the tail _and_ rewrites
-`audit_chain.head_seq`/`head_hash` to the surviving prefix produces a chain that verifies clean — `audit_chain` is not
-itself append-only. That is the intrinsic limit of any self-contained chain: detecting it requires an **external
-anchor** (a witnessed or exported head), which §9's external attestation provides. The test asserts the clean verdict
-and says so, so the boundary of the guarantee is visible instead of assumed.
+**Honest limits, recorded as passing tests rather than hidden.** Two, and the review corrected me on how wide the
+second one is:
+
+1. **The pre-image does not bind WHO or WHEN.** `event_hash` covers prev*hash, seq, chain_id, event_type and the
+   payload digest. It does *not* cover `occurred_at`, `actor*\_`, `subject\_\_`, or `related_event_id`. An actor who
+rewrites who performed an event, when it happened, or which event it relates to leaves the chain intact and gets
+`ok`. So **`ok` attests to order, type and payload — not to attribution, timing, or the intent↔completion binding.\*\*
+   Widening the pre-image is a breaking change (every existing chain would need re-attesting), so it belongs to a
+   versioned pre-image in a later migration, not a silent edit here.
+2. **Anyone who can write `audit_chain` can present _any_ history.** My first draft claimed the limit was tail
+   truncation plus a forged head; the review showed that understates it. `audit_chain` is not itself append-only, so an
+   attacker can delete, insert, or rewrite wholesale — the test now demonstrates the strongest form: **erase every
+   event, rewind the head to genesis, and replay a fabricated history through the sanctioned appender.** Every digest is
+   then correct by construction and the chain verifies perfectly while recording events that never happened.
+
+Both limits have the same remedy — an **external anchor** (a witnessed/exported head, §9 external attestation) — and
+that anchor is **not yet implemented in this repository**. Until it is, `ok` means "internally consistent", not "not
+rewritten". That gap is real, and it is recorded here and in the migration header rather than implied away.
 
 **Deliberately still to come in slice 5:** the broker's emission of the informational `request.completed` / `failed`
 event (which references the intent via `related_event_id`); the approval policy + dual control at request time; and
