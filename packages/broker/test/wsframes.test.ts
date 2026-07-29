@@ -151,4 +151,136 @@ describe('createWsFrameEmitter — bound to the spec ws_frame_set_digest', () =>
     expect(err.message).toBe('ws_frame_set_not_found');
     expect(err.reason).toBe('ws_frame_set_not_found');
   });
+
+  it('SNAPSHOT: mutating the resolver body AFTER construction cannot change what this connection emits', async () => {
+    // the catalog body is an ordinary object from an injected resolver (it may be shared / memoized). The emitter is
+    // held for the whole connection, so it must not re-read a body someone else can still mutate.
+    const mutable: { frames: WsFrameTemplate[] } = {
+      frames: [frame({ name: 'safe', dataBase64: b64('approved-body') })],
+    };
+    const emitter = await createWsFrameEmitter('e'.repeat(64), {
+      fetchWsFrameSet: async () => mutable as WsFrameSet,
+    });
+    // an attacker (or a buggy cache) swaps the bytes and adds a new entry AFTER the emitter was built.
+    mutable.frames[0] = frame({ name: 'safe', dataBase64: b64('destructive-body') });
+    mutable.frames.push(frame({ name: 'fuzz', dataBase64: b64('fuzz-body') }));
+
+    expect(utf8(emitter.emit('safe').data)).toBe('approved-body'); // still the ORIGINAL approved bytes
+    expect(() => emitter.emit('fuzz')).toThrow(/ws_frame_not_in_catalog/); // the injected entry is not emittable
+    expect(emitter.approvedNames).toEqual(['safe']);
+  });
+
+  it('approvedNames advertises EXACTLY what emit admits (ambiguous / malformed entries drop out)', async () => {
+    const { ctx } = ctxOf(
+      setOf(
+        frame({ name: 'ok' }),
+        frame({ name: 'dupe' }),
+        frame({ name: 'dupe', dataBase64: b64('other') }), // ambiguous ⇒ not emittable
+        { name: 'badop', opcode: 'close', dataBase64: b64('x') } as unknown as WsFrameTemplate,
+      ),
+    );
+    const emitter = await createWsFrameEmitter('f'.repeat(64), ctx);
+    expect(emitter.approvedNames).toEqual(['ok']);
+    // and every advertised name really does emit; every omitted one really does refuse.
+    expect(utf8(emitter.emit('ok').data)).toBe('hello');
+    expect(() => emitter.emit('dupe')).toThrow(/ws_frame_name_ambiguous/);
+    expect(() => emitter.emit('badop')).toThrow(/ws_frame_opcode_invalid/);
+  });
+});
+
+describe('untyped-JSONB trust boundary — a malformed catalog never throws a raw error', () => {
+  const malformed = (over: Record<string, unknown>): WsFrameSet =>
+    ({ frames: [{ name: 'x', opcode: 'text', dataBase64: b64('ok'), ...over }] }) as WsFrameSet;
+
+  it('REFUSES an entry whose dataBase64 is absent or not a string (never decodes raw octets)', () => {
+    for (const bad of [undefined, null, 123, ['A', 'B'], { toString: () => 'AAAA' }]) {
+      expect(selectWsFrame(malformed({ dataBase64: bad }), 'x')).toEqual({
+        allow: false,
+        reason: 'ws_frame_entry_malformed',
+      });
+    }
+  });
+
+  it('REFUSES an entry whose name is not a string', () => {
+    const s = {
+      frames: [{ name: 42, opcode: 'text', dataBase64: b64('ok') }],
+    } as unknown as WsFrameSet;
+    expect(selectWsFrame(s, 42 as unknown as string)).toEqual({
+      allow: false,
+      reason: 'ws_frame_entry_malformed',
+    });
+  });
+
+  it('REFUSES non-canonical base64 rather than silently decoding different bytes', () => {
+    // Buffer.from(...,'base64') is LENIENT: it skips out-of-alphabet characters, so "aGVs bG8h!!" would decode to
+    // something the curated entry does not actually specify. Strict canonical base64 is required instead.
+    for (const bad of ['aGVs bG8=', 'aGVsbG8', 'not*base64!', 'aGVsbG8===']) {
+      expect(selectWsFrame(malformed({ dataBase64: bad }), 'x')).toEqual({
+        allow: false,
+        reason: 'ws_frame_entry_malformed',
+      });
+    }
+    // a correctly padded entry (and a legitimately EMPTY frame) still pass.
+    expect(selectWsFrame(malformed({ dataBase64: b64('hello') }), 'x').allow).toBe(true);
+    expect(selectWsFrame(malformed({ dataBase64: '' }), 'x').allow).toBe(true);
+  });
+
+  it('REFUSES a structurally invalid set (nullish, or frames not an array) instead of throwing', () => {
+    for (const bad of [null, undefined, {}, { frames: 'nope' }, { frames: null }]) {
+      expect(selectWsFrame(bad as unknown as WsFrameSet, 'x')).toEqual({
+        allow: false,
+        reason: 'ws_frame_set_not_found',
+      });
+    }
+  });
+
+  it('a null entry inside the frames array is skipped, never dereferenced', () => {
+    const s = { frames: [null, frame({ name: 'real' })] } as unknown as WsFrameSet;
+    expect(selectWsFrame(s, 'real').allow).toBe(true);
+    expect(selectWsFrame(s, 'ghost')).toEqual({ allow: false, reason: 'ws_frame_not_in_catalog' });
+  });
+
+  it('the EMITTER surfaces these as WsFrameError, not a raw TypeError', async () => {
+    const badSet: WsFrameContext = { fetchWsFrameSet: async () => ({}) as unknown as WsFrameSet };
+    await expect(createWsFrameEmitter('a'.repeat(64), badSet)).rejects.toBeInstanceOf(WsFrameError);
+    await expect(createWsFrameEmitter('a'.repeat(64), badSet)).rejects.toThrow(
+      /ws_frame_set_not_found/,
+    );
+
+    const undef: WsFrameContext = {
+      fetchWsFrameSet: async () => undefined as unknown as WsFrameSet,
+    };
+    await expect(createWsFrameEmitter('a'.repeat(64), undef)).rejects.toThrow(
+      /ws_frame_set_not_found/,
+    );
+
+    const badEntry: WsFrameContext = {
+      fetchWsFrameSet: async () =>
+        ({ frames: [{ name: 'x', opcode: 'text' }] }) as unknown as WsFrameSet,
+    };
+    const emitter = await createWsFrameEmitter('a'.repeat(64), badEntry);
+    let caught: unknown;
+    try {
+      emitter.emit('x');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(WsFrameError); // NOT a TypeError from Buffer.from(undefined)
+    expect((caught as WsFrameError).reason).toBe('ws_frame_entry_malformed');
+  });
+
+  it('reads each validated field ONCE — a getter cannot swap the value after it passed the checks', () => {
+    let reads = 0;
+    const entry = {
+      name: 'g',
+      get opcode(): string {
+        reads += 1;
+        return reads === 1 ? 'text' : 'close'; // legal on the validated read, illegal on any later read
+      },
+      dataBase64: b64('body'),
+    };
+    const sel = selectWsFrame({ frames: [entry] } as unknown as WsFrameSet, 'g');
+    expect(sel.allow).toBe(true);
+    if (sel.allow) expect(sel.frame.opcode).toBe('text'); // the RETURNED opcode is the one that was validated
+  });
 });

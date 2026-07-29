@@ -651,22 +651,39 @@ destructive fuzzing."_
   `ws_needs_frames` CHECK) and a digest resolving to nothing is refused (`ws_frame_set_not_found`), both **before** any
   frame can be emitted. Every denial is a fixed-reason `WsFrameError` carrying only the code — never frame bytes or
   names.
+- **The catalog body is treated as an untyped trust boundary.** It arrives as `JSONB` and migration `0003` constrains
+  `content JSONB NOT NULL` but never its _shape_, so the injected resolver's declared TypeScript type is a promise, not
+  a guarantee. The module therefore **validates rather than trusts**: a nullish/structurally invalid body, an entry
+  whose `name`/`dataBase64` is not a string, or **non-canonical base64** all return a fixed reason
+  (`ws_frame_set_not_found` / `ws_frame_entry_malformed`) instead of letting a raw `TypeError` escape a safety control
+  or letting `Buffer.from`'s _lenient_ decoding emit bytes the curated entry never specified. Each validated field is
+  read **exactly once**, so a getter cannot swap a value after it passed its check. And the body is **snapshotted and
+  frozen at construction**: the emitter is held for a whole connection while the resolver's object may be shared or
+  memoized, and `readonly` is erased at runtime — without the snapshot, unrepresentability would hold only at
+  construction time. `approvedNames` is **derived from the selector**, so the advertised list can never drift from what
+  `emit` actually admits.
 - **One enforcement point each, deliberately not duplicated.** SOURCE of a frame is this module; SIZE / COUNT /
   DURATION remain the 5f governor's (`ws_max_message_bytes` / `ws_max_messages` / `ws_max_duration_s`); connection
   ADMISSION remains 5g's (`ws_in_flight ≤ max_ws_connections`). A selected catalog frame is still bounded by the
   governor before it goes on the wire.
 
-Tests: `packages/broker/test/wsframes.test.ts` (12 cases; broker package still **100%** coverage) — selecting a named
+Tests: `packages/broker/test/wsframes.test.ts` (21 cases; broker package still **100%** coverage) — selecting a named
 entry returns the **catalog** bytes; binary frames are byte-exact through base64 (`0x00`/`0xff` round-trip); each
 fail-closed reason at its trigger (absent name, empty set, duplicate name, non-data opcode, unbound digest, not-found
 digest); the emitter looks the set up **by the spec digest and nothing else**; the thrown error carries the exact reason
-with no name/byte leak; and a **structural** case proving the only caller-controlled input is a lookup key — a name that
-looks like frame content is refused, not emitted.
+with no name/byte leak; a **structural** case proving the only caller-controlled input is a lookup key — a name that
+looks like frame content is refused, not emitted; a **snapshot** case mutating the resolver's body _after_ construction
+and proving the connection still emits only the original approved bytes; `approvedNames` advertising exactly what
+`emit` admits; and the untyped-JSONB battery (non-string `dataBase64`/`name`, non-canonical base64, nullish or
+`frames`-less set, a `null` entry inside the array, a value-swapping getter) each proving a **fixed reason** rather than
+a raw `TypeError`.
 
 **Deliberately still to come in slice 5:** the approval-manifest path by which a **non-catalog** frame could ever be
 sent (§7.2) belongs to the approval-policy / dual-control slice — until then a non-catalog frame is simply unsendable,
 the fail-closed default; plus the broker emission of the remaining hash-chained audit events and Stage-1 reuse of the
-window/expiry rule at grant-mint.
+window/expiry rule at grant-mint. **Follow-up noted by review:** `reconstruct.ts` decodes `payload.bodyBase64` with the
+same lenient `Buffer.from` and no shape screen; extracting the strict-base64 + well-formedness helper and applying it
+there is worth doing as its own change rather than destabilising an already-reviewed module inside this slice.
 
 ## Dependency-advisory disposition
 

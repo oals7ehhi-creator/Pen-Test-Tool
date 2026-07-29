@@ -14,6 +14,14 @@
  * `jsonb::text` digest here (that cross-engine canonical-JSON is deliberately avoided). All I/O is INJECTED; this module
  * performs no egress and opens no socket.
  *
+ * TRUST BOUNDARY. The fetched body arrives as untyped `JSONB` — migration `0003` constrains `content JSONB NOT NULL`,
+ * never its SHAPE — so the injected resolver's declared TypeScript type is a promise, not a guarantee. This module
+ * therefore VALIDATES rather than trusts: a nullish or structurally invalid body, a malformed entry, or non-canonical
+ * base64 all yield a FIXED REASON, never a raw `TypeError` escaping a safety control. It also SNAPSHOTS and freezes the
+ * body at construction, because the emitter is held for the whole connection while the resolver's object may be shared
+ * or memoized — `readonly` is erased at runtime, so without the snapshot the unrepresentability guarantee would hold
+ * only at construction time.
+ *
  * COMPOSITION — one enforcement point each, deliberately not duplicated:
  *   - SOURCE of a frame (this module): only an approved catalog entry may be emitted;
  *   - SIZE / COUNT / DURATION of frames (slice 5f, `wsbounds.ts`): the selected frame is then admitted (or the
@@ -39,7 +47,16 @@ export type WsFrameReason =
   | 'ws_frame_set_empty'
   | 'ws_frame_name_ambiguous'
   | 'ws_frame_opcode_invalid'
+  | 'ws_frame_entry_malformed'
   | 'ws_frame_not_in_catalog';
+
+/**
+ * Strict base64: only the base64 alphabet, correctly padded to a multiple of 4 (the empty string is a legal empty
+ * frame). `Buffer.from(x, 'base64')` is LENIENT — it silently skips characters outside the alphabet — so a malformed
+ * curated string would decode to bytes that are not the ones the entry appears to specify. Requiring canonical base64
+ * keeps "the bytes emitted are exactly the approved entry's" true by construction.
+ */
+const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 /** A fixed-reason outbound-frame denial. Carries only the reason code — never frame bytes / names / peer detail. */
 export class WsFrameError extends Error {
@@ -84,23 +101,37 @@ export type WsFrameSelection =
  * CATALOG entry — the caller supplies only the name.
  */
 export function selectWsFrame(set: WsFrameSet, name: string): WsFrameSelection {
+  // The catalog body crosses a TRUST BOUNDARY as untyped JSONB (migration `0003` constrains `content JSONB NOT NULL`,
+  // never its shape), so the declared TypeScript type is a promise, not a guarantee: validate rather than trust, and
+  // return a fixed reason instead of ever throwing a raw TypeError out of a safety control.
+  if (set === null || set === undefined || !Array.isArray(set.frames)) {
+    return { allow: false, reason: 'ws_frame_set_not_found' };
+  }
   if (set.frames.length === 0) return { allow: false, reason: 'ws_frame_set_empty' };
 
-  const matches = set.frames.filter((f) => f.name === name);
+  // A plain `filter` (not an object-keyed lookup) means an exotic entry name — `__proto__`, `constructor` — is just a
+  // string compared by value, and a non-string name simply never matches.
+  const matches = set.frames.filter((f) => f !== null && f !== undefined && f.name === name);
   if (matches.length > 1) return { allow: false, reason: 'ws_frame_name_ambiguous' };
   const entry = matches[0];
   if (entry === undefined) return { allow: false, reason: 'ws_frame_not_in_catalog' };
-  if (!WS_FRAME_OPCODES.has(entry.opcode)) {
+
+  // Read every field EXACTLY ONCE: were a field a getter, a second read could return something other than the value
+  // that was validated, so the bytes emitted must come from the same read that passed the checks.
+  const { name: entryName, opcode, dataBase64 } = entry;
+  if (typeof entryName !== 'string' || typeof dataBase64 !== 'string') {
+    return { allow: false, reason: 'ws_frame_entry_malformed' };
+  }
+  if (!WS_FRAME_OPCODES.has(opcode)) {
     return { allow: false, reason: 'ws_frame_opcode_invalid' };
+  }
+  if (!STRICT_BASE64.test(dataBase64)) {
+    return { allow: false, reason: 'ws_frame_entry_malformed' };
   }
 
   return {
     allow: true,
-    frame: {
-      name: entry.name,
-      opcode: entry.opcode,
-      data: new Uint8Array(Buffer.from(entry.dataBase64, 'base64')),
-    },
+    frame: { name: entryName, opcode, data: new Uint8Array(Buffer.from(dataBase64, 'base64')) },
   };
 }
 
@@ -116,7 +147,7 @@ export interface WsFrameContext {
 export interface WsFrameEmitter {
   /** Emit the named approved frame, or THROW a fixed-reason `WsFrameError` (the caller sends nothing on a throw). */
   emit(name: string): ApprovedWsFrame;
-  /** The names the approved set admits — for operator display / audit, never the frame bytes. */
+  /** Exactly the names `emit` will admit — for operator display / audit, never the frame bytes. */
   readonly approvedNames: readonly string[];
 }
 
@@ -134,8 +165,24 @@ export async function createWsFrameEmitter(
   if (wsFrameSetDigest === null || wsFrameSetDigest === '') {
     throw new WsFrameError('ws_frame_set_unbound');
   }
-  const set = await ctx.fetchWsFrameSet(wsFrameSetDigest);
-  if (set === null) throw new WsFrameError('ws_frame_set_not_found');
+  const fetched = await ctx.fetchWsFrameSet(wsFrameSetDigest);
+  // Shape-validate at the trust boundary (untyped JSONB): a nullish or structurally invalid body is a fixed-reason
+  // refusal BEFORE the emitter — a connection-bound capability — is handed back, never a deferred TypeError mid-stream.
+  if (fetched === null || fetched === undefined || !Array.isArray(fetched.frames)) {
+    throw new WsFrameError('ws_frame_set_not_found');
+  }
+
+  // SNAPSHOT + FREEZE. The resolver's body is trusted only at the instant it is returned, but the emitter outlives that
+  // instant (it is held for the whole connection). Copying and freezing every entry means a later mutation of a shared
+  // or memoized body cannot change what this connection may emit — `readonly` is erased at runtime, so it is not a
+  // defense. Without this the "a non-catalog frame is unrepresentable" guarantee would hold only at construction time.
+  const set: WsFrameSet = Object.freeze({
+    frames: Object.freeze(
+      Array.from(fetched.frames, (f) =>
+        Object.freeze({ name: f?.name, opcode: f?.opcode, dataBase64: f?.dataBase64 }),
+      ),
+    ) as readonly WsFrameTemplate[],
+  });
 
   return {
     emit(name: string): ApprovedWsFrame {
@@ -143,8 +190,10 @@ export async function createWsFrameEmitter(
       if (!selection.allow) throw new WsFrameError(selection.reason);
       return selection.frame;
     },
+    // DERIVED from the selector, so the advertised list can never drift from what `emit` actually admits: a
+    // duplicate-named pair (ambiguous) and a malformed / invalid-opcode entry all drop out by construction.
     get approvedNames(): readonly string[] {
-      return set.frames.map((f) => f.name);
+      return set.frames.filter((f) => selectWsFrame(set, f.name).allow).map((f) => f.name);
     },
   };
 }
