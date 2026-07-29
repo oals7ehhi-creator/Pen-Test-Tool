@@ -170,6 +170,20 @@ export {
 } from './wsadmit.js';
 
 export {
+  type WsFrameOpcode,
+  type WsFrameReason,
+  type WsFrameTemplate,
+  type WsFrameSet,
+  type ApprovedWsFrame,
+  type WsFrameSelection,
+  type WsFrameContext,
+  type WsFrameEmitter,
+  WsFrameError,
+  selectWsFrame,
+  createWsFrameEmitter,
+} from './wsframes.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,
