@@ -184,6 +184,17 @@ export {
 } from './wsframes.js';
 
 export {
+  type CompletionEventType,
+  type CompletionPayload,
+  type CompletionEvent,
+  type CompletionAppend,
+  type AuditEmitter,
+  type CompletionRecord,
+  buildCompletionEvent,
+  recordCompletion,
+} from './completion.js';
+
+export {
   type IngressAuthReason,
   type IngressCredentials,
   type VerifiedTlsSocket,
