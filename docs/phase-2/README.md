@@ -775,22 +775,46 @@ Two properties define the module, and both are the opposite of how a naive "log 
   `{stage, reason}` codes. The request's identity is deliberately **not** duplicated: the intent event already binds
   `spec_sha256` and the canonical target, and this event points at it, so re-recording the target would add leak
   surface for no evidentiary gain.
+- **`reason` is bounded, not echoed** — the adversarial review's sharpest catch. "Fixed reason codes" is a _convention_,
+  not a type guarantee: `runStage2`'s `reasonOf` surfaces **any** thrown error's `.reason` property, and the interlocks
+  are _injected ports_, so a dependency's error reaches this module. Node's own `ERR_TLS_CERT_ALTNAME_INVALID` carries
+  a `.reason` naming the peer's certificate SANs — internal hostnames — and a driver error can quote a query holding
+  secret values. Since this append is hash-chained and **unerasable**, an unvetted string written here could never be
+  taken back. `reason` is now reduced to a fixed code (lowercase snake, optionally colon-qualified, ≤ 64 chars — the
+  shape `resolvePin`'s `network_guard:…` and `redirect`'s `redirect_out_of_scope:…` genuinely produce) and **replaced**
+  otherwise, never truncated: a prefix of a secret is still a secret. `stage` is reduced to its closed set.
+- **The intent link is nullable, because intent does not always exist.** Intent is committed at step 10, so a denial at
+  `ingress`, `reconstruct`, or a _pre-charge_ interlock never produced one. Requiring an id would either make those
+  denials unrecordable or invite a fabricated link — and slice 5i established that `related_event_id` is **not** bound
+  into `event_hash`, so a wrong link is not self-evident. A denial with no intent is still evidence, and is recorded
+  unlinked.
 
 The audit append itself is injected, so this module performs no I/O and the chained write stays in the database
 (`audit_append`, `0004`) where `seq` / `prev_hash` / `event_hash` are derived under the chain lock and cannot be forged.
 
-Tests: `packages/broker/test/completion.test.ts` (10 cases; broker package still **100%** coverage) — a success
+Tests: `packages/broker/test/completion.test.ts` (17 cases; broker package still **100%** coverage) — a success
 records the pinned IP, status and byte counts; truncation is recorded as a fact without content; a denial records only
-the fixed `{stage, reason}` and **no** pinned IP (nothing was dialed). Then the **redaction proof**: a response whose
-body, `set-cookie`/`authorization` headers and target URL all carry planted secrets yields a serialized payload
-containing none of them — not even the host — and a case proving the payload carries **exactly** the allowlisted keys,
-so a newly added response field cannot leak in. Finally: the event reaches the emitter linked to the intent id, a
-failed run is recorded too (a denial is evidence, not silence), and an emitter that rejects yields
-`{recorded:false, error}` with the attempted event still returned, never a throw.
+the fixed `{stage, reason}` and **no** pinned IP. The **redaction proof**: a response whose body,
+`set-cookie`/`authorization` headers and target URL all carry planted secrets yields a serialized payload containing
+none of them — not even the host — plus a case pinning the payload to **exactly** the allowlisted keys, and a
+**structural** assertion that every value is a scalar (so a byte-encoded field cannot slip past a substring check in
+some other encoding). The `reason` battery: Node's real TLS `altnames` string is replaced, as are whitespace, quotes,
+newlines, URLs, SQL-ish text and over-length input — while every legitimate in-tree code, including the composed
+`network_guard:cloud_metadata` and `redirect_out_of_scope:no_host_match`, round-trips **unchanged** (proving the guard
+does not over-redact). Finally: the event reaches the emitter linked to the intent id; a pre-charge denial is recorded
+**unlinked**; a failed run is recorded too (a denial is evidence, not silence); and the function is proven **total** —
+a rejecting emitter, a _synchronously throwing_ emitter, a non-`Error` rejection, and a malformed outcome all return
+`{recorded:false, error}` with a valid secret-free event, never a throw.
 
-**Deliberately still to come in slice 5:** approval policy + dual control at request time; Stage-1 reuse of the
-window/expiry rule at grant-mint; and the **external audit anchor** (§9 attestation) recorded as debt in slice 5i,
-without which `ok` from `verify_audit_chain` means "internally consistent", not "not rewritten".
+**Known gap, stated rather than papered over:** for a `send` / `read` denial a socket _was_ opened, so §7.1 step 14's
+pinned IP and byte counts exist — but `Stage2Outcome`'s failure branch is `{ok:false, stage, reason}` and does not
+carry them, so this module cannot record them. Widening that union is a `stage2.ts` change and belongs to the slice
+that wires this in; the nulls are honest about what this module was given, not a claim that nothing was dialed.
+
+**Deliberately still to come in slice 5:** wiring this into `runStage2`'s call path (with the union widened as above);
+approval policy + dual control at request time; Stage-1 reuse of the window/expiry rule at grant-mint; and the
+**external audit anchor** (§9 attestation) recorded as debt in slice 5i, without which `ok` from `verify_audit_chain`
+means "internally consistent", not "not rewritten".
 
 ## Dependency-advisory disposition
 

@@ -31,6 +31,44 @@ import type { Stage2Outcome } from './stage2.js';
 /** The two informational lifecycle event types (§9 engagement stream). */
 export type CompletionEventType = 'request.completed' | 'request.failed';
 
+/** The Stage-2 steps that can deny — a closed set, set only from source literals in `runStage2`. */
+type Stage2Stage = Extract<Stage2Outcome, { ok: false }>['stage'];
+const STAGES: ReadonlySet<string> = new Set<Stage2Stage>([
+  'ingress',
+  'reconstruct',
+  'interlock',
+  'resolve',
+  'send',
+  'read',
+]);
+
+/**
+ * A fixed reason code: lowercase snake tokens, optionally colon-qualified. The colon form is REAL — `resolvePin`
+ * emits `network_guard:${verdict.reason}` and `redirect` emits `redirect_out_of_scope:${decision.reason}` — so the
+ * shape must admit it without over-redacting; the longest legitimate composition in the tree is ~60 characters.
+ */
+const REASON_CODE = /^[a-z][a-z0-9_]*(?::[a-z0-9_]+)*$/;
+const REASON_MAX = 64;
+
+/**
+ * Reduce a reason to a fixed code, replacing anything else. "Fixed reason codes" is a CONVENTION, not a type
+ * guarantee: `runStage2`'s `reasonOf` surfaces ANY thrown error's `.reason` string property, and the interlocks are
+ * INJECTED ports, so a dependency's error can reach here. Node's own `ERR_TLS_CERT_ALTNAME_INVALID` carries a
+ * `.reason` naming the peer's certificate SANs — internal hostnames — and a driver error can carry a query fragment
+ * holding SECRET query values. This append is hash-chained and unerasable (`audit_append`, `0004`), so an unvetted
+ * string written here can never be taken back. Replace, never truncate-and-append: a prefix of a secret is a secret.
+ */
+function safeReason(reason: string): string {
+  return typeof reason === 'string' && reason.length <= REASON_MAX && REASON_CODE.test(reason)
+    ? reason
+    : 'unrecognized_reason';
+}
+
+/** Reduce a stage to the closed set; anything else is recorded as unknown rather than echoed. */
+function safeStage(stage: string): string {
+  return STAGES.has(stage) ? stage : 'unknown_stage';
+}
+
 /**
  * The redacted completion payload. Every field is a scalar chosen deliberately; there is no pass-through of response
  * or request content. `null` where a fact does not apply (a denial never reached an IP or a status).
@@ -79,21 +117,34 @@ export function buildCompletionEvent(outcome: Stage2Outcome): CompletionEvent {
   return {
     eventType: 'request.failed',
     payload: {
+      // KNOWN GAP (not a silent one): for a `send`/`read` denial a socket WAS opened, so §7.1 step 14's pinned IP and
+      // byte counts exist — but `Stage2Outcome`'s failure branch is `{ok:false, stage, reason}` and does not carry
+      // them, so they cannot be recovered here. Widening that union is a `stage2.ts` change and belongs to the slice
+      // that wires this in; recording null is honest about what this module was given, not a claim none occurred.
       pinnedIp: null,
       statusCode: null,
       bytesRead: 0,
       truncated: false,
-      stage: outcome.stage,
-      reason: outcome.reason,
+      stage: safeStage(outcome.stage),
+      reason: safeReason(outcome.reason),
     },
   };
 }
 
-/** What the injected emitter is asked to append — mirrors `audit_append`'s chained-write parameters. */
+/**
+ * What the injected emitter is asked to append. This is the CONTENT of the event only — the chain, actor and subject
+ * columns `audit_append` also takes are the emitter's to supply from the calling context, not this module's to invent.
+ */
 export interface CompletionAppend {
   readonly eventType: CompletionEventType;
-  /** The `request.intent` event this completion refers to, on the SAME chain (§9). */
-  readonly relatedEventId: string;
+  /**
+   * The `request.intent` event this completion refers to, on the SAME chain (§9) — or NULL when there is no intent to
+   * point at. That is not an edge case: intent is committed at step 10, so a denial at `ingress`, `reconstruct`, or an
+   * interlock BEFORE the charge never produced one. Forcing an id here would either make those denials unrecordable or
+   * invite a fabricated link — and slice 5i established that `related_event_id` is NOT bound into `event_hash`, so a
+   * wrong link is not self-evident. A denial with no intent is still evidence and is still recorded, unlinked.
+   */
+  readonly relatedEventId: string | null;
   readonly payload: CompletionPayload;
 }
 
@@ -119,11 +170,15 @@ export type CompletionRecord =
  */
 export async function recordCompletion(
   outcome: Stage2Outcome,
-  intentEventId: string,
+  intentEventId: string | null,
   emitter: AuditEmitter,
 ): Promise<CompletionRecord> {
-  const event = buildCompletionEvent(outcome);
+  // The BUILD is inside the try as well as the emit. It reads fields off a caller-supplied outcome, so a malformed one
+  // would throw a raw TypeError — and a function documented "NEVER THROWS" that throws for some inputs is worse than
+  // one that never claimed it. A synchronously-throwing emitter is covered by the same guard.
+  let event: CompletionEvent = FALLBACK_EVENT;
   try {
+    event = buildCompletionEvent(outcome);
     const eventId = await emitter.append({
       eventType: event.eventType,
       relatedEventId: intentEventId,
@@ -131,6 +186,22 @@ export async function recordCompletion(
     });
     return { recorded: true, eventId, event };
   } catch (error) {
+    // `error` is an ARBITRARY thrown value and may itself carry sensitive text (a driver error quoting a query that
+    // holds secret query values). It is handed back to the caller, never folded into the payload — the event returned
+    // alongside it is the same secret-free structure that would have been appended.
     return { recorded: false, error, event };
   }
 }
+
+/** Used only when the outcome itself could not be read — still a valid, secret-free event shape. */
+const FALLBACK_EVENT: CompletionEvent = {
+  eventType: 'request.failed',
+  payload: {
+    pinnedIp: null,
+    statusCode: null,
+    bytesRead: 0,
+    truncated: false,
+    stage: 'unknown_stage',
+    reason: 'unrecognized_reason',
+  },
+};

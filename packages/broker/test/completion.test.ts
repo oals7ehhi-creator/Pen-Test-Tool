@@ -188,4 +188,106 @@ describe('recordCompletion — informational, chained to the intent, never throw
     // the event it TRIED to record is still returned, so the caller can alarm with the actual content.
     expect(r.event.eventType).toBe('request.completed');
   });
+
+  it('records an unlinked completion when there is NO intent to point at (pre-charge denial)', async () => {
+    // intent is committed at step 10, so an ingress/reconstruct/pre-charge-interlock denial never produced one.
+    // A denial with no intent is still evidence and is still recorded — unlinked, not dropped or fabricated.
+    const { emitter, appended } = emitterOf();
+    const r = await recordCompletion(failOutcome('ingress', 'spec_mismatch'), null, emitter);
+    expect(r.recorded).toBe(true);
+    expect(appended[0]?.relatedEventId).toBeNull();
+    expect(appended[0]?.payload.reason).toBe('spec_mismatch');
+  });
+
+  it('is TOTAL — a synchronously throwing emitter, a non-Error rejection, and a malformed outcome all report', async () => {
+    const syncThrow: AuditEmitter = {
+      append: () => {
+        throw new TypeError('sync boom');
+      },
+    };
+    const r1 = await recordCompletion(okOutcome(), 'i-1', syncThrow);
+    expect(r1.recorded).toBe(false);
+
+    const nonError: AuditEmitter = { append: () => Promise.reject('just a string') };
+    const r2 = await recordCompletion(okOutcome(), 'i-1', nonError);
+    expect(r2.recorded).toBe(false);
+    if (!r2.recorded) expect(r2.error).toBe('just a string');
+
+    // a malformed outcome would make buildCompletionEvent throw a raw TypeError — the contract says it must not
+    // escape, and the fallback event must still be a valid, secret-free shape.
+    const { emitter } = emitterOf();
+    const r3 = await recordCompletion(
+      { ok: true } as unknown as Stage2Outcome, // no `response` — reading it throws
+      'i-1',
+      emitter,
+    );
+    expect(r3.recorded).toBe(false);
+    expect(r3.event.payload.reason).toBe('unrecognized_reason');
+    expect(JSON.stringify(r3.event.payload)).not.toContain('undefined');
+  });
+});
+
+describe('the reason field is the ONLY producer-controlled string — it is bounded, not echoed', () => {
+  it("replaces a hostile free-form reason (Node's TLS error names the peer's cert SANs)", () => {
+    // runStage2's reasonOf surfaces ANY error's `.reason`, and the interlocks are INJECTED ports, so a dependency's
+    // error really can reach here. ERR_TLS_CERT_ALTNAME_INVALID carries internal hostnames in exactly that field.
+    const hostile =
+      "Host: example.com. is not in the cert's altnames: DNS:secret-internal.corp, DNS:vault.internal";
+    const { payload } = buildCompletionEvent(failOutcome('send', hostile));
+    expect(payload.reason).toBe('unrecognized_reason');
+    expect(JSON.stringify(payload)).not.toContain('secret-internal.corp');
+    expect(JSON.stringify(payload)).not.toContain('altnames');
+  });
+
+  it('replaces anything with whitespace, punctuation, URLs, newlines, or excess length', () => {
+    for (const bad of [
+      'a b',
+      'a"b',
+      'a\nb',
+      'https://evil.example/x?k=sk_live_secret',
+      'SELECT * FROM operator_query_value WHERE v=$1',
+      'Reason: Denied',
+      'x'.repeat(200),
+    ]) {
+      expect(buildCompletionEvent(failOutcome('read', bad)).payload.reason).toBe(
+        'unrecognized_reason',
+      );
+    }
+  });
+
+  it('does NOT over-redact: every legitimate in-tree reason round-trips unchanged', () => {
+    for (const good of [
+      'budget_exhausted',
+      'emergency_stop',
+      'concurrency_exceeded',
+      'rate_limited_host',
+      'ws_connection_limit',
+      'connection_closed_early',
+      'restricted_range_elevation_not_granted',
+      'network_guard:cloud_metadata', // resolvePin composes this
+      'redirect_out_of_scope:no_host_match', // redirect composes this
+    ]) {
+      expect(buildCompletionEvent(failOutcome('resolve', good)).payload.reason).toBe(good);
+    }
+  });
+
+  it('reduces an unrecognized stage rather than echoing it', () => {
+    expect(buildCompletionEvent(failOutcome('ledger' as never, 'x_y')).payload.stage).toBe(
+      'unknown_stage',
+    );
+    expect(buildCompletionEvent(failOutcome('interlock', 'x_y')).payload.stage).toBe('interlock');
+  });
+
+  it('STRUCTURAL: every payload value is a scalar — bytes or nested objects cannot slip past in any encoding', () => {
+    const scalar = (v: unknown): boolean =>
+      v === null || ['string', 'number', 'boolean'].includes(typeof v);
+    for (const outcome of [okOutcome(), failOutcome('read', 'body_too_large')]) {
+      const { payload } = buildCompletionEvent(outcome);
+      for (const [k, v] of Object.entries(payload)) {
+        expect(scalar(v), `payload.${k} must be a scalar`).toBe(true);
+      }
+      expect(Number.isInteger(payload.bytesRead)).toBe(true);
+      if (payload.pinnedIp !== null) expect(payload.pinnedIp).toMatch(/^[0-9a-f.:]+$/i);
+    }
+  });
 });
